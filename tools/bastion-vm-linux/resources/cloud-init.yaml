@@ -1,0 +1,28 @@
+#cloud-config
+package_update: false
+package_upgrade: false
+
+write_files:
+  - path: /usr/local/sbin/install-data-platform-bastion-vm-tools.sh
+    owner: root:root
+    permissions: '0755'
+    encoding: b64
+    content: __INSTALL_TOOLS_B64__
+  - path: /etc/profile.d/data-platform-bastion-vm.sh
+    owner: root:root
+    permissions: '0644'
+    content: |
+      export UV_PYTHON_INSTALL_DIR=/opt/uv/python
+      export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
+  - path: /etc/motd
+    owner: root:root
+    permissions: '0644'
+    content: |
+      Data Platform Bastion VM
+
+      Private Linux access for platform deployment and operational work.
+      Follow the runbook in the Component Repository for your task.
+
+runcmd:
+  - [ bash, -lc, 'mkdir -p /opt/data-platform-bastion-vm' ]
+  - [ bash, -lc, '/usr/local/sbin/install-data-platform-bastion-vm-tools.sh 2>&1 | tee /var/log/data-platform-bastion-vm-install.log' ]
