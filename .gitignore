@@ -1,0 +1,8 @@
+# Python environments and caches.
+.venv/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+
+# Local Bastion VM configuration identifies a tenant and subscription.
+bastion-vm.json

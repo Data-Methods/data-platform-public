@@ -1,13 +1,20 @@
 # Data Platform Public
 
-Public client-side utilities from Data Methods. This repository currently contains
-one tool: [`tools/template-access/template-access.ps1`](tools/template-access/template-access.ps1).
+Public client-side utilities from Data Methods:
+
+- [`tools/template-access/`](tools/template-access/template-access.ps1) prepares an
+  SSH key for read-only access to one private Component Template Repository.
+- [`tools/bastion-vm-linux/`](tools/bastion-vm-linux/README.md) creates and manages
+  a private Linux VM for platform work, reached through Azure Bastion.
+
+Each tool has its own versions, published as Git tags named `<tool>/<version>`,
+such as `template-access/1.0.0`. Read a tool before running it.
+
+## Template access
 
 The tool prepares an SSH key for read-only access to one private Component Template
 Repository for one Platform Instance. It does **not** grant access by itself and
 does not send the private key to Data Methods. Read the script before running it.
-
-## Template access
 
 Requirements: PowerShell 7, OpenSSH (`ssh` and `ssh-keygen`), and an approved
 workstation. Azure CLI is needed only when using `-KeyVaultName`. The signed-in
@@ -59,3 +66,8 @@ The script prints paths and non-secret public-key information, never the
 private-key value. It does not contact Data Methods; Azure CLI calls go only
 to the Key Vault you name. To test locally without Azure, run
 `pwsh -NoProfile -File ./tests/template-access.ps1`.
+
+## Linux Bastion VM
+
+See the [Linux Bastion VM README](tools/bastion-vm-linux/README.md) for its
+requirements, download and verification commands, and lifecycle.
