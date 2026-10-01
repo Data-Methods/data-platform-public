@@ -287,6 +287,17 @@ function Download-KeyVaultSecret {
     }
 }
 
+function ConvertTo-PrivateKeyText {
+    param([Parameter(Mandatory = $true)][string]$Value)
+
+    # ssh-keygen refuses an OpenSSH private key without its final newline.
+    $text = $Value.Replace("`r`n", "`n")
+    if (-not $text.EndsWith("`n")) {
+        $text += "`n"
+    }
+    return $text
+}
+
 function Convert-LegacySecretFile {
     param(
         [Parameter(Mandatory = $true)][string]$Source,
@@ -295,7 +306,7 @@ function Convert-LegacySecretFile {
 
     $value = [IO.File]::ReadAllText($Source)
     if ($value.TrimStart().StartsWith('-----BEGIN OPENSSH PRIVATE KEY-----')) {
-        Write-TextAtomically -Path $Destination -Value $value -Private $true
+        Write-TextAtomically -Path $Destination -Value (ConvertTo-PrivateKeyText -Value $value) -Private $true
         return
     }
 
@@ -312,7 +323,7 @@ function Convert-LegacySecretFile {
     ) {
         throw "Legacy Key Vault secret '$LegacySecretName' does not contain 'private_key'."
     }
-    Write-TextAtomically -Path $Destination -Value $payload.private_key -Private $true
+    Write-TextAtomically -Path $Destination -Value (ConvertTo-PrivateKeyText -Value $payload.private_key) -Private $true
 }
 
 function Restore-KeyFromVault {
