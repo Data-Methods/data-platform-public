@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "platform_version": "2026.2",
+  "dp_instance_commit": null,
+  "sources": {
+    "data-platform-application-identity": "462ea432d8605e924d1c7893966a0f03dbcbc329",
+    "data-platform-example": "7fa63916f144cfadeac755b8aaa47ebdd7b6e197",
+    "data-platform-external-ingress-storage": "80e905bf2a7e42e8226645545a23d68c95d9836f",
+    "data-platform-infrastructure": "df1c8a33e3a556e734c36dc23a40ae1c88b9965f",
+    "data-platform-iot": "8d2ceaa55496d8472eb14a3f36167a6924ce2901"
+  },
+  "order": [],
+  "snapshots": {
+    "data-platform-application-identity": {
+      "462ea432d8605e924d1c7893966a0f03dbcbc329": "1433e47b189b6afc3dd96dd453bc94b482306f3e"
+    },
+    "data-platform-example": {
+      "7fa63916f144cfadeac755b8aaa47ebdd7b6e197": "d6868ebf362b1ea3b5fa68c29bbdf78a265a6d32"
+    },
+    "data-platform-external-ingress-storage": {
+      "80e905bf2a7e42e8226645545a23d68c95d9836f": "2371c9ca81b40561532148347af5785d420b237c"
+    },
+    "data-platform-infrastructure": {
+      "df1c8a33e3a556e734c36dc23a40ae1c88b9965f": "bd8a7c847629d36779dff4ab6b42652fa29b45d8"
+    },
+    "data-platform-iot": {
+      "8d2ceaa55496d8472eb14a3f36167a6924ce2901": "58c1a35ac986e251d93327d2c81283105cc9a053"
+    }
+  }
+}
