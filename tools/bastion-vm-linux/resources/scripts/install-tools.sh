@@ -13,6 +13,7 @@ POWERSHELL_VERSION="7.6.3"
 GRAPH_AUTH_VERSION="2.38.1"
 KUBECTL_VERSION="1.35.0"
 KUBELOGIN_VERSION="0.2.19"
+SNOWFLAKE_CLI_VERSION="3.29.0"
 
 retry() {
   local attempt=1
@@ -116,6 +117,17 @@ install_terraform() {
   rm -f "$archive"
 }
 
+install_snowflake_cli() {
+  local archive=/tmp/snowflake-cli.deb
+  download_verified \
+    "https://sfc-repo.snowflakecomputing.com/snowflake-cli/linux_x86_64/${SNOWFLAKE_CLI_VERSION}/snowflake-cli-${SNOWFLAKE_CLI_VERSION}.x86_64.deb" \
+    "658f43adb127e4a7c6066d995128ce8020d84ea3ed7fe6716055b00b7bf4c8d6" \
+    "$archive"
+  wait_for_apt
+  dpkg -i "$archive"
+  rm -f "$archive"
+}
+
 install_kubernetes_tools() {
   local kubectl_binary=/tmp/kubectl
   local kubelogin_archive=/tmp/kubelogin.zip
@@ -209,6 +221,7 @@ write_completion_marker() {
     echo "terraform=$(terraform version -json | jq -r '.terraform_version')"
     echo "kubectl=$(kubectl version --client --output=json | jq -r '.clientVersion.gitVersion')"
     echo "kubelogin=$(kubelogin --version | tr '\n' ' ')"
+    echo "snow=$(snow --version)"
     echo "uv=$(uv --version)"
     echo "python=$(/usr/local/bin/python3.12 --version)"
     echo "powershell=$(pwsh --version)"
@@ -224,6 +237,7 @@ main() {
   install_github_cli
   install_terraform
   install_kubernetes_tools
+  install_snowflake_cli
   install_uv
   install_python
   install_powershell

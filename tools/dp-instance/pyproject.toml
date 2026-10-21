@@ -1,0 +1,40 @@
+[project]
+name = "dp-instance"
+version = "1.0.0"
+description = "Runs a Platform Instance's upgrades and configuration changes through each component's own CLI."
+license = "MIT"
+requires-python = ">=3.12"
+# Rich and its three dependencies, each pinned exactly: `uv tool install` resolves these
+# requirements, not the lock file.
+dependencies = [
+    "rich==14.1.0",
+    "markdown-it-py==4.2.0",
+    "mdurl==0.1.2",
+    "pygments==2.21.0",
+]
+
+[project.scripts]
+dp-instance = "dp_instance.cli:main"
+
+[dependency-groups]
+dev = ["pytest==9.0.3", "ruff==0.14.0"]
+
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/dp_instance"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E501"]

@@ -107,7 +107,9 @@ class AzureCli:
         return azure_cli_command(*args, *context)
 
     def run(self, *args: str, parse_json: bool = False) -> Any:
-        command = self._command(args)
+        return self._execute(self._command(args), parse_json=parse_json)
+
+    def _execute(self, command: list[str], *, parse_json: bool) -> Any:
         try:
             result = subprocess.run(command, capture_output=True, text=True, check=False)
         except OSError as exc:
@@ -155,3 +157,9 @@ class AzureCli:
 
     def account(self) -> dict[str, Any]:
         return self.run("account", "show", "--output", "json", parse_json=True)
+
+    def active_account(self) -> dict[str, Any]:
+        """Return the profile's active subscription, which Bastion tunnels authenticate with."""
+        return self._execute(
+            azure_cli_command("account", "show", "--output", "json"), parse_json=True
+        )

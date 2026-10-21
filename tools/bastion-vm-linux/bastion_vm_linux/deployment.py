@@ -10,6 +10,7 @@ from pathlib import Path
 from .azure import AzureCli, CommandError
 from .changes import Change
 from .config import WorkstationConfig, validate_context
+from .tunnel import open_tunnel
 
 VM_ADMIN_LOGIN_ROLE_ID = "1c0163c0-47e6-4577-8991-ea5c82e286e4"
 TEMPLATE = Path(__file__).resolve().parents[1] / "resources" / "main.bicep"
@@ -260,7 +261,8 @@ def resource_group(config: WorkstationConfig, azure: AzureCli) -> dict[str, obje
     return group
 
 
-def _print_connection(desired: WorkstationConfig, azure: AzureCli) -> None:
+def _vm_id(desired: WorkstationConfig, azure: AzureCli) -> str:
+    """Return the VM's resource ID after checking that its Azure Bastion exists."""
     vm_id = azure.run(
         "vm",
         "show",
@@ -294,6 +296,11 @@ def _print_connection(desired: WorkstationConfig, azure: AzureCli) -> None:
         raise CommandError(
             f"Azure Bastion {desired.name_prefix} was not found in {desired.resource_group_name}"
         )
+    return vm_id
+
+
+def _print_connection(desired: WorkstationConfig, azure: AzureCli) -> None:
+    vm_id = _vm_id(desired, azure)
     print("Connect from a local shell with your activated or permanent Infra Admin identity:")
     print(
         "Use a dedicated AZURE_CONFIG_DIR when other sessions share this machine. "
@@ -313,13 +320,31 @@ def _print_connection(desired: WorkstationConfig, azure: AzureCli) -> None:
     print(f"  https://portal.azure.com/#resource{vm_id}/connect")
 
 
-def connection(config: WorkstationConfig, azure: AzureCli) -> None:
-    desired = config
-    if _stack(config, desired, azure) is None:
+def _require_stack(config: WorkstationConfig, azure: AzureCli) -> None:
+    if _stack(config, config, azure) is None:
         raise CommandError(
             "Bastion VM is not deployed; run 'status' and apply any required changes"
         )
-    _print_connection(desired, azure)
+
+
+def connection(config: WorkstationConfig, azure: AzureCli) -> None:
+    _require_stack(config, azure)
+    _print_connection(config, azure)
+
+
+def tunnel(config: WorkstationConfig, azure: AzureCli, port: int) -> int:
+    account = azure.active_account()
+    if (
+        str(account.get("tenantId", "")).casefold() != config.tenant_id.casefold()
+        or str(account.get("id", "")).casefold() != config.subscription_id.casefold()
+    ):
+        raise CommandError(
+            "Bastion tunnels sign in with the Azure CLI profile's active subscription, "
+            "which is not this configuration's. Select it, in a dedicated AZURE_CONFIG_DIR "
+            f"on a shared machine: az account set --subscription {config.subscription_id}"
+        )
+    _require_stack(config, azure)
+    return open_tunnel(config, _vm_id(config, azure), port)
 
 
 def apply(config: WorkstationConfig, azure: AzureCli) -> None:

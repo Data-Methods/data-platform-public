@@ -8,6 +8,7 @@ from . import deployment
 from .azure import AzureCli, CommandError
 from .changes import confirm, render_plan
 from .config import DEFAULT_FILE, WorkstationConfig, configure, validate_context
+from .tunnel import DEFAULT_PORT, port_number
 
 
 def parser() -> argparse.ArgumentParser:
@@ -20,6 +21,7 @@ def parser() -> argparse.ArgumentParser:
         "apply",
         "status",
         "connection",
+        "tunnel",
         "delete",
     ):
         command = actions.add_parser(name)
@@ -27,6 +29,8 @@ def parser() -> argparse.ArgumentParser:
         if name in {"authorize", "apply", "delete"}:
             command.add_argument("--dry-run", action="store_true")
             command.add_argument("--yes", action="store_true")
+        if name == "tunnel":
+            command.add_argument("--port", type=port_number, default=DEFAULT_PORT)
     return result
 
 
@@ -45,6 +49,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.action == "connection":
             deployment.connection(config, azure)
             return 0
+        if args.action == "tunnel":
+            return deployment.tunnel(config, azure, args.port)
         if args.action == "authorize":
             planned = deployment.authorization_changes(config, azure)
             blockers = []
