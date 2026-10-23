@@ -4,7 +4,8 @@ Each component runs as `uv run --locked <command>` in its own checkout, so it ke
 engine version. With `--json` it writes one JSON object per line to stdout, one line as each
 step starts and finishes and a result last, and everything meant for a person to stderr,
 which goes to the run's log. Values a person supplies go to its stdin as one JSON document
-and nowhere else.
+and nowhere else. A command that only reads runs again when it fails for a moment; one that
+writes never does.
 """
 
 from __future__ import annotations
@@ -18,15 +19,22 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-from . import processes
-from .outcome import EXIT_CODES, USAGE, failed
+from . import processes, transient
+from .outcome import EXIT_CODES, USAGE, Stop, failed
 
 WINDOWS_FILE_LOCK = "os error 1224"
+# The commands that only read, which a failure that looks temporary runs again.
+READS = (("steps",), ("outputs", "aggregate"), ("preflight",), ("plan",), ("verify",))
+
+
+def read_command(arguments) -> tuple[str, ...] | None:
+    """The read-only command ``arguments`` run, if they run one."""
+    return next((words for words in READS if tuple(arguments[: len(words)]) == words), None)
 
 
 def uv_run(command: str, project: Path | None) -> list[str]:
-    """The launcher: `uv run --locked`, from the checkout's own project or, at the 2026.3
-    hop, from a fetched template source."""
+    """The launcher: `uv run --locked`, from the checkout's own project or from the target's
+    fetched template source."""
     launcher = [processes.executable("uv"), "run", "--locked"]
     if project is not None:
         launcher += ["--project", str(project)]
@@ -52,7 +60,8 @@ class Log:
 
 @dataclass
 class Call:
-    """One component process: its result, the events it wrote and its human lines."""
+    """One component process: its result, the events it wrote and its human lines. A read
+    whose last failure looked temporary holds what it looked like and how often it ran again."""
 
     status: str
     code: int
@@ -61,6 +70,8 @@ class Call:
     stderr: list[str] = field(default_factory=list)
     stdout: str = ""
     seconds: float = 0.0
+    temporary: str | None = None
+    retried: int = 0
 
     def finished(self, step: str | None = None) -> list[dict]:
         return [
@@ -77,9 +88,11 @@ class Call:
     @property
     def message(self) -> str:
         if self.result and self.result.get("message"):
-            return str(self.result["message"])
-        last = self.excerpt(1)
-        return last[0] if last else f"exit code {self.code}"
+            text = str(self.result["message"])
+        else:
+            last = self.excerpt(1)
+            text = last[0] if last else f"exit code {self.code}"
+        return transient.exhausted(text, self.temporary, self.retried)
 
 
 @dataclass(frozen=True)
@@ -163,6 +176,19 @@ class Cli:
         )
         return call, retry
 
+    def _started(self, arguments, stdin, on_event, on_line) -> Call:
+        """uv failing on a Windows file lock (os error 1224, usually an antivirus scan holding a
+        file in uv's cache) before the command starts is retried once; a second failure stands."""
+        call, retry = self._once(arguments, stdin, on_event, on_line)
+        if retry:
+            self.log.write("   Windows os error 1224 before the command started: retrying once.")
+            call, _ = self._once(arguments, stdin, on_event, on_line)
+        return call
+
+    def _report(self, line: str) -> None:
+        self.log.write(f"   {line}")
+        transient.say(line)
+
     def run(
         self,
         *arguments: str,
@@ -170,20 +196,35 @@ class Cli:
         on_event: Callable[[dict], None] | None = None,
         on_line: Callable[[str], None] | None = None,
     ) -> Call:
-        """Run one command. uv failing on a Windows file lock (os error 1224, usually an
-        antivirus scan holding a file in uv's cache) before the command starts is retried
-        once; a second failure stands."""
-        call, retry = self._once(arguments, stdin, on_event, on_line)
-        if retry:
-            self.log.write("   Windows os error 1224 before the command started: retrying once.")
-            call, _ = self._once(arguments, stdin, on_event, on_line)
+        """Run one command. A read that fails the way a network or a busy service fails for a
+        moment runs again after a wait, up to three times, each retry said in one line; a
+        sign-in to renew never does, nor does a command that writes."""
+        call = self._started(arguments, stdin, on_event, on_line)
+        words = read_command(arguments)
+        if words is None:
+            return call
+        label = " ".join((self.command, *words))
+        if "--phase" in arguments:
+            label += f" --phase {arguments[arguments.index('--phase') + 1]}"
+        retried = 0
+        while call.status in ("failed", "usage"):
+            found = transient.classify("\n".join((*call.stderr, call.message)))
+            if not transient.retries(found, retried, label=label, report=self._report):
+                if found is not None:
+                    call.temporary, call.retried = found, retried
+                break
+            retried += 1
+            call = self._started(arguments, stdin, on_event, on_line)
         return call
 
     def document(self, *arguments: str) -> dict:
         """A command that prints one JSON document, such as `steps --json`."""
         call = self.run(*arguments)
         if call.status != "done":
-            raise failed(f"{self.command} {' '.join(arguments)} failed: {call.message}")
+            message = f"{self.command} {' '.join(arguments)} failed: {call.message}"
+            if call.temporary is not None:
+                raise Stop("failed", message, reason="transient")
+            raise failed(message)
         try:
             found = json.loads(call.stdout)
         except ValueError:

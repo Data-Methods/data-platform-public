@@ -17,7 +17,11 @@ dependencies = [
 dp-instance = "dp_instance.cli:main"
 
 [dependency-groups]
-dev = ["pytest==9.0.3", "ruff==0.14.0"]
+dev = [
+    "pytest==9.0.3",
+    "pytest-xdist==3.8.0",
+    "ruff==0.14.0",
+]
 
 [build-system]
 requires = ["hatchling==1.27.0"]
@@ -28,6 +32,9 @@ packages = ["src/dp_instance"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "windows: exercises Windows behaviour (paths and files, processes, Git for Windows); the Windows CI job runs only these",
+]
 
 [tool.ruff]
 line-length = 110

@@ -1,9 +1,10 @@
 """The commands that run the sequence: `upgrade`, `apply` and `resume`.
 
-`upgrade --to V` starts one run from the code into the platform. `apply` always starts a new
-run on the checked-out code, its finished steps passing as no changes. `resume` carries on
-from where the active run stopped, the one place a run's record decides where to start, and
-refuses if the commits it's tied to have moved.
+`upgrade` starts one run from the code into the platform: to the release `--to` names or, with
+none named, the next stop, which it names first. `apply` always starts a new run on the
+checked-out code, its finished steps passing as no changes. `resume` carries on from where the
+active run stopped, the one place a run's record decides where to start, and refuses if the
+commits it's tied to have moved.
 """
 
 from __future__ import annotations
@@ -52,12 +53,37 @@ def _goal(session: Session, target: Manifest, channel: str) -> str:
     return f"upgrade: {start} → Platform {target.platform_version}"
 
 
+def _nothing_to_upgrade(session: Session, version: str) -> Result:
+    """On the newest release: nothing to upgrade, though a run that stopped after its merges
+    may still have steps to finish."""
+    message = f"Nothing to upgrade: this instance runs Platform {version}, the newest release."
+    steps = (
+        (Next("dp-instance resume", "carries on the run under way, which hasn't finished"),)
+        if record.active(session.instance.state) is not None
+        else ()
+    )
+    session.screen.header("upgrade", ("instance", session.instance.key))
+    session.screen.blank()
+    session.screen.note(message, "bold green")
+    if steps:
+        session.screen.next_block(steps)
+    return Result("upgrade", "done", message, steps, {"platform_version": version})
+
+
 def upgrade(session: Session, version: str | None, manifest_file: str | None) -> Result:
     releases = session.releases
+    chosen = None
+    if version is None and manifest_file is None:
+        start, version = targets.next_stop(session.instance, releases)
+        if version is None:
+            return _nothing_to_upgrade(session, start)
+        chosen = f"Upgrading to Platform {version}, {targets.describe_next(start, version)}."
     target, channel = targets.target(releases, version, manifest_file)
-    target.check_install(session.own_commit())
+    # Whether the instance may take the target comes before the install check, so an older
+    # target never asks for an older dp-instance.
     if channel == "stable":
         targets.check_may_take(session.instance, releases, target)
+    target.check_install(session.own_commit())
     mapped = session.instance.components
     first_hop = [
         item.key for item in target.order if item.key in mapped and at_first_hop(mapped[item.key].path)
@@ -83,6 +109,7 @@ def upgrade(session: Session, version: str | None, manifest_file: str | None) ->
         manifest_origin=manifest_file or f"platform-release/{target.platform_version}",
         first_hop=first_hop,
         previous_manifest="previous-manifest.json" if previous else None,
+        chosen=chosen,
     )
     run.manifest_path.write_text(target.text, encoding="utf-8")
     if previous:

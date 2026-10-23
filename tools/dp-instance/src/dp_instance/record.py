@@ -1,10 +1,10 @@
 """A run and its record, in `.dp-instance/runs/<run>/`.
 
 A run is one journey through the whole sequence. Its record holds the manifest it runs, the
-commits it's tied to, each step's outcome as it happens, where it stopped and why, its log,
-its plan files and its handoff pages. `status` reads it without planning anything, and
-`resume` carries on from where it stopped. The record never stands in for a plan: each step
-is still planned right before it's applied.
+commits it's tied to, each step's outcome as it happens, the pull requests it opened and merged,
+where it stopped and why, its log, its plan files and its handoff pages. `status` reads it
+without planning anything, and `resume` carries on from where it stopped. The record never
+stands in for a plan: each step is still planned right before it's applied.
 """
 
 from __future__ import annotations
@@ -121,6 +121,16 @@ class Record:
             **{key: value for key, value in detail.items() if value not in (None, [], {})},
         }
         self.data["position"] = entry.id
+        self.save()
+
+    def pull_request(self, repository: str, pull: dict) -> None:
+        """Keep a pull request of the run's in a repository, as GitHub lists it: its number, its
+        URL and, once merged, the commit it merged as."""
+        self.data.setdefault("pull_requests", {})[repository] = {
+            "number": pull["number"],
+            "url": pull.get("url"),
+            "merge_commit": (pull.get("mergeCommit") or {}).get("oid"),
+        }
         self.save()
 
     def stop(self, status: str, reason: str, message: str, **detail) -> None:

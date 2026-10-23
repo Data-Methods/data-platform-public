@@ -7,6 +7,7 @@ checks it against the checkouts before doing anything else.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -139,6 +140,13 @@ class Instance:
         if not ignore.exists():
             ignore.write_text("*\n", encoding="utf-8")
         return folder
+
+    def own(self, kind: str, repository: str) -> Path:
+        """A folder of dp-instance's own for one repository, `.dp-instance/<kind>/` and eight
+        hex digits of its key's hash: about as deep as the repository's checkout. Windows
+        refuses a path over 260 characters, and a template's deepest file comes near that from
+        the checkout itself."""
+        return self.state / kind / hashlib.sha256(repository.encode()).hexdigest()[:8]
 
     @property
     def components(self) -> dict[str, Mapped]:

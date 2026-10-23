@@ -9,6 +9,9 @@ from pathlib import Path
 from . import processes
 from .outcome import Stop
 
+# The one branch a Managed Repository's Adoption PR comes from.
+ADOPTION_BRANCH = "platform-adoption"
+
 
 def _json(path: Path, *arguments: str):
     try:

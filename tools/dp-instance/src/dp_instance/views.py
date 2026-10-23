@@ -97,7 +97,7 @@ class Preview(Run):
                     continue
                 for item in event.get("handoffs") or []:
                     sections.append(item)
-                self.optional(step, event)
+                self.optional(event)
                 status = event.get("status")
                 if status == "change":
                     step.add("Step Plan:", event.get("summary") or "a change")
@@ -226,7 +226,7 @@ class Verification(Run):
                 self.finish(entry, step, "not verified")
                 continue
             event = events[-1]
-            self.optional(step, event)
+            self.optional(event)
             status = event.get("status")
             if status == "converged":
                 self.finish(entry, step, "converged", compact=True)

@@ -4,19 +4,23 @@
 Repositories contain components, components contain phases and phases contain steps.
 Before anything changes, every component's `preflight` step runs and, in an upgrade run, the
 drift check. An upgrade run then runs each repository owner's `upgrade` phase and every
-component's `migrate` step, repository by repository. Then, per repository, each component's
-phases, the owner's `merge` phase, and the phases that read the merged commit.
+component's `migrate` step, repository by repository; its preflights and `upgrade` phases are
+the target's, as the target declares them. Then, per repository, each component's phases,
+the owner's `merge` phase, and the phases that read the merged commit.
 """
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 
 from .manifest import Manifest, Repository
 from .outcome import failed
 
 UPGRADE = "upgrade"
 MERGE = "merge"
+# The one-time move onto the release repositories, which only a repository at its 2026.2 to
+# 2026.3 hop takes. Deleted at the 2026.4 stop.
+FIRST_MOVE = "first-move"
 
 
 @dataclass(frozen=True)
@@ -118,7 +122,8 @@ class Entry:
     preflight_counter: str = ""
     repository_description: str = ""
     component_description: str = ""
-    # At the 2026.3 hop, an entry run from the owner's fetched 2026.3 CLI.
+    # An entry run from the owner's CLI fetched at the target: an upgrade's preflights and
+    # its owners' `upgrade` phases.
     fetched: bool = False
 
     def describe(self) -> dict:
@@ -151,6 +156,8 @@ class Plan:
     manifest: Manifest
     repositories: tuple[Repository, ...]
     declarations: dict[tuple[str, str], Declaration]
+    # The repositories an upgrade leaves as they are, which take no `upgrade` phase.
+    unchanged: frozenset[str] = frozenset()
 
     def declared(self, repository: str, component: str) -> Declaration:
         return self.declarations[(repository, component)]
@@ -183,7 +190,7 @@ class Plan:
 
     def _phase_names(self, repository: Repository, declared: Declaration, upgrade: bool) -> list[str]:
         names = [phase.name for phase in declared.phases]
-        if upgrade and declared.owner:
+        if upgrade and declared.owner and repository.key not in self.unchanged:
             names.insert(0, UPGRADE)
         return names
 
@@ -220,16 +227,23 @@ class Plan:
             for number, (repository, component) in enumerate(found, 1)
         ]
 
-    def code(self) -> list[Entry]:
+    def code(self, first_hop: set[str]) -> list[Entry]:
         """An upgrade run's code: each owner's `upgrade` phase, then every component's
-        `migrate` step, repository by repository."""
+        `migrate` step, repository by repository. Only a repository at its first hop takes
+        the first move, and one the upgrade leaves unchanged takes no `upgrade` phase."""
         entries = []
         for repository in self.repositories:
             owner = repository.owner
             declared = self.declared(repository.key, owner.key)
-            if declared.upgrade is None:
+            upgrade = declared.upgrade
+            if upgrade is None:
                 raise failed(f"{owner.key} declares no upgrade phase, so it can't own {repository.key}.")
-            entries.extend(self._phase_entries(repository, owner, declared.upgrade, True, "upgrade"))
+            if repository.key not in first_hop:
+                upgrade = replace(
+                    upgrade, steps=tuple(step for step in upgrade.steps if step.name != FIRST_MOVE)
+                )
+            if repository.key not in self.unchanged:
+                entries.extend(self._phase_entries(repository, owner, upgrade, True, "upgrade"))
             for component in repository.components:
                 migrate = self.declared(repository.key, component.key).migrate
                 if migrate:

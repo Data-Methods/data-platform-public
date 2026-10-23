@@ -1,24 +1,31 @@
-"""`dp-instance secret list|reload|rotate`: secrets day to day, with no plan and no Terraform.
+"""`dp-instance secret list|set|reload|rotate`: secrets day to day, with no plan and no Terraform.
 
 Each component keeps its own secrets through its secrets steps; dp-instance drives each
-component's `secret` commands and asks for approvals. `list` shows every secret, what it's
-for, who supplies it, what reads it and its state. A supplied secret changes by writing a new
-version in Key Vault, by any means; `reload` then checks its fields by name and restarts the
-readers that are behind. `rotate` makes a platform-generated secret's new value, sets it where
-it's used, writes it to the vault and restarts its readers. Values are never printed.
+component's `secret` commands and asks for approvals. `list` shows every secret, or one, what
+it's for, who supplies it, what reads it and its state. `set` asks a person at a terminal for
+the fields they supply of one secret, which its component writes as a new version, keeping the
+others, before it restarts the secret's readers. A supplied secret may also change by writing a
+new version in Key Vault, by any means; `reload` then checks its fields by name, restarts the
+readers that are behind and names each it restarted. `rotate` makes a platform-generated
+secret's new value, sets it where it's used, writes it to the vault and restarts its readers.
+Values are never printed.
 """
 
 from __future__ import annotations
 
+import re
 from contextlib import nullcontext
 from dataclasses import dataclass
 
 from rich.text import Text
 
-from . import record, targets
+from . import prompts, record, targets
 from .components import Call, Cli, Log
 from .outcome import WAITS, Next, Result, Stop, failed
 from .session import Session
+
+# The line a component prints for each secret whose readers it restarted.
+RESTARTED = re.compile(r"\S+: restarted .+\.")
 
 
 @dataclass(frozen=True)
@@ -65,22 +72,31 @@ def _listing(session: Session, found: list[Holder]) -> list[tuple[Holder, dict]]
     return secrets
 
 
+def _unknown(name: str) -> Stop:
+    return failed(
+        f"No component keeps a secret named {name}.",
+        Next("dp-instance secret list", "lists every secret"),
+    )
+
+
 def _owner(session: Session, found: list[Holder], name: str) -> Holder:
     owners = [holder for holder, event in _listing(session, found) if event.get("name") == name]
     if not owners:
-        raise failed(
-            f"No component keeps a secret named {name}.",
-            Next("dp-instance secret list", "lists every secret"),
-        )
+        raise _unknown(name)
     return owners[0]
 
 
-def list_secrets(session: Session) -> Result:
+def list_secrets(session: Session, name: str | None) -> Result:
     screen = session.screen
     found, run = holders(session, "list")
-    screen.header("secret list", ("instance", session.instance.key))
+    rows = [("instance", session.instance.key), *([("secret", name)] if name else [])]
+    screen.header("secret list", *rows)
     with screen.console.status("Reading every component's secrets") if screen.interactive else nullcontext():
         secrets = _listing(session, found)
+    if name:
+        secrets = [(holder, event) for holder, event in secrets if event.get("name") == name]
+        if not secrets:
+            raise _unknown(name)
     shown = []
     for holder, event in secrets:
         screen.blank()
@@ -128,17 +144,32 @@ def _decisions(session: Session, call: Call, approvals: list[str], command: str)
     )
 
 
-def _drive(session: Session, holder: Holder, arguments: list[str], command: str) -> Call:
+def _drive(
+    session: Session,
+    holder: Holder,
+    arguments: list[str],
+    command: str,
+    values: dict[str, dict[str, str]] | None = None,
+) -> tuple[Call, list[str]]:
+    """Run a component's secret command, asking for each decision it stops for; ``values`` a
+    person supplied go to every run's stdin. Returns the last call and every `<secret>:
+    restarted <readers>.` line: a call that stops for a later secret's decision may already
+    have restarted an earlier one's readers, which shows then."""
     approvals = list(session.options.approvals)
+    restarted: list[str] = []
     while True:
         extra = [part for identifier in dict.fromkeys(approvals) for part in ("--approve", identifier)]
         if session.options.auto_approve:
             extra.append("--auto-approve")
-        call = holder.cli.run(*arguments, "--json", *extra)
+        call = holder.cli.run(*arguments, "--json", *extra, stdin=values)
+        lines = [line.strip() for line in call.stderr if RESTARTED.fullmatch(line.strip())]
+        restarted += lines
         if call.status == "decision":
+            for line in lines:
+                session.screen.note(line)
             _decisions(session, call, approvals, command)
             continue
-        return call
+        return call, restarted
 
 
 def _report(session: Session, holder: Holder, call: Call, command: str) -> Result:
@@ -176,13 +207,15 @@ def reload(session: Session, name: str | None) -> Result:
         if name
         else [holder for holder in found if holder.cli.run("secret", "list", "--json").status != "usage"]
     )
+    restarted = []
     for holder in chosen:
         session.screen.blank()
         session.screen.labelled("Component Name:", Text(holder.component, style="bold"))
-        call = _drive(session, holder, ["secret", "reload", *([name] if name else [])], command)
+        call, lines = _drive(session, holder, ["secret", "reload", *([name] if name else [])], command)
         _report(session, holder, call, "secret reload")
+        restarted += lines
     run.complete()
-    return Result("secret reload", "done", "Every reader that was behind restarted.")
+    return Result("secret reload", "done", " ".join(restarted) or "No reader was behind.")
 
 
 def rotate(session: Session, name: str) -> Result:
@@ -191,7 +224,50 @@ def rotate(session: Session, name: str) -> Result:
     holder = _owner(session, found, name)
     session.screen.blank()
     session.screen.labelled("Component Name:", Text(holder.component, style="bold"))
-    call = _drive(session, holder, ["secret", "rotate", name], f"dp-instance secret rotate {name}")
+    call, _ = _drive(session, holder, ["secret", "rotate", name], f"dp-instance secret rotate {name}")
     result = _report(session, holder, call, "secret rotate")
     run.complete()
     return result
+
+
+def set_secret(session: Session, name: str) -> Result:
+    """Ask the owner which fields a person supplies, ask for each at the terminal, then have
+    the owner write them, asking for its restarts as `reload` does."""
+    found, run = holders(session, "set")
+    screen = session.screen
+    screen.header("secret set", ("instance", session.instance.key), ("secret", name))
+    command = f"dp-instance secret set {name}"
+    if not session.interactive:
+        raise Stop(
+            "values",
+            f"secret set needs a terminal: a person types {name}'s values, which never pass through "
+            "an agent.",
+            next=(
+                Next(
+                    command,
+                    "run by a person at a terminal: asks for each value with a hidden prompt and hands it "
+                    "to the component alone",
+                ),
+            ),
+        )
+    holder = _owner(session, found, name)
+    screen.blank()
+    screen.labelled("Component Name:", Text(holder.component, style="bold"))
+    asked = holder.cli.run("secret", "set", name, "--json")
+    if asked.status == "usage":
+        raise failed(
+            f"{holder.component}'s engine predates secret set, so it can't set {name}; "
+            "a newer Platform Version brings it."
+        )
+    supply = ((asked.result or {}).get("values") or {}).get("supply")
+    if asked.status != "values" or not supply:
+        _report(session, holder, asked, "secret set")
+        raise failed(f"{holder.component} named no values to supply for {name}.")
+    screen.blank()
+    screen.note(f"The values go to {holder.cli.command} alone, and nowhere else.")
+    values = prompts.supply(screen, supply)
+    screen.blank()
+    call, restarted = _drive(session, holder, ["secret", "set", name, "--values-from-stdin"], command, values)
+    _report(session, holder, call, "secret set")
+    run.complete()
+    return Result("secret set", "done", " ".join([f"{name}: set.", *restarted]))

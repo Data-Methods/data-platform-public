@@ -258,7 +258,9 @@ class Releases:
                 f"and now names {published[version]}. Release tags never move; tell Data Methods."
             )
         if not local.ok:
-            gitops.git("fetch", "--quiet", "--depth=1", "--no-tags", self.url, f"{tag}:{tag}", cwd=self.cache)
+            gitops.remote_git(
+                "fetch", "--quiet", "--depth=1", "--no-tags", self.url, f"{tag}:{tag}", cwd=self.cache
+            )
             local = gitops.git("rev-parse", f"{tag}^{{commit}}", cwd=self.cache)
             if local.stdout.strip() != published[version]:
                 raise failed(f"The fetched platform-release/{version} isn't the published commit.")
@@ -285,7 +287,9 @@ class Releases:
         ]
         if missing:
             refspecs = [f"{TAG_PREFIX}{version}:{TAG_PREFIX}{version}" for version in missing]
-            gitops.git("fetch", "--quiet", "--depth=1", "--no-tags", self.url, *refspecs, cwd=self.cache)
+            gitops.remote_git(
+                "fetch", "--quiet", "--depth=1", "--no-tags", self.url, *refspecs, cwd=self.cache
+            )
 
     def documents(self) -> list[tuple[str, dict]]:
         """Every published manifest's JSON, newest first, as published: for matching an

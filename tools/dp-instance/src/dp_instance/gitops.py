@@ -1,15 +1,19 @@
-"""Reading Git: checkouts, remotes and tags. dp-instance does no Git work in a checkout; the
-components commit, push and merge. It only observes, and fetches release manifests and
-template sources into its own folder."""
+"""Reading Git: checkouts, remotes and tags. dp-instance commits, pushes and merges nothing in a
+checkout; the components do. It observes, fetches a Managed Repository's tags to read its
+release, and fetches release manifests and template sources into its own folder. A read from
+a remote that fails for a moment is retried."""
 
 from __future__ import annotations
 
+import os
 import re
+import shutil
+import stat
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from . import processes
-from .outcome import failed
+from . import processes, transient
+from .outcome import Stop, failed
 
 COMMIT = re.compile(r"^[0-9a-f]{40}$")
 DEVELOPMENT_SUFFIX = "-dev"
@@ -17,6 +21,38 @@ DEVELOPMENT_SUFFIX = "-dev"
 
 def git(*arguments: str, cwd: Path | None = None, check: bool = True) -> processes.Completed:
     return processes.run("git", *arguments, cwd=cwd, check=check)
+
+
+def remote_git(*arguments: str, cwd: Path | None = None) -> processes.Completed:
+    """A Git command that reaches a remote. A failure that looks temporary, such as a dropped
+    connection, is retried after a wait, up to three times; the last failure stops, saying
+    whether it looked temporary."""
+    retried = 0
+    while True:
+        found = git(*arguments, cwd=cwd, check=False)
+        if found.ok:
+            return found
+        temporary = transient.classify(found.stderr)
+        if not transient.retries(temporary, retried, label=f"git {arguments[0]}"):
+            break
+        retried += 1
+    words = " ".join(("git", *arguments[:2]))
+    message = transient.exhausted(f"{words} failed: {found.first_error_line()}", temporary, retried)
+    if temporary is not None:
+        raise Stop("failed", message, reason="transient")
+    raise failed(message)
+
+
+def remove(folder: Path) -> None:
+    """Remove a checkout of dp-instance's own, if there is one. Git leaves its object files
+    read only, which Windows won't delete until they're made writable."""
+
+    def writable(function, path, _):
+        os.chmod(path, stat.S_IWRITE)
+        function(path)
+
+    if folder.exists():
+        shutil.rmtree(folder, onexc=writable)
 
 
 def is_checkout_root(path: Path) -> bool:
@@ -88,9 +124,7 @@ def contains(path: Path, ancestor: str, descendant: str) -> bool:
 
 def remote_refs(url: str, *patterns: str) -> dict[str, str]:
     """`git ls-remote`: each matching ref and the object it names, peeled for annotated tags."""
-    found = git("ls-remote", url, *patterns, check=False)
-    if not found.ok:
-        raise failed(f"git ls-remote {url} failed: {found.first_error_line()}")
+    found = remote_git("ls-remote", url, *patterns)
     refs: dict[str, str] = {}
     for line in found.stdout.splitlines():
         sha, _, name = line.partition("\t")
@@ -154,5 +188,5 @@ def fetch_commit(destination: Path, url: str, commit: str) -> None:
     destination.mkdir(parents=True, exist_ok=True)
     if not (destination / ".git").exists():
         git("init", "--quiet", cwd=destination)
-    git("fetch", "--quiet", "--depth=1", "--no-tags", url, commit, cwd=destination)
+    remote_git("fetch", "--quiet", "--depth=1", "--no-tags", url, commit, cwd=destination)
     git("-c", "advice.detachedHead=false", "checkout", "--quiet", "--force", commit, cwd=destination)

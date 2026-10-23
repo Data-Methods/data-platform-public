@@ -3,10 +3,10 @@
 It shows the active run's journey from its record, then what the repositories record, what
 the hold acts on, their open pull requests, and each Managed Repository's adoption: whether
 its adoption pull request is merged and released, and which Platform Version each
-Environment's workflows pin. It reads the run record, Git and GitHub, and the hold from the
-cluster when it can reach it, so it runs from any workstation, with no network check: outside
-the instance's network the hold is unknown. At a terminal it offers to resume the active run
-or start a new one.
+Environment's workflows pin, read once its tags and `main` are fetched. It reads the run
+record, Git and GitHub, and the hold from the cluster when it can reach it, so it runs from
+any workstation, with no network check: outside the instance's network the hold is unknown.
+It asks nothing: it prints, names what comes next and returns.
 """
 
 from __future__ import annotations
@@ -20,12 +20,10 @@ from . import github, gitops, hold, record, targets
 from .instance import INFRASTRUCTURE, Mapped
 from .manifest import Releases, family
 from .outcome import Next, Result, Stop
-from .runs import apply, resume
 from .screen import NAME_LABELS, level_line
 from .sequence import Entry
 from .session import Session
 
-ADOPTION_BRANCH = "platform-adoption"
 REASONS = {
     "decision": "stopped for review",
     "declined": "stopped: the change wasn't approved",
@@ -141,17 +139,22 @@ def _pinned_version(session: Session, releases: Releases, pins: set[str]) -> str
 
 
 def adoption(session: Session, releases: Releases, managed: Mapped) -> dict:
-    """A Managed Repository's adoption, from GitHub and Git reads only."""
+    """A Managed Repository's adoption, from GitHub, and from Git once the checkout has
+    fetched its tags and `main`. Checks and reviewers matter only while the pull request is
+    open."""
     screen = session.screen
     found: dict = {"repository": managed.name}
+    with screen.console.status(f"Fetching {managed.name}") if session.interactive else nullcontext():
+        fetched = gitops.git("fetch", "--quiet", "--tags", cwd=managed.path, check=False).ok
+    found["fetched"] = fetched
     screen.blank()
     screen.labelled("Repo Name:", Text(managed.name, style="bold"))
-    pull = github.pull_request(managed.path, ADOPTION_BRANCH, state="all")
+    pull = github.pull_request(managed.path, github.ADOPTION_BRANCH, state="all")
     if pull is None:
         screen.labelled("Adoption PR:", "none open or merged")
     else:
         merge = (pull.get("mergeCommit") or {}).get("oid")
-        state = github.describe(pull)
+        state = "draft" if pull.get("isDraft") else str(pull.get("state", "")).lower()
         if merge:
             main = gitops.contains(managed.path, merge, "origin/main")
             tags = gitops.git(
@@ -162,10 +165,11 @@ def adoption(session: Session, releases: Releases, managed: Mapped) -> dict:
                 f", released in {tags[0]}" if released else ", not released yet"
             )
         screen.labelled("Adoption PR:", f"#{pull['number']} {state} {pull.get('url', '')}".strip())
-        screen.labelled("Adoption Checks:", github.checks(pull))
-        reviewers = github.reviewers(pull)
-        if reviewers:
-            screen.labelled("Adoption Reviewers:", ", ".join(reviewers))
+        if pull.get("state") == "OPEN":
+            screen.labelled("Adoption Checks:", github.checks(pull))
+            reviewers = github.reviewers(pull)
+            if reviewers:
+                screen.labelled("Adoption Reviewers:", ", ".join(reviewers))
         found["pull_request"] = {"number": pull["number"], "state": state}
     infrastructure = session.instance.infrastructure
     if infrastructure is not None:
@@ -186,7 +190,10 @@ def adoption(session: Session, releases: Releases, managed: Mapped) -> dict:
                 )
                 continue
             pinned = _pinned_version(session, releases, _pins(managed, revision, name))
-            screen.labelled(f"{environment} Pins:", f"{pinned} ({revision}, as last fetched)")
+            screen.labelled(
+                f"{environment} Pins:",
+                f"{pinned} ({revision})" if fetched else f"{pinned} ({revision}, as last fetched)",
+            )
             found[environment.lower()] = pinned
     return found
 
@@ -218,8 +225,10 @@ def status(session: Session) -> Result:
     instance = session.instance
     run = record.active(instance.state)
     detail: dict = {"active": None}
+    screen.header("status", ("instance", instance.key))
     if run is not None:
-        screen.header(run.data["goal"], ("instance", instance.key), ("run", run.id))
+        screen.blank()
+        screen.print(Text.assemble((run.data["goal"], "bold cyan"), f" · run {run.id}"))
         screen.print(
             Text.assemble(
                 ("recorded ", "bold"),
@@ -262,7 +271,6 @@ def status(session: Session) -> Result:
             "can_resume": not moved,
         }
     else:
-        screen.header("status", ("instance", instance.key))
         last = next(iter(record.records(instance.state)), None)
         screen.blank()
         if last is not None:
@@ -274,16 +282,24 @@ def status(session: Session) -> Result:
 
     screen.stage("the instance")
     releases = session.releases
+    upcoming: Next | None = None
     try:
         current = targets.current(instance, releases)
         screen.labelled("Repositories Record:", current.describe())
         detail["platform_version"] = current.version
-        upcoming = targets.next_release(releases, current.version) if current.version else None
-        if current.version is None and current.canary:
-            upcoming = _candidate_release(session, detail)
+        if current.version:
+            release = targets.next_release(releases, current.version)
+            if release:
+                upcoming = Next(
+                    f"dp-instance upgrade --to {release}",
+                    f"takes Platform {release}, {targets.describe_next(current.version, release)}",
+                )
+        elif current.canary:
+            release = _candidate_release(session, detail)
+            if release:
+                upcoming = Next(f"dp-instance upgrade --to {release}", f"Platform {release} is published")
     except Stop as stop:
         screen.labelled("Repositories Record:", f"unknown: {stop.message}")
-        upcoming = None
     with screen.console.status("Reading the hold from the cluster") if session.interactive else nullcontext():
         found = hold.read(instance)
     if found.describe() is not None:
@@ -311,13 +327,6 @@ def status(session: Session) -> Result:
     if instance.managed:
         screen.stage("adoption")
         detail["adoption"] = [adoption(session, releases, managed) for managed in instance.managed]
-    latest = next(iter(record.records(instance.state)), None)
-    optional = list((latest.data.get("optional") or {}).values()) if latest else []
-    if optional:
-        screen.stage("optional handoffs")
-        for item in optional:
-            screen.labelled("Optional Handoff:", f"{item.get('title')} ({item.get('system')})")
-        detail["optional_handoffs"] = [item.get("title") for item in optional]
 
     steps: list[Next] = []
     if run is not None:
@@ -325,19 +334,7 @@ def status(session: Session) -> Result:
             Next("dp-instance resume", "carries on from where the run stopped")
         ]
     elif upcoming:
-        steps = [Next(f"dp-instance upgrade --to {upcoming}", f"Platform {upcoming} is published")]
+        steps = [upcoming]
     if steps:
-        screen.next_block(steps)
-    result = Result("status", "done", None, tuple(steps), detail)
-    if not session.interactive:
-        return result
-    choices = (
-        [("r", "resume (dp-instance resume)")] if run is not None and detail["active"]["can_resume"] else []
-    )
-    choices += [("a", "new run (dp-instance apply)"), ("q", "quit")]
-    key = screen.choose(choices)
-    if key == "r":
-        return resume(session)
-    if key == "a":
-        return apply(session)
-    return result
+        screen.next_block(steps, session.relative(run.folder) + "/" if run is not None else None)
+    return Result("status", "done", None, tuple(steps), detail)

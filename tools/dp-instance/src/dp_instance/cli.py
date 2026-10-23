@@ -2,13 +2,13 @@
 
     dp-instance [status]                    where the instance stands, planning nothing
     dp-instance setup                       map the instance's repositories
-    dp-instance upgrade --to VERSION        one run, from the code into the platform
+    dp-instance upgrade [--to VERSION]      one run, from the code into the platform
     dp-instance plan                        preview the next change; starts no run
     dp-instance apply                       a new run on the checked-out code
     dp-instance resume                      carry on from where the active run stopped
     dp-instance verify                      the completion check
     dp-instance template-access setup|check
-    dp-instance secret list|reload|rotate
+    dp-instance secret list|set|reload|rotate
 
 Every command takes --json: one JSON object per line on stdout, ending with the result, and
 no question asked. Exit codes: 0 done, 1 failed, 2 a usage error, 3 an external handoff,
@@ -61,10 +61,15 @@ def _parser() -> argparse.ArgumentParser:
         "--approve", action="append", default=[], metavar="ID", help="Write the map setup showed."
     )
     upgrade = commands.add_parser(
-        "upgrade", parents=[common, approving], help="Upgrade to a Platform Version."
+        "upgrade", parents=[common, approving], help="Upgrade to the next release, or the one --to names."
     )
-    target = upgrade.add_mutually_exclusive_group(required=True)
-    target.add_argument("--to", metavar="VERSION", help="The published Platform Version, such as 2026.3.")
+    target = upgrade.add_mutually_exclusive_group()
+    target.add_argument(
+        "--to",
+        metavar="VERSION",
+        help="The published Platform Version, such as 2026.3. By default, the next stop: the next "
+        "Platform Version, else a newer fix of the one the instance runs.",
+    )
     target.add_argument(
         "--manifest",
         metavar="FILE",
@@ -87,14 +92,16 @@ def _parser() -> argparse.ArgumentParser:
 
     access = commands.add_parser("template-access", parents=[common], help="Set up or check template access.")
     access_commands = access.add_subparsers(dest="access", metavar="ACTION", required=True)
-    for name, text in (
-        ("setup", "Set up one template's key, vault copy and SSH alias."),
-        ("check", "Check template access."),
+    for name, text, default in (
+        (
+            "setup",
+            "Set up template access: each key, its vault copy, SSH alias and Git rule.",
+            "with --key-vault, every template in dp-instance.json whose key the vault holds",
+        ),
+        ("check", "Check template access.", "every template set up here or mapped"),
     ):
         sub = access_commands.add_parser(name, parents=[common], help=text)
-        sub.add_argument(
-            "template", nargs=None if name == "setup" else "?", help="The Template Repository Key."
-        )
+        sub.add_argument("template", nargs="?", help=f"The Template Repository Key; by default, {default}.")
         sub.add_argument(
             "--instance", metavar="KEY", help="The Platform Instance Key; read from the map by default."
         )
@@ -117,11 +124,18 @@ def _parser() -> argparse.ArgumentParser:
                 help="Adopt the older Infrastructure key, without rotating it.",
             )
 
-    secret = commands.add_parser("secret", parents=[common], help="List, reload or rotate secrets.")
+    secret = commands.add_parser("secret", parents=[common], help="List, set, reload or rotate secrets.")
     secret_commands = secret.add_subparsers(dest="secret", metavar="ACTION", required=True)
-    secret_commands.add_parser(
-        "list", parents=[common], help="Every secret, who supplies it, what reads it, its state."
+    listing = secret_commands.add_parser(
+        "list", parents=[common], help="Every secret, or one: who supplies it, what reads it, its state."
     )
+    listing.add_argument("name", nargs="?", help="One secret; every secret by default.")
+    setting = secret_commands.add_parser(
+        "set",
+        parents=[common, approving],
+        help="At a terminal, replace the fields a person supplies of one secret.",
+    )
+    setting.add_argument("name", help="The secret to set.")
     reload = secret_commands.add_parser(
         "reload", parents=[common, approving], help="Restart the readers that are behind."
     )
@@ -177,7 +191,9 @@ def _dispatch(arguments, screen: Screen) -> Result:
     if command == "verify":
         return views.verify(session)
     if arguments.secret == "list":
-        return secrets.list_secrets(session)
+        return secrets.list_secrets(session, arguments.name)
+    if arguments.secret == "set":
+        return secrets.set_secret(session, arguments.name)
     if arguments.secret == "reload":
         return secrets.reload(session, arguments.name)
     return secrets.rotate(session, arguments.name)

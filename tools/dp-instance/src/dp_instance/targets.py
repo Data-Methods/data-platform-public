@@ -7,7 +7,8 @@ A repository on `canary` runs unpublished commits, which only canary's own candi
 manifests name, kept in its runs' records on the workstation that ran them; there, the
 candidate's Platform Version is where the instance stands, and its published release is
 the one it takes. A release whose manifest names no `dp-instance`, as 2026.2's doesn't,
-predates it: an instance on it runs only `status` and `upgrade`.
+predates it: an instance on it runs only `status` and `upgrade`. Versions compare whole, so
+2026.3.1 is newer than 2026.3.
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ from pathlib import Path
 
 from . import record as records
 from .instance import SETUP, Instance, SourceRecord
-from .manifest import Manifest, Releases, family, read_file
+from .manifest import Manifest, Releases, family, read_file, version_key
 from .outcome import Next, Stop, failed
 
 
@@ -46,6 +47,20 @@ def matches(document: dict, recorded: dict[str, SourceRecord], *, snapshots: boo
         if commit != sources[template] and not (snapshots and commit in _snapshots(document, template)):
             return False
     return True
+
+
+def named_before(releases: Releases, version: str) -> dict[str, set[str]]:
+    """Each template's commits that the releases published before ``version`` name. A
+    release reuses the commit of a template that didn't change, so one that names such a
+    commit leaves that template as it was."""
+    found: dict[str, set[str]] = {}
+    for published, document in releases.documents():
+        sources = document.get("sources")
+        if version_key(published) >= version_key(version) or not isinstance(sources, dict):
+            continue
+        for template, commit in sources.items():
+            found.setdefault(template, set()).add(commit)
+    return found
 
 
 @dataclass(frozen=True)
@@ -151,21 +166,49 @@ def _before_dp_instance(releases: Releases, version: str) -> Stop:
 
 
 def next_release(releases: Releases, version: str) -> str | None:
-    """The release an instance on ``version`` upgrades to next: a newer fix of its own
-    Platform Version, or else the newest release of the next one."""
-    newer = releases.latest_of(family(version))
-    if newer and newer != version:
-        return newer
+    """The release an instance on ``version`` upgrades to next: the newest release of the next
+    Platform Version, which holds its own version's fixes, or else a newer fix of its own."""
     later = [item for item in releases.families() if item > family(version)]
-    return releases.latest_of(later[0]) if later else None
+    if later:
+        return releases.latest_of(later[0])
+    newer = releases.latest_of(family(version))
+    return newer if newer is not None and version_key(newer) > version_key(version) else None
+
+
+def describe_next(version: str, upcoming: str) -> str:
+    """What ``upcoming``, the next release, is to an instance on ``version``."""
+    if family(upcoming) > family(version):
+        return "the next Platform Version, a required stop"
+    return "the newest fix of Platform " + ".".join(str(part) for part in family(version))
+
+
+def next_stop(instance: Instance, releases: Releases) -> tuple[str, str | None]:
+    """With no target named, the release the instance runs, as each repository's `main`
+    records it, and the next one it takes, or None on the newest release. Candidate commits
+    take none: only a candidate manifest keeps canary on the canary channel."""
+    found = current(instance, releases, applied=True)
+    if found.canary:
+        raise failed(
+            "This instance runs canary candidate commits, so dp-instance doesn't choose the release it "
+            "takes: a candidate manifest keeps it on the canary channel.",
+            Next("dp-instance upgrade --manifest <candidate manifest>", "upgrades to that candidate"),
+        )
+    if found.version is None:
+        raise failed(
+            "This instance's recorded template commits match no published release, so dp-instance "
+            "can't tell which release it takes next.",
+            Next("dp-instance status", "shows what each repository records"),
+        )
+    return found.version, next_release(releases, found.version)
 
 
 def check_may_take(instance: Instance, releases: Releases, target: Manifest) -> Current:
     """Every Platform Version is a required stop: an instance moves to a release of its own
-    family or of the next one, from any release of its current one. On candidate commits, its
-    own is the Platform Version they're the candidate of, when this workstation ran it. What it
-    runs is what each repository's `main` records, so an upgrade under way on its branch still
-    counts as the release it started from."""
+    family or of the next one, from any release of its current one, and never back to an older
+    release, an older fix included. On candidate commits, its own is the Platform Version
+    they're the candidate of, when this workstation ran it. What it runs is what each
+    repository's `main` records, so an upgrade under way on its branch still counts as the
+    release it started from."""
     found = current(instance, releases, applied=True)
     if found.version is None and not found.canary:
         raise failed(
@@ -177,11 +220,11 @@ def check_may_take(instance: Instance, releases: Releases, target: Manifest) -> 
     if start is None:
         return found
     runs = f"Platform {start}" if found.version else f"canary candidate commits of Platform {start}"
+    if version_key(target.platform_version) < version_key(start):
+        raise failed(f"This instance runs {runs}; it can't go back to {target.platform_version}.")
     # A candidate's Platform Version may not be published yet.
     families = sorted({*releases.families(), family(start)})
     distance = families.index(family(target.platform_version)) - families.index(family(start))
-    if distance < 0:
-        raise failed(f"This instance runs {runs}; it can't go back to {target.platform_version}.")
     if distance > 1:
         stop = releases.latest_of(families[families.index(family(start)) + 1])
         raise failed(

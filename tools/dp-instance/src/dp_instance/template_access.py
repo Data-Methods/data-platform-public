@@ -4,10 +4,22 @@
 `ssh-keygen`; checks the local key against the vault and stores it there if it's missing;
 restricts the key file to its owner on Windows and POSIX; writes the dedicated SSH host
 alias, `dm-<instance>-<template>`, and an `Include` at the top of the user's SSH
-configuration, checking the alias uses only that key; and prints the non-secret request for
-Data Methods. `check` confirms the key, the vault match, the SSH configuration and the
-template's reach. Canary alone also keeps a key for each development repository, under
-`<template>-dev`, whose alias the engine derives the same way.
+configuration, checking the alias uses only that key; for a template whose source record
+names plain or HTTPS github.com, adds a global Git `insteadOf` rule sending exactly that URL
+through the alias; and, for a key it has just created, prints the non-secret request for
+Data Methods. With no template named, it restores and sets up every template in
+`dp-instance.json` whose key the vault holds, and names any it couldn't. `check` confirms the
+key, the vault match, the SSH configuration and, with `git ls-remote`, every mapped
+template's reach through its alias. Canary alone also keeps a key for each development
+repository, under `<template>-dev`, whose alias the engine derives the same way.
+
+The SSH configuration names its files in `~/.ssh`, the `Include` relative to it and each key
+under `~`, which every OpenSSH resolves in its own home alike, Git for Windows' bundled one
+included, where a Windows absolute path reads as relative. On Windows the absolute `Include`
+of the same file follows, for Windows OpenSSH whatever `HOME` Git gives it. `setup` and
+`check` prove reach through Git itself, not only `ssh -G`; when Git still can't use an alias,
+such as with a `HOME` outside the user profile, they name the `core.sshCommand` that has Git
+run the OpenSSH they checked, and never set it themselves.
 
 A new keypair is only for an instance's first access to a template: `setup` refuses to create
 one for a template a mapped repository already reads through its alias, and names the
@@ -25,7 +37,7 @@ import re
 import stat
 import sys
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from rich.text import Text
@@ -41,6 +53,9 @@ LEGACY_SECRET = "dm-template-read-key"
 FOUNDATION = Path("config/infrastructure/platform_foundation.json")
 DEVELOPMENT = gitops.DEVELOPMENT_SUFFIX
 PRIVATE_KEY_HEADER = "-----BEGIN OPENSSH PRIVATE KEY-----"
+# A source record naming GitHub itself rather than the instance's alias, and its path.
+GITHUB_URL = re.compile(r"(?:git@github\.com:|https://github\.com/)(.+)")
+UNMAPPED = "not checked: no mapped repository uses this template"
 
 
 def _key(value: str, label: str) -> str:
@@ -69,12 +84,33 @@ class Access:
         return self.ssh_root / "template-access.conf"
 
     @property
+    def include(self) -> str:
+        """The managed configuration as the user's `Include` names it: relative to `~/.ssh`."""
+        return self.managed_config.relative_to(self.user_config.parent).as_posix()
+
+    @property
+    def include_lines(self) -> list[str]:
+        """The `Include` lines setup writes first in the user's SSH configuration: the relative
+        one, which every OpenSSH resolves in its own home; on Windows also the absolute one,
+        which Windows OpenSSH reads whatever `HOME` Git gives it and Git's bundled ssh, reading
+        it as relative to `~/.ssh`, skips."""
+        lines = [f"Include {self.include}"]
+        if sys.platform == "win32":
+            lines.append(f'Include "{self.managed_config.as_posix()}"')
+        return lines
+
+    @property
     def directory(self) -> Path:
         return self.ssh_root / self.instance / self.template
 
     @property
     def private(self) -> Path:
         return self.directory / "template-read"
+
+    @property
+    def identity(self) -> str:
+        """The private key as the SSH configuration names it: under `~`."""
+        return "~/" + self.private.relative_to(Path.home()).as_posix()
 
     @property
     def public(self) -> Path:
@@ -344,14 +380,14 @@ def update_managed_config(access: Access) -> None:
             for template in sorted(
                 path for path in instance.iterdir() if path.is_dir() and KEY.fullmatch(path.name)
             ):
-                key = template / "template-read"
-                if key.is_file():
+                entry = Access(instance.name, template.name)
+                if entry.private.is_file():
                     lines += [
                         "",
-                        f"Host dm-{instance.name}-{template.name}",
+                        f"Host {entry.alias}",
                         "    HostName github.com",
                         "    User git",
-                        f'    IdentityFile "{key.as_posix()}"',
+                        f"    IdentityFile {entry.identity}",
                         "    IdentitiesOnly yes",
                     ]
     write_atomically(access.managed_config, "\n".join(lines) + "\n", private=True)
@@ -372,14 +408,15 @@ def effective_problem(access: Access, config: Path) -> str | None:
         values.get("hostname", [""])[0] != "github.com"
         or values.get("user", [""])[0] != "git"
         or values.get("identitiesonly", [""])[0] != "yes"
-        or identities != [_posix(access.private.as_posix())]
+        or identities != [_posix(access.identity)]
     ):
         return f"the effective SSH configuration for {access.alias} doesn't use only its dedicated key"
     return None
 
 
 def ensure_include(access: Access) -> None:
-    """Put the `Include` first in the user's SSH configuration, keeping every other line."""
+    """Put the `Include` lines first in the user's SSH configuration, keeping every other line
+    and replacing any earlier `Include` of the same file."""
     config = access.user_config
     ensure_directory(config.parent)
     if config.is_symlink():
@@ -388,17 +425,17 @@ def ensure_include(access: Access) -> None:
         )
     current = config.read_text(encoding="utf-8") if config.is_file() else ""
     newline = "\r\n" if "\r\n" in current else "\n"
-    expected = _posix(access.managed_config.as_posix())
+    replaced = {_posix(access.include), _posix(access.managed_config.as_posix())}
     kept = []
     for line in re.split(r"\r?\n", current):
         content = line.split("#", 1)[0].strip()
         match = re.fullmatch(r"(?i)include\s+(.+)", content)
-        if match and _posix(match.group(1).strip()) == expected:
+        if match and _posix(match.group(1).strip()) in replaced:
             continue
         kept.append(line)
     while kept and kept[-1] == "":
         kept.pop()
-    updated = f'Include "{access.managed_config.as_posix()}"' + newline
+    updated = newline.join(access.include_lines) + newline
     if kept:
         updated += newline + newline.join(kept) + newline
     if current == updated:
@@ -416,6 +453,58 @@ def ensure_include(access: Access) -> None:
         restrict_file(config, private=True)
     finally:
         candidate.unlink(missing_ok=True)
+
+
+# Git --------------------------------------------------------------------------------------
+
+
+def alias_url(access: Access, url: str) -> str | None:
+    """The same repository through the alias, for a record naming plain or HTTPS github.com."""
+    match = GITHUB_URL.fullmatch(url)
+    return f"git@{access.alias}:{match.group(1)}" if match else None
+
+
+def ensure_rule(access: Access, url: str) -> bool:
+    """A global Git rule fetching exactly the record's ``url`` through the alias, keeping every
+    other rule; whether it's new."""
+    base = alias_url(access, url)
+    if base is None:
+        return False
+    name = f"url.{base}.insteadOf"
+    if url in gitops.git("config", "--global", "--get-all", name, check=False).stdout.splitlines():
+        return False
+    gitops.git("config", "--global", "--add", name, url)
+    return True
+
+
+def ssh_command() -> Next:
+    """The command that has Git run the OpenSSH `setup` checks the aliases with; it's named,
+    never run."""
+    path = Path(processes.executable("ssh")).as_posix()
+    value = f"'{path}'" if " " in path else path
+    return Next(
+        f'git config --global core.sshCommand "{value}"',
+        "has Git run the OpenSSH that reads the template access aliases",
+    )
+
+
+def reach(access: Access, url: str) -> str:
+    """That Git reaches the record's ``url`` through the alias, after its own rules and with
+    the ssh it runs."""
+    through = gitops.git("ls-remote", "--get-url", url).stdout.strip()
+    if not through.startswith(f"git@{access.alias}:"):
+        source = "directly" if through == url else f"from {through}"
+        raise failed(f"Git fetches {url} {source}, not through {access.alias}")
+    found = gitops.git("ls-remote", url, "HEAD", check=False)
+    if found.ok:
+        return f"{url} answers through {access.alias}"
+    if re.search(f"could not resolve hostname {re.escape(access.alias)}", found.stderr, re.IGNORECASE):
+        raise failed(
+            f"Git can't use {access.alias}: the ssh Git runs doesn't read the SSH configuration "
+            "that names it",
+            ssh_command(),
+        )
+    raise failed(f"{url} doesn't answer: {found.first_error_line()}")
 
 
 # Commands ---------------------------------------------------------------------------------
@@ -461,44 +550,232 @@ def _instance_key(given: str | None, start: Path) -> str:
         ) from None
 
 
+@dataclass
+class Report:
+    """What setup did for one template's access, and what's wrong with it."""
+
+    access: Access
+    template: str
+    done: list[str] = field(default_factory=list)
+    reach: list[str] = field(default_factory=list)
+    problems: list[str] = field(default_factory=list)
+    next: list[Next] = field(default_factory=list)
+    created: bool = False
+    public: str | None = None
+    fingerprint: str | None = None
+
+    def describe(self, key_vault: str | None, development: bool) -> dict:
+        return {
+            "template": self.template,
+            "development": development,
+            "alias": self.access.alias,
+            "private_key_path": str(self.access.private),
+            "public_key": self.public,
+            "fingerprint": self.fingerprint,
+            "key_vault_secret": f"{key_vault}/{self.access.secret}" if key_vault else None,
+            "created": self.created,
+            "reach": self.reach,
+            "problems": self.problems,
+        }
+
+
 def setup(
     screen: Screen,
     start: Path,
-    template: str,
+    template: str | None,
     *,
     instance: str | None,
     key_vault: str | None,
     development: bool,
     migrate_legacy: bool,
 ) -> Result:
-    template = _key(template, "Template Repository Key")
+    """One template's access, or, with none named, every template's in `dp-instance.json` whose
+    key the vault holds."""
+    if template is not None:
+        template = _key(template, "Template Repository Key")
     if key_vault is not None and not VAULT.fullmatch(key_vault):
         raise failed(f"{key_vault!r} isn't a Key Vault name.")
     if migrate_legacy and (template != INFRASTRUCTURE or development):
         raise failed(
             f"--migrate-legacy-infrastructure-key applies only to {INFRASTRUCTURE}'s release repository key."
         )
-    access = Access(_instance_key(instance, start), template + (DEVELOPMENT if development else ""))
+    key = _instance_key(instance, start)
+    every = None if template else _every_template(start, key_vault)
     for tool in (
         "ssh-keygen",
         "ssh",
+        "git",
         *(("icacls",) if sys.platform == "win32" else ()),
         *(("az",) if key_vault else ()),
     ):
         processes.executable(tool)
+    suffix = DEVELOPMENT if development else ""
+    if every is None:
+        access = Access(key, template + suffix)
+        reports = [
+            _set_up(
+                start,
+                access,
+                template,
+                key_vault=key_vault,
+                vault_current=bool(key_vault) and vault_has(key_vault, access.secret),
+                development=development,
+                migrate_legacy=migrate_legacy,
+            )
+        ]
+    else:
+        reports = [
+            _restore(start, Access(key, name + suffix), name, key_vault, development) for name in every
+        ]
+    _show(screen, key, reports, single=every is None, key_vault=key_vault, development=development)
+
+    detail = (
+        reports[0].describe(key_vault, development)
+        if every is None
+        else {"templates": [report.describe(key_vault, development) for report in reports]}
+    )
+    failing = [report.access.template for report in reports if report.problems]
+    if failing:
+        steps = tuple(dict.fromkeys(item for report in reports for item in report.next))
+        if steps:
+            screen.next_block(steps)
+        return Result(
+            "template-access setup",
+            "failed",
+            f"Template access has problems for {', '.join(failing)}.",
+            steps,
+            {"instance": key, **detail},
+        )
+    return Result(
+        "template-access setup",
+        "done",
+        "Template access is set up locally.",
+        detail={"instance": key, **detail},
+    )
+
+
+def _every_template(start: Path, key_vault: str | None) -> list[str]:
+    """With no template named: every template `dp-instance.json` maps, restored from the vault."""
+    if not key_vault:
+        vault = _configured_vault(start) or "<Platform Infrastructure Key Vault>"
+        raise failed(
+            "Name a template, or the Key Vault to restore every template's key from.",
+            Next(
+                f"dp-instance template-access setup --key-vault {vault}",
+                "restores the key of every template in dp-instance.json and sets up its access",
+            ),
+        )
+    templates = _mapped_templates(start)
+    if not templates:
+        raise failed("Name a template, or run this in a mapped instance folder: dp-instance.json names them.")
+    return templates
+
+
+def _restore(start: Path, access: Access, template: str, key_vault: str, development: bool) -> Report:
+    """One template of a setup for every template: only one whose key the vault holds."""
+    try:
+        if not vault_has(key_vault, access.secret):
+            flag = " --development" if development else ""
+            return Report(
+                access,
+                template,
+                problems=[f"Key Vault {key_vault} has no secret {access.secret}"],
+                next=[
+                    Next(
+                        f"dp-instance template-access setup {template}{flag} --key-vault {key_vault}",
+                        f"sets up {access.template} on its own",
+                    )
+                ],
+            )
+        return _set_up(
+            start,
+            access,
+            template,
+            key_vault=key_vault,
+            vault_current=True,
+            development=development,
+            migrate_legacy=False,
+        )
+    except Stop as stop:
+        return Report(access, template, problems=[stop.message], next=list(stop.next))
+
+
+def _set_up(
+    start: Path,
+    access: Access,
+    template: str,
+    *,
+    key_vault: str | None,
+    vault_current: bool,
+    development: bool,
+    migrate_legacy: bool,
+) -> Report:
+    """The key, its vault copy, the SSH host alias and the Git rule for one template, and Git
+    reaching it through the alias once the key can be registered."""
+    done, created = _key_files(
+        start,
+        access,
+        template,
+        key_vault=key_vault,
+        vault_current=vault_current,
+        development=development,
+        migrate_legacy=migrate_legacy,
+    )
+    update_managed_config(access)
+    ensure_include(access)
+    report = Report(
+        access,
+        template,
+        done,
+        created=created,
+        public=access.public.read_text(encoding="utf-8").strip(),
+        fingerprint=fingerprint(access),
+    )
+    urls = _clone_urls(start, access.template)
+    for url in urls:
+        if ensure_rule(access, url):
+            report.done.append(f"Added a global Git rule fetching {url} through {access.alias}.")
+    if not urls:
+        report.reach.append(UNMAPPED)
+    elif created:
+        report.reach.append("not checked until Data Methods registers the new key")
+    else:
+        for url in urls:
+            try:
+                report.reach.append(reach(access, url))
+            except Stop as stop:
+                report.problems.append(stop.message)
+                report.next.extend(stop.next)
+    return report
+
+
+def _key_files(
+    start: Path,
+    access: Access,
+    template: str,
+    *,
+    key_vault: str | None,
+    vault_current: bool,
+    development: bool,
+    migrate_legacy: bool,
+) -> tuple[list[str], bool]:
+    """Restore, adopt or create the Template Read Private Key and keep its vault copy: what was
+    done, and whether the key is new."""
     legacy_local = template == INFRASTRUCTURE and not development and access.legacy_private.is_file()
     if not access.private.is_file() and not key_vault and not migrate_legacy and not legacy_local:
         _refuse_a_second_key(start, access, template, development)
     lines: list[str] = []
+    created = False
     ensure_directory(access.ssh_root)
     ensure_directory(access.directory)
 
     local = access.private.is_file()
-    vault_current = vault_legacy = False
-    if key_vault:
-        vault_current = vault_has(key_vault, access.secret)
-        if template == INFRASTRUCTURE and not development:
-            vault_legacy = vault_has(key_vault, LEGACY_SECRET)
+    vault_legacy = (
+        bool(key_vault)
+        and template == INFRASTRUCTURE
+        and not development
+        and vault_has(key_vault, LEGACY_SECRET)
+    )
     if migrate_legacy and not legacy_local and not vault_legacy:
         raise failed("No legacy Infrastructure key was found locally or in the selected Key Vault.")
     if not migrate_legacy and not local and not vault_current and (legacy_local or vault_legacy):
@@ -540,6 +817,7 @@ def setup(
     elif not local:
         new_keypair(access)
         lines.append("Created a new Template Read Keypair.")
+        created = True
 
     restrict_file(access.private, private=True)
     ensure_public(access)
@@ -560,49 +838,51 @@ def setup(
         else:
             save_to_vault(access, key_vault)
             lines.append(f"Stored the Template Read Private Key in Key Vault secret {access.secret}.")
+    return lines, created
 
-    update_managed_config(access)
-    ensure_include(access)
-    public = access.public.read_text(encoding="utf-8").strip()
-    print_fingerprint = fingerprint(access)
 
-    screen.header("template-access setup", ("instance", access.instance), ("template", access.template))
-    screen.blank()
-    for line in lines:
-        screen.note(line)
-    screen.blank()
-    screen.labelled("Private Key:", str(access.private))
-    screen.labelled(
-        "Key Vault Secret:",
-        f"{key_vault}/{access.secret}"
-        if key_vault
-        else "not stored yet; run setup again with --key-vault once the vault exists",
-    )
-    screen.labelled("SSH Host Alias:", access.alias)
-    screen.blank()
-    screen.print(Text("Send this non-secret request to Data Methods:", style="bold"))
-    screen.labelled("Platform Instance Key:", access.instance)
-    screen.labelled(
-        "Template Repository Key:", template + (" (development repository)" if development else "")
-    )
-    screen.labelled("Template Read Public Key:", public)
-    screen.labelled("Fingerprint:", print_fingerprint)
-    screen.note("Data Methods registers the key on that repository and returns its SSH clone URL.")
-    return Result(
-        "template-access setup",
-        "done",
-        "Template access is set up locally.",
-        detail={
-            "instance": access.instance,
-            "template": template,
-            "development": development,
-            "alias": access.alias,
-            "private_key_path": str(access.private),
-            "public_key": public,
-            "fingerprint": print_fingerprint,
-            "key_vault_secret": f"{key_vault}/{access.secret}" if key_vault else None,
-        },
-    )
+def _show(
+    screen: Screen,
+    instance: str,
+    reports: list[Report],
+    *,
+    single: bool,
+    key_vault: str | None,
+    development: bool,
+) -> None:
+    """Each template's setup; the request to register a key only for one setup just created."""
+    rows = [("instance", instance)] + ([("template", reports[0].access.template)] if single else [])
+    screen.header("template-access setup", *rows)
+    for report in reports:
+        screen.blank()
+        if not single:
+            screen.labelled("Template:", Text(report.access.template, style="bold"))
+        for line in report.done:
+            screen.note(line)
+        if report.public is not None:
+            screen.labelled("Private Key:", str(report.access.private))
+            screen.labelled(
+                "Key Vault Secret:",
+                f"{key_vault}/{report.access.secret}"
+                if key_vault
+                else "not stored yet; run setup again with --key-vault once the vault exists",
+            )
+            screen.labelled("SSH Host Alias:", report.access.alias)
+        for text in report.reach:
+            screen.labelled("Reach:", text)
+        for text in report.problems:
+            screen.labelled("Problem:", text, "bold red")
+        if report.created:
+            screen.blank()
+            screen.print(Text("Send this non-secret request to Data Methods:", style="bold"))
+            screen.labelled("Platform Instance Key:", instance)
+            screen.labelled(
+                "Template Repository Key:",
+                report.template + (" (development repository)" if development else ""),
+            )
+            screen.labelled("Template Read Public Key:", report.public)
+            screen.labelled("Fingerprint:", report.fingerprint)
+            screen.note("Data Methods registers the key on that repository and returns its SSH clone URL.")
 
 
 def _clone_urls(start: Path, template: str) -> list[str]:
@@ -621,6 +901,41 @@ def _clone_urls(start: Path, template: str) -> list[str]:
     return [record.development_url if template.endswith(DEVELOPMENT) else record.release_url]
 
 
+def _mapped_templates(start: Path) -> list[str]:
+    """The templates of the Component Repositories `dp-instance.json` maps, when it's there."""
+    try:
+        return list(Instance.find(start).components)
+    except Stop:
+        return []
+
+
+def _repairs(start: Path, templates: list[str], key_vault: str | None) -> list[Next]:
+    """What sets these templates' access up again: one setup from the vault for the mapped
+    templates, and setup by name for any other."""
+    mapped = set(_mapped_templates(start))
+    vault = key_vault or _configured_vault(start) or "<Platform Infrastructure Key Vault>"
+    flags = {
+        " --development" if name.endswith(DEVELOPMENT) else ""
+        for name in templates
+        if name.removesuffix(DEVELOPMENT) in mapped
+    }
+    steps = [
+        Next(
+            f"dp-instance template-access setup{flag} --key-vault {vault}",
+            "restores each mapped template's key from the vault and sets up its access again",
+        )
+        for flag in sorted(flags)
+    ]
+    if any(name.removesuffix(DEVELOPMENT) not in mapped for name in templates):
+        steps.append(
+            Next(
+                "dp-instance template-access setup <template>",
+                "repairs the key, the vault copy, the SSH configuration and the Git rule",
+            )
+        )
+    return steps
+
+
 def check(
     screen: Screen,
     start: Path,
@@ -635,11 +950,12 @@ def check(
     if template:
         templates = [_key(template, "Template Repository Key") + (DEVELOPMENT if development else "")]
     else:
-        templates = (
-            sorted(path.name for path in root.iterdir() if path.is_dir() and KEY.fullmatch(path.name))
+        local = (
+            {path.name for path in root.iterdir() if path.is_dir() and KEY.fullmatch(path.name)}
             if root.is_dir()
-            else []
+            else set()
         )
+        templates = sorted(local | set(_mapped_templates(start)))
     if not templates:
         raise failed(
             f"No template access is set up for {key} on this workstation.",
@@ -647,6 +963,9 @@ def check(
         )
     screen.header("template-access check", ("instance", key))
     report = []
+    # The commands a problem names for itself, and the templates whose problems setup repairs.
+    fixes: list[Next] = []
+    repair: list[str] = []
     for name in templates:
         access = Access(key, name)
         problems: list[str] = []
@@ -679,7 +998,7 @@ def check(
                 except Stop as stop:
                     problems.append(stop.message)
         include = access.user_config.is_file() and any(
-            _posix(match.group(1).strip()) == _posix(access.managed_config.as_posix())
+            _posix(match.group(1).strip()) == _posix(access.include)
             for match in re.finditer(
                 r"(?im)^\s*include\s+(.+?)\s*$", access.user_config.read_text(encoding="utf-8")
             )
@@ -687,21 +1006,25 @@ def check(
         problem = (
             effective_problem(access, access.user_config)
             if include
-            else "the SSH configuration doesn't include the managed host aliases"
+            else f"the SSH configuration has no Include {access.include}"
         )
         if problem:
             problems.append(problem)
         else:
             checks.append(("SSH:", f"{access.alias} uses only its dedicated key"))
-        urls = [url for url in _clone_urls(start, name) if url.startswith(f"git@{access.alias}:")]
+        urls = _clone_urls(start, name)
         if not urls:
-            checks.append(("Reach:", "not checked: no mapped repository clones through this alias"))
+            checks.append(("Reach:", UNMAPPED))
+        fixed = 0
         for url in urls:
-            reached = gitops.git("ls-remote", url, "HEAD", check=False)
-            if reached.ok:
-                checks.append(("Reach:", f"{url} answers"))
-            else:
-                problems.append(f"{url} doesn't answer: {reached.first_error_line()}")
+            try:
+                checks.append(("Reach:", reach(access, url)))
+            except Stop as stop:
+                problems.append(stop.message)
+                fixes.extend(stop.next)
+                fixed += bool(stop.next)
+        if len(problems) > fixed:
+            repair.append(name)
         screen.blank()
         screen.labelled("Template:", Text(name, style="bold"))
         for label, text in checks:
@@ -718,12 +1041,7 @@ def check(
         )
     bad = [item for item in report if item["problems"]]
     if bad:
-        steps = (
-            Next(
-                "dp-instance template-access setup <template>",
-                "repairs the key, the vault copy and the SSH configuration",
-            ),
-        )
+        steps = (*dict.fromkeys(fixes), *_repairs(start, repair, key_vault))
         screen.next_block(steps)
         return Result(
             "template-access check",

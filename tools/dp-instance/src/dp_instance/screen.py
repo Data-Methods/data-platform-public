@@ -1,10 +1,12 @@
 """One screen for every run: a single column with no alignment and no indents.
 
-Each level is named as it's entered, with its position: repository n of N, component n of N,
-phase n of N and step n of N. A level's line holds the level, a cyan counter, the outcome and
-the time; each labelled item then has a line of its own, blue label first. Each step is one
-block, updated in place while it plans, waits and applies, and printed once when done. What a
-resumed run finished earlier takes one line for the largest level wholly done. Colour
+Every command opens with one line, such as `dp-instance status · dm-canary`. Each level is
+named as it's entered, with its position: repository n of N, component n of N, phase n of N
+and step n of N. A level's line holds the level, a cyan counter, the outcome and the time,
+read as 4.2 s, 1 m 50 s or 1 h 2 m; each labelled item then has a line of its own, blue label
+first. Each step is one block, updated in place while it plans, waits and applies, and printed
+once when done. What a resumed run finished earlier takes one line for the largest level
+wholly done. Colour
 is only for meaning: green done, yellow a change, orange an external handoff, red a failure.
 Nothing is faint. While a prompt waits for a key nothing redraws.
 
@@ -36,7 +38,8 @@ LABEL_STYLES = {
     "Step Handoff:": "bold orange1",
     "Handoff Page:": "bold orange1",
     "Still Waiting:": "bold orange1",
-    "Optional Handoff:": "bold orange1",
+    "Waiting on required handoff:": "bold orange1",
+    "Recommended optional handoff:": "bold orange1",
     "Sign-In:": "bold orange1",
     "Values Needed:": "bold orange1",
     "Still Running:": "bold orange1",
@@ -80,6 +83,15 @@ DESC_LABELS = {
 }
 
 
+def duration(seconds: float) -> str:
+    """A time as a person reads it: 4.2 s, 1 m 50 s or 1 h 2 m."""
+    if round(seconds, 1) < 60:
+        return f"{seconds:.1f} s"
+    hours, rest = divmod(round(seconds), 3600)
+    minutes, rest = divmod(rest, 60)
+    return f"{hours} h {minutes} m" if hours else f"{minutes} m {rest} s"
+
+
 def outcome_style(outcome: str) -> str:
     word = outcome.removesuffix(" earlier")
     if word in DONE:
@@ -101,7 +113,7 @@ def done_line(level: str, counter: str, name: str, steps: int, seconds: float) -
         (f" {counter}", "cyan"),
         (f" {name}", "bold"),
         (f"   {steps} step{'s' if steps != 1 else ''} done earlier", "green"),
-        f"   {seconds:.1f} s",
+        f"   {duration(seconds)}",
     )
 
 
@@ -126,7 +138,7 @@ def level_line(level: str, counter: str = "", outcome: str = "", seconds: float 
         (level, "bold"),
         (f" {counter}" if counter else "", "cyan"),
         (f"   {outcome}" if outcome else "", outcome_style(outcome)),
-        (f"   {seconds:.1f} s" if seconds is not None else ""),
+        (f"   {duration(seconds)}" if seconds is not None else ""),
     )
 
 
@@ -224,12 +236,12 @@ class Screen:
     def labelled(self, label: str, text: str | Text, style: str | None = None) -> None:
         self.print(Line(text, label, style))
 
-    def header(self, goal: str, *rows: tuple[str, str]) -> None:
+    def header(self, command: str, *rows: tuple[str, str]) -> None:
+        """The one line a command opens with: `dp-instance status · dm-canary`. The instance's
+        key stands alone; each other row reads as its label, then its value."""
+        parts = [value if label == "instance" else f"{label} {value}" for label, value in rows]
         self.blank()
-        self.print(Text("dp-instance", style="bold"))
-        self.print(Text(goal, style="bold cyan"))
-        for label, value in rows:
-            self.print(Text.assemble((f"{label} ", "bold"), value))
+        self.print(Text.assemble((f"dp-instance {command}", "bold"), *(f" · {part}" for part in parts)))
 
     def stage(self, title: str) -> None:
         self.blank(2)
@@ -282,7 +294,7 @@ class Screen:
             self.blank()
 
     def choose(self, choices: list[tuple[str, str]], prompt: str = "") -> str:
-        """A keypress outside a block, such as status's offer to resume."""
+        """A keypress outside a block, such as setup's question before it writes the map."""
         parts = [prompt + "   "] if prompt else []
         for key, label in choices:
             parts += [(key, "bold"), f" {label}    "]
@@ -313,18 +325,18 @@ class Screen:
             self.print(Text(item.command, style="bold"))
             self.print(Text(item.why))
         if record:
-            self.blank()
-            self.print(Text(f"Run record: {record}", style="italic"))
+            self.run_record(record)
 
-    def complete(self, seconds: float, record: str | None) -> None:
+    def run_record(self, record: str) -> None:
+        self.blank()
+        self.print(Text(f"Run record: {record}", style="italic"))
+
+    def complete(self, seconds: float) -> None:
         self.blank(2)
         self.print(
             Text.assemble(
                 ("Complete", "bold green"),
-                f"   in {seconds:.0f} s. Every changed step passed its verify, and every other "
+                f"   in {duration(seconds)}. Every changed step passed its verify, and every other "
                 "step planned no change.",
             )
         )
-        if record:
-            self.blank()
-            self.print(Text(f"Run record: {record}", style="italic"))
