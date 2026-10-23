@@ -1,0 +1,109 @@
+{
+  "schema_version": 1,
+  "platform_version": "2026.3.1",
+  "dp_instance_commit": "50374f46b9a8031197b3e1b54d112d17bfb16620",
+  "sources": {
+    "data-platform-infrastructure": "0e4e6a241dbd05617377151ac5ceefefb5d1ae52",
+    "data-platform-application-identity": "47568d172381d0bc54f45d5bd1b639cd3968584b",
+    "data-platform-external-ingress-storage": "18e4e115717d449c39b1ec61e0aca2cf33160222",
+    "data-platform-copilot-agent": "e1fd0ae62f78e829d2fbc76d29ebfbf1d22b49a2",
+    "data-platform-customer-agent": "5937bdd315ed7330e8d5037327827b970edcdf1d",
+    "data-platform-example": "a7c0bf1946d23dca2b2386fea14fc947ec8889ca",
+    "data-platform-iot": "84acacaca05e967d5e34b6ac31a8a75a4cdab9e1"
+  },
+  "order": [
+    {
+      "repository": "data-platform-infrastructure",
+      "components": [
+        {
+          "key": "infrastructure",
+          "command": "dp-infrastructure"
+        },
+        {
+          "key": "datahub",
+          "command": "dp-datahub"
+        },
+        {
+          "key": "jira",
+          "command": "dp-jira"
+        },
+        {
+          "key": "data-engineering",
+          "command": "dp-data-engineering"
+        }
+      ],
+      "after_merge": [
+        {
+          "component": "data-engineering",
+          "phase": "adoption"
+        }
+      ]
+    },
+    {
+      "repository": "data-platform-application-identity",
+      "components": [
+        {
+          "key": "application-identity",
+          "command": "dp-application-identity"
+        }
+      ]
+    },
+    {
+      "repository": "data-platform-external-ingress-storage",
+      "components": [
+        {
+          "key": "external-ingress",
+          "command": "dp-external-ingress"
+        }
+      ]
+    },
+    {
+      "repository": "data-platform-copilot-agent",
+      "components": [
+        {
+          "key": "copilot-agent",
+          "command": "dp-copilot-agent"
+        }
+      ],
+      "after_merge": [
+        {
+          "component": "copilot-agent",
+          "phase": "delivery"
+        }
+      ]
+    },
+    {
+      "repository": "data-platform-customer-agent",
+      "components": [
+        {
+          "key": "customer-agent",
+          "command": "dp-customer-agent"
+        }
+      ],
+      "after_merge": [
+        {
+          "component": "customer-agent",
+          "phase": "delivery"
+        }
+      ]
+    },
+    {
+      "repository": "data-platform-example",
+      "components": [
+        {
+          "key": "example",
+          "command": "dp-example"
+        }
+      ]
+    },
+    {
+      "repository": "data-platform-iot",
+      "components": [
+        {
+          "key": "iot",
+          "command": "dp-iot"
+        }
+      ]
+    }
+  ]
+}
