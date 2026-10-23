@@ -10,19 +10,41 @@ stands in for a plan: each step is still planned right before it's applied.
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
+from .outcome import failed
 from .sequence import Entry
 
 ACTIVE = ("running", "stopped", "failed")
+# Windows refuses to replace a file another program has open, such as a reader of the record or
+# an antivirus scan of a file just written; that passes within moments.
+REPLACE_TRIES = 20
+REPLACE_WAIT = 0.1
 # Outcomes after which a resumed run passes a step without running it again.
 FINISHED = ("applied", "no change", "passed", "no drift", "published cleanly", "approved", "skipped")
 
 
 def now() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def replace(source: Path, destination: Path) -> None:
+    """Replace ``destination`` with ``source``, waiting out another program briefly holding it
+    open, as Windows refuses the replace meanwhile."""
+    for attempt in range(REPLACE_TRIES):
+        try:
+            source.replace(destination)
+            return
+        except PermissionError:
+            if attempt == REPLACE_TRIES - 1:
+                raise failed(
+                    f"Couldn't save {destination}: another program kept it open. Close it, then "
+                    "run the command again."
+                ) from None
+            time.sleep(REPLACE_WAIT)
 
 
 def identifier(runs: Path, kind: str, target: str | None) -> str:
@@ -111,7 +133,7 @@ class Record:
         path = self.folder / "run.json"
         temporary = path.with_suffix(".json.tmp")
         temporary.write_text(json.dumps(self.data, indent=2) + "\n", encoding="utf-8")
-        temporary.replace(path)
+        replace(temporary, path)
 
     def note(self, entry: Entry, outcome: str, seconds: float, **detail) -> None:
         self.data["steps"][entry.id] = {

@@ -67,6 +67,20 @@ def head(path: Path) -> str:
     return git("rev-parse", "HEAD", cwd=path).stdout.strip()
 
 
+def uncommitted(path: Path) -> list[str]:
+    """The tracked files in a checkout with changes not committed yet, staged or not."""
+    entries = iter(git("status", "--porcelain=v1", "-z", "--untracked-files=no", cwd=path).stdout.split("\0"))
+    files = []
+    for entry in entries:
+        if not entry:
+            continue
+        files.append(entry[3:])
+        # A rename's or copy's entry is followed by its old path.
+        if entry[0] in "RC":
+            next(entries, None)
+    return files
+
+
 def branch(path: Path) -> str | None:
     """The checked-out branch, or None when detached."""
     found = git("symbolic-ref", "--quiet", "--short", "HEAD", cwd=path, check=False)

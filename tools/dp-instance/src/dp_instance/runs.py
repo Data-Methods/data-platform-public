@@ -168,6 +168,20 @@ def resume(session: Session) -> Result:
                 "starts a new run on the checked-out code; finished steps pass as no changes",
             ),
         )
+    for name in run.data.get("commits", {}):
+        files = gitops.uncommitted(mapped[name].path) if name in mapped else []
+        if files:
+            shown = ", ".join(files[:3]) + (f" and {len(files) - 3} more" if len(files) > 3 else "")
+            raise failed(
+                f"The run can't resume: {name} has uncommitted changes to tracked files ({shown}). "
+                "A run commits everything it writes, so these are a step's unfinished output or "
+                "someone's edits.",
+                Next(
+                    f"git -C {mapped[name].stored} restore --staged --worktree -- .",
+                    "discards them; the step writes its files again when the run resumes",
+                ),
+                Next("dp-instance resume", "carries on once the checkout is clean"),
+            )
     run.data["status"], run.data["stop"] = "running", None
     run.save()
     return Run(session, run, manifest).walk()
