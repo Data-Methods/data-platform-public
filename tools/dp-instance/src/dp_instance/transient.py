@@ -133,7 +133,7 @@ def retries(found: str | None, retried: int, *, label: str, report: Callable[[st
     if found is None or retried >= len(DELAYS):
         return False
     delay = DELAYS[retried]
-    report(f"{label}: {found}; retrying in {delay} s ({retried + 1} of {len(DELAYS)}).")
+    report(f"{label}: {found}; retrying in {delay}s ({retried + 1} of {len(DELAYS)}).")
     _sleep(delay)
     return True
 

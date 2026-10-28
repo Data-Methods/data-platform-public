@@ -5,10 +5,12 @@ a remote that fails for a moment is retried."""
 
 from __future__ import annotations
 
+import ntpath
 import os
 import re
 import shutil
 import stat
+import sys
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -17,6 +19,8 @@ from .outcome import Stop, failed
 
 COMMIT = re.compile(r"^[0-9a-f]{40}$")
 DEVELOPMENT_SUFFIX = "-dev"
+# The first Git that reads configuration from its environment, `GIT_CONFIG_COUNT`.
+CONFIGURATION_ENVIRONMENT = (2, 31)
 
 
 def git(*arguments: str, cwd: Path | None = None, check: bool = True) -> processes.Completed:
@@ -43,16 +47,52 @@ def remote_git(*arguments: str, cwd: Path | None = None) -> processes.Completed:
     raise failed(message)
 
 
+def require_configuration_environment() -> None:
+    """Git reads configuration from its environment, `GIT_CONFIG_COUNT`, from 2.31 on; an
+    older Git ignores it without a word, so it stops the command."""
+    found = git("--version").stdout.strip()
+    match = re.search(r"(\d+)\.(\d+)(?:\.\d+)?", found)
+    if match is None or (int(match.group(1)), int(match.group(2))) < CONFIGURATION_ENVIRONMENT:
+        version = match.group(0) if match else found or "unknown"
+        raise failed(
+            f"Git {version} is older than 2.31, the first Git that takes template access from "
+            "dp-instance. Install Git 2.31 or newer, then run the command again."
+        )
+
+
+def pass_configuration(entries: list[tuple[str, str]]) -> None:
+    """Pass these Git configuration entries to every tool dp-instance starts from now on."""
+    if entries:
+        require_configuration_environment()
+    processes.configure_git(entries)
+
+
+def extended_length(folder: str | os.PathLike[str]) -> str:
+    """On Windows, the folder's extended-length path, `\\\\?\\C:\\...` or
+    `\\\\?\\UNC\\server\\share\\...`, which Windows' file functions take beyond 260 characters
+    whether long paths are on or off; elsewhere, the folder's path."""
+    if sys.platform != "win32":
+        return os.path.abspath(folder)
+    path = ntpath.abspath(folder)
+    if path.startswith("\\\\?\\"):
+        return path
+    if path.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + path[2:]
+    return "\\\\?\\" + path
+
+
 def remove(folder: Path) -> None:
-    """Remove a checkout of dp-instance's own, if there is one. Git leaves its object files
-    read only, which Windows won't delete until they're made writable."""
+    """Remove a folder of dp-instance's own, such as a fetched source and its environment, if
+    there is one, through its extended-length path on Windows, so a file deeper than Windows'
+    260 characters goes too. Git leaves its object files read only, which Windows won't delete
+    until they're made writable."""
 
     def writable(function, path, _):
         os.chmod(path, stat.S_IWRITE)
         function(path)
 
     if folder.exists():
-        shutil.rmtree(folder, onexc=writable)
+        shutil.rmtree(extended_length(folder), onexc=writable)
 
 
 def is_checkout_root(path: Path) -> bool:
@@ -65,6 +105,13 @@ def is_checkout_root(path: Path) -> bool:
 
 def head(path: Path) -> str:
     return git("rev-parse", "HEAD", cwd=path).stdout.strip()
+
+
+def commit_of(path: Path) -> str | None:
+    """The checked-out commit, or None in a repository with none, such as one a fetch that
+    stopped part way left."""
+    found = git("rev-parse", "--verify", "--quiet", "HEAD^{commit}", cwd=path, check=False)
+    return (found.stdout.strip() or None) if found.ok else None
 
 
 def uncommitted(path: Path) -> list[str]:
@@ -107,12 +154,6 @@ def main_commit(path: Path) -> str | None:
         if found.ok:
             return found.stdout.strip()
     return None
-
-
-def file_history(path: Path, since: str, file: str) -> list[str]:
-    """The commits on the checked-out branch since ``since`` that changed ``file``."""
-    found = git("log", "--format=%H", f"{since}..HEAD", "--", file, cwd=path, check=False)
-    return found.stdout.split() if found.ok else []
 
 
 def run_branch(change: str) -> str:

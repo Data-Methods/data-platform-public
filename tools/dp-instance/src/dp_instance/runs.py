@@ -1,45 +1,26 @@
 """The commands that run the sequence: `upgrade`, `apply` and `resume`.
 
 `upgrade` starts one run from the code into the platform: to the release `--to` names or, with
-none named, the next stop, which it names first. `apply` always starts a new run on the
-checked-out code, its finished steps passing as no changes. `resume` carries on from where the
-active run stopped, the one place a run's record decides where to start, and refuses if the
-commits it's tied to have moved.
+none named, the next stop, which it names first. `apply` always starts a new run on `main`'s
+code, a Configuration Change, its finished steps passing as no changes. `resume` carries on from
+where the active run stopped, the one place a run's record decides where to start. It refuses if
+the commits it's tied to have moved, except forward on the run's own branch, as a step applied by
+hand leaves them.
 """
 
 from __future__ import annotations
 
-import json
-
 from . import gitops, record, targets
-from .manifest import Manifest, Releases, family, parse
+from .manifest import Manifest, parse, published, version_key
 from .outcome import Next, Result, Stop, failed
 from .record import Record
 from .session import Session
-from .walk import Run, at_first_hop
+from .walk import Run
 
 
 def _commits(session: Session, manifest: Manifest) -> dict[str, str]:
     mapped = session.instance.components
     return {item.key: gitops.head(mapped[item.key].path) for item in manifest.order if item.key in mapped}
-
-
-def _previous_manifest(releases: Releases, target: Manifest) -> str | None:
-    """The previous Platform Version's manifest that maps release snapshots to the development
-    commits 2026.2's records name, which the first move reads; None once there's none."""
-    previous = releases.previous_family(target.platform_version)
-    if previous is None:
-        return None
-    for version in reversed(list(releases.published())):
-        if family(version) != previous:
-            continue
-        text = releases.text(version)
-        try:
-            if "snapshots" in json.loads(text):
-                return text
-        except ValueError:
-            continue
-    return None
 
 
 def _goal(session: Session, target: Manifest, channel: str) -> str:
@@ -83,19 +64,7 @@ def upgrade(session: Session, version: str | None, manifest_file: str | None) ->
     # target never asks for an older dp-instance.
     if channel == "stable":
         targets.check_may_take(session.instance, releases, target)
-    target.check_install(session.own_commit())
-    mapped = session.instance.components
-    first_hop = [
-        item.key for item in target.order if item.key in mapped and at_first_hop(mapped[item.key].path)
-    ]
-    # The first move onto the release repositories reads it for a repository whose `main`
-    # records `stable`, whatever the target's channel. Deleted at the 2026.4 stop.
-    on_stable = any(
-        session.instance.record(item.key, applied=True).channel == "stable"
-        for item in target.order
-        if item.key in mapped
-    )
-    previous = _previous_manifest(releases, target) if on_stable else None
+    target.check_install(session.own_version())
     goal = _goal(session, target, channel)
     state = session.instance.state
     record.replace_active(state)
@@ -107,39 +76,144 @@ def upgrade(session: Session, version: str | None, manifest_file: str | None) ->
         channel=channel,
         change=target.change,
         manifest_origin=manifest_file or f"platform-release/{target.platform_version}",
-        first_hop=first_hop,
-        previous_manifest="previous-manifest.json" if previous else None,
         chosen=chosen,
     )
     run.manifest_path.write_text(target.text, encoding="utf-8")
-    if previous:
-        run.file("previous-manifest.json").write_text(previous, encoding="utf-8")
     run.data["commits"] = _commits(session, target)
     run.save()
     return Run(session, run, target).walk()
 
 
+def _check_on_merged_main(session: Session, manifest: Manifest) -> None:
+    """Stop unless every repository the run walks is on `main`, and its `main` is `origin/main`
+    as just fetched: what a configuration change applies is merged on GitHub."""
+    mapped = session.instance.components
+    keys = [item.key for item in manifest.order if item.key in mapped]
+    elsewhere = {key: gitops.branch(mapped[key].path) for key in keys}
+    elsewhere = {key: branch for key, branch in elsewhere.items() if branch != "main"}
+    if elsewhere:
+        shown = "; ".join(f"{key} is on {branch or 'a detached HEAD'}" for key, branch in elsewhere.items())
+        raise failed(
+            f"A configuration change applies main, and {shown}: merge your change to main first.",
+            Next(
+                "dp-instance apply", "applies main once the change is merged and each repository is on main"
+            ),
+        )
+    behind, ahead = [], []
+    for key in keys:
+        path = mapped[key].path
+        gitops.remote_git("fetch", "--quiet", "origin", "main", cwd=path)
+        merged = gitops.main_commit(path)
+        if gitops.head(path) != merged:
+            (behind if gitops.contains(path, "HEAD", merged) else ahead).append(key)
+    if not behind and not ahead:
+        return
+    shown = [f"{key}'s main is behind origin/main" for key in behind] + [
+        f"{key}'s main has commits origin/main doesn't" for key in ahead
+    ]
+    raise failed(
+        f"A configuration change applies main as merged on GitHub, and {'; '.join(shown)}"
+        + (": merge your change through its pull request first." if ahead else "."),
+        *(
+            Next(f"git -C {mapped[key].stored} pull --ff-only", "brings its main to origin/main")
+            for key in behind
+        ),
+    )
+
+
+def _check_names_every_repository(session: Session, manifest: Manifest) -> None:
+    """Stop when a mapped repository's template isn't in the release the instance runs: apply
+    never leaves it out. A later release that includes it deploys it: when one is published, the
+    upgrade is the next step."""
+    unnamed = sorted(key for key in session.instance.components if manifest.repository(key) is None)
+    if not unnamed:
+        return
+    stable = published(manifest.origin)
+    release = f"{'' if stable else 'candidate '}Platform {manifest.platform_version}"
+    later = "A later Platform Version" if stable else "A later candidate"
+    templates, it, they = ("template", "it", "it") if len(unnamed) == 1 else ("templates", "them", "they")
+    including = [
+        version
+        for version, document in (session.releases.documents() if stable else [])
+        if version_key(version) > version_key(manifest.platform_version)
+        and isinstance(document.get("sources"), dict)
+        and any(key in document["sources"] for key in unnamed)
+    ]
+    steps = ()
+    if including:
+        # Newest first: the last is the first to include it.
+        steps = (
+            Next(
+                "dp-instance upgrade",
+                f"takes the next release; Platform {including[-1]} is the first to include the {templates}",
+            ),
+        )
+    raise Stop(
+        "failed",
+        f"{release}, which this instance runs, doesn't include the {templates} of {', '.join(unnamed)}, "
+        f"which the map holds; nothing has changed. {later} that includes {it} deploys {it}; until "
+        f"then, {they} can't be applied.",
+        reason="not-in-release",
+        unnamed=unnamed,
+        next=steps,
+    )
+
+
 def apply(session: Session) -> Result:
+    """A Configuration Change: the platform brought to the configuration on `main`, where its
+    pull request merged first. A step that commits does so on a branch named from the run, and
+    the run's pull requests are titled with the components whose configuration it applies."""
     manifest = targets.running(session.instance, session.releases)
-    manifest.check_install(session.own_commit())
+    manifest.check_install(session.own_version())
+    _check_names_every_repository(session, manifest)
+    _check_on_merged_main(session, manifest)
     state = session.instance.state
     record.replace_active(state)
-    change = session.options.change
-    goal = f"apply: Platform {manifest.platform_version}, the checked-out code" + (
-        f", {change}" if change else ""
-    )
     run = Record.new(
         record.runs_folder(state),
         "apply",
         None,
-        goal,
-        change=change,
+        f"apply: Platform {manifest.platform_version}, main's configuration",
         manifest_origin=manifest.origin,
     )
+    run.data["change"] = f"Configuration {run.id}"
     run.manifest_path.write_text(manifest.text, encoding="utf-8")
-    run.data["commits"] = _commits(session, manifest)
+    # The `main` commits the run applies; its commits follow each repository as steps commit.
+    run.data["main"] = _commits(session, manifest)
+    run.data["commits"] = dict(run.data["main"])
     run.save()
     return Run(session, run, manifest).walk()
+
+
+def _moved(run: Record, mapped: dict) -> tuple[list[str], dict[str, str]]:
+    """The repositories that moved since the run stopped, as the run refuses them, and the one it
+    carries on in, with its new commit, as the step it stopped at, applied by hand, leaves it: that
+    step's repository, on the run's own branch, moved only forward from the commit the run
+    recorded, by commits and no merge, with nothing uncommitted. A merge could bring in what the
+    drift check never saw, such as a configuration change merged to `main`."""
+    branch = gitops.run_branch(run.data["change"]) if run.data.get("change") else None
+    stopped = (run.data.get("stop") or {}).get("entry")
+    repository = next((entry.repository for entry in run.entries if entry.id == stopped), None)
+    moved, forward = [], {}
+    for name, commit in run.data.get("commits", {}).items():
+        if name not in mapped:
+            continue
+        path = mapped[name].path
+        head = gitops.head(path)
+        if head == commit:
+            continue
+        if (
+            branch is not None
+            and name == repository
+            and gitops.branch(path) == branch
+            and gitops.contains(path, commit, head)
+            and not gitops.git("rev-list", "--merges", f"{commit}..{head}", cwd=path).stdout.strip()
+            and not gitops.uncommitted(path)
+        ):
+            forward[name] = head
+        else:
+            moved.append(name)
+    return moved, forward
 
 
 def resume(session: Session) -> Result:
@@ -148,26 +222,35 @@ def resume(session: Session) -> Result:
     if run is None:
         raise failed(
             "No run is under way on this workstation.",
-            Next("dp-instance apply", "starts a new run on the checked-out code"),
+            Next("dp-instance apply", "starts a new run on main's code"),
         )
     manifest = parse(
         run.manifest_path.read_text(encoding="utf-8"), run.data.get("manifest_origin", "the run's")
     )
-    manifest.check_install(session.own_commit())
+    manifest.check_install(session.own_version())
     mapped = session.instance.components
-    moved = [
-        name
-        for name, commit in run.data.get("commits", {}).items()
-        if name in mapped and gitops.head(mapped[name].path) != commit
-    ]
+    moved, forward = _moved(run, mapped)
     if moved:
+        # A new run applies only `main`.
+        on_main = all(
+            gitops.branch(mapped[name].path) == "main" for name in run.data["commits"] if name in mapped
+        )
         raise failed(
             f"The run can't resume: {', '.join(moved)} moved to other commits since it stopped.",
-            Next(
-                "dp-instance apply",
-                "starts a new run on the checked-out code; finished steps pass as no changes",
+            *(
+                (
+                    Next(
+                        "dp-instance apply",
+                        "starts a new run on main's code; finished steps pass as no changes",
+                    ),
+                )
+                if on_main
+                else ()
             ),
         )
+    # A step applied by hand committed on the run's own branch: the run carries on from there, and
+    # the step it stopped at plans again.
+    run.data["commits"].update(forward)
     for name in run.data.get("commits", {}):
         files = gitops.uncommitted(mapped[name].path) if name in mapped else []
         if files:
@@ -183,5 +266,7 @@ def resume(session: Session) -> Result:
                 Next("dp-instance resume", "carries on once the checkout is clean"),
             )
     run.data["status"], run.data["stop"] = "running", None
+    # A resumed run never skips a plan: whatever happened while it stood still, every step plans.
+    run.data.setdefault("plan_skip_off", "the run resumed")
     run.save()
     return Run(session, run, manifest).walk()

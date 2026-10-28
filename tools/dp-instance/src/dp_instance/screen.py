@@ -1,12 +1,15 @@
 """One screen for every run: a single column with no alignment and no indents.
 
-Every command opens with one line, such as `dp-instance status · dm-canary`. Each level is
-named as it's entered, with its position: repository n of N, component n of N, phase n of N
-and step n of N. A level's line holds the level, a cyan counter, the outcome and the time,
-read as 4.2 s, 1 m 50 s or 1 h 2 m; each labelled item then has a line of its own, blue label
-first. Each step is one block, updated in place while it plans, waits and applies, and printed
-once when done. What a resumed run finished earlier takes one line for the largest level
-wholly done. Colour
+Every command opens with one line, such as `dp-instance status · dm-canary`, ends each of its
+parts with a line of its time, and ends with its total, as its JSON events and result give
+them too. A run has up to three parts, before anything changes, the code and the platform, each
+named as it starts. Each level is named as it's entered, with its position:
+repository n of N, component n of N, phase n of N and step n of N. A level's line holds the
+level, a cyan counter, the outcome and the time, read as 4.2s, 1m 50s or 1h 2m 5s; each
+labelled item then has a line of its own, blue label first. Each step is one block, updated in
+place while it plans, waits and applies, and printed once when done; under it, the part, its
+count and what's ahead. What a resumed run finished earlier takes one line for the largest
+level wholly done. Colour
 is only for meaning: green done, yellow a change, orange an external handoff, red a failure.
 Nothing is faint. While a prompt waits for a key nothing redraws.
 
@@ -45,8 +48,7 @@ LABEL_STYLES = {
     "Still Running:": "bold orange1",
     "Failure:": "bold red",
     "Drift:": "bold red",
-    "Not Clean:": "bold red",
-    "Never Published:": "bold yellow",
+    "Unapplied:": "bold red",
     "Problem:": "bold red",
 }
 DONE = (
@@ -54,14 +56,20 @@ DONE = (
     "no change",
     "passed",
     "no drift",
-    "published cleanly",
     "approved",
     "converged",
     "complete",
 )
 CHANGE = ("change", "stopped", "pending")
 WAITING = tuple(WAITING_FOR.values())
-FAILURE = ("failed", "drift", "not converged", "not verified", "not published cleanly", "interrupted")
+FAILURE = (
+    "failed",
+    "drift",
+    "unapplied",
+    "not converged",
+    "not verified",
+    "interrupted",
+)
 UNDER_WAY = ("planning", "applying", "checking", "verifying")
 NAME_LABELS = {
     "repository": "Repo Name:",
@@ -70,6 +78,7 @@ NAME_LABELS = {
     "step": "Step Name:",
     "preflight": "Component Name:",
     "migrate step": "Step Name:",
+    "upgrade step": "Step Name:",
 }
 DESC_LABELS = {
     "repository": "Repo Desc:",
@@ -78,18 +87,18 @@ DESC_LABELS = {
     "step": "Step Desc:",
     "preflight": "Step Desc:",
     "migrate step": "Step Desc:",
+    "upgrade step": "Step Desc:",
     "drift check": "Check Desc:",
-    "published outputs": "Check Desc:",
 }
 
 
 def duration(seconds: float) -> str:
-    """A time as a person reads it: 4.2 s, 1 m 50 s or 1 h 2 m."""
+    """A time as a person reads it, the same in every tool: 4.2s, 1m 50s or 1h 2m 5s."""
     if round(seconds, 1) < 60:
-        return f"{seconds:.1f} s"
+        return f"{seconds:.1f}s"
     hours, rest = divmod(round(seconds), 3600)
     minutes, rest = divmod(rest, 60)
-    return f"{hours} h {minutes} m" if hours else f"{minutes} m {rest} s"
+    return f"{hours}h {minutes}m {rest}s" if hours else f"{minutes}m {rest}s"
 
 
 def outcome_style(outcome: str) -> str:
@@ -211,6 +220,48 @@ class Screen:
             )
         self._blanks = 0
         self._done = False
+        # The command's parts, each with its time, and the one under way, with its start.
+        self.started = time.monotonic()
+        self.parts: dict[str, float] = {}
+        self._part: tuple[str, float] | None = None
+
+    # Timing -----------------------------------------------------------------------------
+
+    def begin(self, title: str) -> None:
+        """Start a part of the command, ending the one under way."""
+        self.end()
+        self._part = (title, time.monotonic())
+
+    def end(self, steps: int | None = None) -> None:
+        """End the part under way, if any, with a line of its time."""
+        if self._part is not None:
+            title, started = self._part
+            self._part = None
+            self.ended(title, time.monotonic() - started, steps=steps)
+
+    def ended(self, title: str, seconds: float, *, steps: int | None = None, **fields) -> None:
+        """A part of the command, done: its line, its event and its place in the command's
+        parts."""
+        self.parts[title] = round(seconds, 1)
+        self.part(title, steps, seconds)
+        self.emit(
+            {
+                "event": "part",
+                **fields,
+                "part": title,
+                **({"steps": steps} if steps is not None else {}),
+                "seconds": round(seconds, 1),
+            }
+        )
+
+    def total(self) -> dict:
+        """End the part under way and show the command's time; its parts and total, as its
+        result gives them."""
+        self.end()
+        seconds = time.monotonic() - self.started
+        self.blank()
+        self.print(Text.assemble(("Took", "bold"), f" {duration(seconds)}"))
+        return {"seconds": round(seconds, 1), "parts": dict(self.parts)}
 
     # Output -----------------------------------------------------------------------------
 
@@ -253,6 +304,17 @@ class Screen:
 
     def note(self, text: str, style: str = "") -> None:
         self.print(Text(text, style=style))
+
+    def timed(self, label: str, text: str, seconds: float) -> None:
+        """Work with no step of its own and its time, such as reading the steps."""
+        self.print(Text.assemble((label, "bold"), f"   {text}", f"   {duration(seconds)}"))
+
+    def part(self, title: str, steps: int | None, seconds: float) -> None:
+        """A part of a command, done: how many of its entries, when it counts them, and its time."""
+        self.blank()
+        done = f"   {steps} done" if steps is not None else "   done"
+        self.print(Text.assemble((title, "bold"), (done, "green"), f"   {duration(seconds)}"))
+        self._done = False
 
     def done(self, level: str, counter: str, name: str, steps: int, seconds: float) -> None:
         """A level a resumed run finished earlier; consecutive ones stand together."""

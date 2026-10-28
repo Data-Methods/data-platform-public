@@ -14,6 +14,7 @@ from pathlib import Path
 
 from . import gitops
 from .outcome import Next, failed
+from .sequence import MERGED_COMMIT
 
 MAP_FILE = "dp-instance.json"
 STATE_FOLDER = ".dp-instance"
@@ -111,6 +112,41 @@ def registrations(aggregate: dict) -> list[tuple[str, str]]:
         repository = registration.get("repository")
         if isinstance(key, str) and isinstance(repository, str) and repository:
             found.append((key, repository))
+    return found
+
+
+def merged_commits(aggregate: dict) -> dict[str, str | None]:
+    """Each registered component's `merged_commit`, as `outputs aggregate` prints its published
+    Component Outputs: the evidence status, such as `available` or `not_collected`, or None
+    when its outputs couldn't be read or name no `merged_commit`. A Repository Owner's `merge`
+    publishes it once a run has applied every other phase of its repository."""
+    found = {}
+    for item in aggregate.get("components", []):
+        if not isinstance(item, dict):
+            continue
+        key = ((item.get("registration") or {}).get("component") or {}).get("key")
+        if not isinstance(key, str):
+            continue
+        merged = ((item.get("outputs") or {}).get("exports") or {}).get(MERGED_COMMIT)
+        status = (merged.get("evidence") or {}).get("status") if isinstance(merged, dict) else None
+        found[key] = status if item.get("status") == "available" else None
+    return found
+
+
+def managed_registrations(aggregate: dict) -> list[tuple[str, str]]:
+    """Each Managed Repository a registered component lists in its registration, as
+    `outputs aggregate` prints them: the component's key and the repository's URL. A
+    registration at 2026.3's schema 1 lists none."""
+    found = []
+    for item in aggregate.get("components", []):
+        registration = item.get("registration") if isinstance(item, dict) else None
+        if not isinstance(registration, dict):
+            continue
+        key = (registration.get("component") or {}).get("key")
+        for managed in registration.get("managed_repositories") or []:
+            url = managed.get("url") if isinstance(managed, dict) else None
+            if isinstance(key, str) and isinstance(url, str) and url:
+                found.append((key, url))
     return found
 
 

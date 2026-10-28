@@ -2,7 +2,9 @@
 
 Every tool runs from an argument list, never a shell, with its output read as UTF-8, so the
 same call works on Windows, macOS and Linux. A tool's own TLS, proxy and credential settings
-apply, since dp-instance makes no web requests of its own.
+apply, since dp-instance makes no web requests of its own. The instance's template access
+rules reach Git through its environment configuration, `GIT_CONFIG_COUNT`, in every tool
+dp-instance starts and nowhere else.
 """
 
 from __future__ import annotations
@@ -10,10 +12,21 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
 from .outcome import failed
+
+# The Git configuration every tool dp-instance starts takes, as (key, value) pairs.
+_git_configuration: tuple[tuple[str, str], ...] = ()
+
+
+def configure_git(entries: Iterable[tuple[str, str]]) -> None:
+    """Pass these Git configuration entries to every tool started from now on, in place of
+    any passed before."""
+    global _git_configuration
+    _git_configuration = tuple(entries)
 
 
 @dataclass(frozen=True)
@@ -44,9 +57,17 @@ def executable(name: str) -> str:
 
 def environment() -> dict[str, str]:
     """The environment for a tool: this one, without a virtual environment that isn't the
-    tool's, and with Python's text streams in UTF-8 for any Python a tool starts."""
+    tool's, with Python's text streams in UTF-8 for any Python a tool starts, and with the Git
+    configuration entries passed to dp-instance's tools after any this environment holds."""
     values = {key: value for key, value in os.environ.items() if key != "VIRTUAL_ENV"}
     values["PYTHONUTF8"] = "1"
+    if _git_configuration:
+        held = values.get("GIT_CONFIG_COUNT", "")
+        count = int(held) if held.isdigit() else 0
+        for index, (key, value) in enumerate(_git_configuration, start=count):
+            values[f"GIT_CONFIG_KEY_{index}"] = key
+            values[f"GIT_CONFIG_VALUE_{index}"] = value
+        values["GIT_CONFIG_COUNT"] = str(count + len(_git_configuration))
     return values
 
 

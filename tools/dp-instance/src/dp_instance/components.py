@@ -95,6 +95,26 @@ class Call:
         return transient.exhausted(text, self.temporary, self.retried)
 
 
+class StepReports:
+    """What each step of a process that runs several, such as a phase's `verify`, reports as it
+    happens, by phase and step: its own time, from its started event's arrival to its finished
+    event's, as the component writes each at once, and each pull request's last state."""
+
+    def __init__(self):
+        self._started: dict[tuple[str, str], float] = {}
+        self.seconds: dict[tuple[str, str], float] = {}
+        self.pull_requests: dict[tuple[str, str], dict[str, str | None]] = {}
+
+    def __call__(self, event: dict) -> None:
+        key = (event.get("phase"), event.get("step"))
+        if event.get("event") == "pull_request" and event.get("url"):
+            self.pull_requests.setdefault(key, {})[event["url"]] = event.get("state")
+        elif event.get("event") == "step" and event.get("state") == "started":
+            self._started[key] = time.monotonic()
+        elif event.get("event") == "step" and event.get("state") == "finished" and key in self._started:
+            self.seconds[key] = time.monotonic() - self._started[key]
+
+
 @dataclass(frozen=True)
 class Cli:
     """A component's CLI in its checkout; ``project`` runs another source's CLI against it."""

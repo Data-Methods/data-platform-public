@@ -8,7 +8,8 @@ others, before it restarts the secret's readers. A supplied secret may also chan
 new version in Key Vault, by any means; `reload` then checks its fields by name, restarts the
 readers that are behind and names each it restarted. `rotate` makes a platform-generated
 secret's new value, sets it where it's used, writes it to the vault and restarts its readers.
-Values are never printed.
+Values are never printed. Reading the secrets and each component a command drives are its
+parts, each shown with its time.
 """
 
 from __future__ import annotations
@@ -39,7 +40,7 @@ class Holder:
 
 def holders(session: Session, operation: str) -> tuple[list[Holder], record.Record]:
     manifest = targets.running(session.instance, session.releases)
-    manifest.check_install(session.own_commit())
+    manifest.check_install(session.own_version())
     run = record.Record.new(
         record.runs_folder(session.instance.state),
         "secret",
@@ -91,6 +92,7 @@ def list_secrets(session: Session, name: str | None) -> Result:
     found, run = holders(session, "list")
     rows = [("instance", session.instance.key), *([("secret", name)] if name else [])]
     screen.header("secret list", *rows)
+    screen.begin("the secrets")
     with screen.console.status("Reading every component's secrets") if screen.interactive else nullcontext():
         secrets = _listing(session, found)
     if name:
@@ -201,6 +203,7 @@ def _waiting(call: Call) -> Stop:
 def reload(session: Session, name: str | None) -> Result:
     found, run = holders(session, "reload")
     session.screen.header("secret reload", ("instance", session.instance.key))
+    session.screen.begin("the secrets")
     command = "dp-instance secret reload" + (f" {name}" if name else "")
     chosen = (
         [_owner(session, found, name)]
@@ -209,6 +212,7 @@ def reload(session: Session, name: str | None) -> Result:
     )
     restarted = []
     for holder in chosen:
+        session.screen.begin(holder.component)
         session.screen.blank()
         session.screen.labelled("Component Name:", Text(holder.component, style="bold"))
         call, lines = _drive(session, holder, ["secret", "reload", *([name] if name else [])], command)
@@ -221,7 +225,9 @@ def reload(session: Session, name: str | None) -> Result:
 def rotate(session: Session, name: str) -> Result:
     found, run = holders(session, "rotate")
     session.screen.header("secret rotate", ("instance", session.instance.key), ("secret", name))
+    session.screen.begin("the secrets")
     holder = _owner(session, found, name)
+    session.screen.begin(holder.component)
     session.screen.blank()
     session.screen.labelled("Component Name:", Text(holder.component, style="bold"))
     call, _ = _drive(session, holder, ["secret", "rotate", name], f"dp-instance secret rotate {name}")
@@ -250,7 +256,9 @@ def set_secret(session: Session, name: str) -> Result:
                 ),
             ),
         )
+    screen.begin("the secrets")
     holder = _owner(session, found, name)
+    screen.begin(holder.component)
     screen.blank()
     screen.labelled("Component Name:", Text(holder.component, style="bold"))
     asked = holder.cli.run("secret", "set", name, "--json")

@@ -1,11 +1,19 @@
 """A run: the sequencer walking the steps, one process per step.
 
-Before anything changes, every component's `preflight` step runs and, in an upgrade run, the
-drift check. Then each step is planned only after the steps before it have applied: a step
-with no change passes, and at a step with a change the run stops for review and, on
-approval, applies exactly that plan, which the component verifies before the next step
-starts. At a terminal a person is asked with single keypresses; without one, or with
-`--json`, every question is a stop naming the command that continues.
+A run has up to three parts, each counted and timed on its own. Before anything changes, an
+upgrade fetches every repository's target source at once, every component's `preflight` step
+runs and, in an upgrade run, the drift check. An upgrade's code part then runs each owner's
+`upgrade` phase and every `migrate` step. In the platform part, each step is planned only
+after the steps before it have applied: a step with no change passes, and at a step with a
+change the run stops for review and, on approval, applies exactly that plan, which the
+component verifies before the next step starts. While rule C holds in an upgrade, a Terraform
+step whose drift plan had no change is named to its component's `apply` with that plan's
+inputs hash, and reports no change without running Terraform while the hash still matches:
+rule C holds until a step that writes more than its repositories applies, the run waits on
+outside work, or it resumes, and never for a component whose configuration `migrate` changed.
+At a terminal a person is asked with single keypresses; without one, or with `--json`, every
+question is a stop naming the command that continues. Each pull request a step reports is
+shown as it arrives, and its last state kept.
 """
 
 from __future__ import annotations
@@ -22,14 +30,14 @@ from pathlib import Path
 
 from rich.text import Text
 
-from . import github, gitops, handoffs, prompts, targets
+from . import configuration, gitops, handoffs, prompts, targets
 from .components import Call, Cli, Log
 from .instance import (
     INFRASTRUCTURE,
     INFRASTRUCTURE_COMMAND,
     SETUP,
-    SOURCE_RECORD,
     SourceRecord,
+    merged_commits,
     registrations,
 )
 from .manifest import Manifest
@@ -39,32 +47,34 @@ from .screen import Block, duration
 from .sequence import MERGE, Declaration, Entry, Plan, declaration
 from .session import Session
 
-ENGINE_PROJECT = Path("tools/dp-template-engine/pyproject.toml")
-# The first engine with the common interface; a checkout bundling an older one is at the
-# 2026.2 to 2026.3 hop. Deleted at the 2026.4 stop.
-INTERFACE = (0, 14, 0)
-STAGES = {"before": "before anything changes", "run": "run sequence"}
+# A run's parts, in order, each counted and timed on its own.
+PARTS = {"before": "before anything changes", "code": "the code", "platform": "the platform"}
 # The checks before the run, as a resumed run names those that passed earlier.
-CHECKS = {"preflight": "preflights", "drift": "the drift check", "published": "the published outputs check"}
-# The owner's `upgrade` steps that change only the run's branch, which its pull request shows and
-# the `merge` lands. They run with --auto-approve, so they stop only for what it never covers:
-# restoring an edited template file or removing a file.
-BRANCH_STEPS = ("source", "pull-request")
+CHECKS = {"preflight": "preflights", "drift": "the drift check"}
+# 2026.4's engine, the first whose `steps --json` is schema 2 and whose `upgrade` works out
+# the channel from its target; an engine before it takes `upgrade --channel`. Goes at the next
+# stop.
+FIRST_SCHEMA_2_ENGINE = (0, 15)
 # How many of a decision's plan lines its JSON result carries.
 PLAN_HEAD = 40
 LEVELS = ("repository", "component", "phase", "step")
 DRIFT_TEXT = (
-    "Every component's phases planned, read only and in parallel, on the code the platform runs: "
-    "the checkout, or its main while an upgrade is under way on its branch; any change is drift."
-)
-PUBLISHED_TEXT = (
-    "At the 2026.3 hop, each component's published outputs, read only: each must be last "
-    "published cleanly from the template commit its repository records."
+    "Every component's phases planned, read only and in parallel, on the code the platform runs: the "
+    "checkout, or its main while an upgrade is under way on its branch; any change is drift. A "
+    "repository no run has finished is left out."
 )
 
 
-def stage_of(entry: Entry) -> str:
-    return "before" if entry.kind in ("preflight", "drift", "published") else "run"
+def part_of(entry: Entry) -> str:
+    """The part a run's entry is in: the checks before anything changes, an upgrade's code (each
+    owner's `upgrade` phase and every `migrate`), or the platform's steps."""
+    if entry.kind in ("preflight", "drift"):
+        return "before"
+    return "code" if entry.kind in ("upgrade", "migrate") else "platform"
+
+
+def _and(items: list[str]) -> str:
+    return items[0] if len(items) == 1 else ", ".join(items[:-1]) + ", and " + items[-1]
 
 
 def level_key(entry: Entry, level: str) -> tuple:
@@ -76,30 +86,6 @@ def level_key(entry: Entry, level: str) -> tuple:
         "component": (part, entry.component),
         "phase": (part, entry.component, entry.phase),
     }[level]
-
-
-def bundled_engine(checkout: Path) -> tuple[int, int, int] | None:
-    """The engine version `main` bundles: the code last merged, which the platform runs, even
-    while an upgrade under way has the checkout on its branch."""
-    commit = gitops.main_commit(checkout)
-    if commit is not None:
-        text = gitops.show(checkout, commit, ENGINE_PROJECT.as_posix())
-    else:
-        try:
-            text = (checkout / ENGINE_PROJECT).read_text(encoding="utf-8")
-        except OSError:
-            text = None
-    if text is None:
-        return None
-    match = re.search(r'^version\s*=\s*"(\d+)\.(\d+)\.(\d+)', text, re.MULTILINE)
-    return tuple(int(part) for part in match.groups()) if match else None
-
-
-def at_first_hop(checkout: Path) -> bool:
-    """Whether the repository's `main` predates the common interface: the 2026.2 to 2026.3
-    hop."""
-    version = bundled_engine(checkout)
-    return version is not None and version < INTERFACE
 
 
 def by_system(sections: list[dict]) -> dict[str, int]:
@@ -129,10 +115,19 @@ class Run:
         self._asked_by: str | None = None
         self._position = 0
         self._walked: set[str] = set()
-        self._fetching = threading.Lock()
+        # One fetch at a time into each repository's own folder, every repository at once.
+        self._fetching = {item.key: threading.Lock() for item in self.repositories}
         # The entry under way and its block, which a stop finishes.
         self._entry: Entry | None = None
         self._block: Block | None = None
+        # The progress the footer shows for the entry under way; None while reading, which has
+        # no count.
+        self._progress: str | None = None
+        # The part being walked, which ends with a line of its time, and those that have.
+        self._part: str | None = None
+        self._closed: set[str] = set()
+        # Each pull request the entry under way reported, with its last state, by URL.
+        self._pulls: dict[str, str | None] = {}
 
     # What the run is ------------------------------------------------------------------
 
@@ -149,10 +144,6 @@ class Run:
         return self.record.data.get("change")
 
     @property
-    def first_hop(self) -> set[str]:
-        return set(self.record.data.get("first_hop", []))
-
-    @property
     def unchanged(self) -> set[str]:
         """The repositories the upgrade leaves as they are, which `build` records."""
         return set(self.record.data.get("unchanged", []))
@@ -166,15 +157,71 @@ class Run:
         preflights and the owner's `upgrade` phase, so a fix to either works in the upgrade
         that ships it. Only the target's source is kept: an earlier target's goes, environment
         and all."""
+        return self.fetch(repository)[0]
+
+    def fetch(self, repository: str) -> tuple[Path, bool]:
+        """The owner's source at the target, and whether this fetched it. A fetch that fails
+        leaves no folder behind, so the next one starts clean."""
         commit = self.manifest.sources[repository]
         folder = self.instance.own("src", repository)
-        with self._fetching:
-            if not gitops.is_checkout_root(folder) or gitops.head(folder) != commit:
+        with self._fetching[repository]:
+            if gitops.is_checkout_root(folder) and gitops.commit_of(folder) == commit:
+                return folder, False
+            try:
                 gitops.remove(folder)
                 record = SourceRecord.read(self.checkout(repository))
                 url = record.release_url if self.channel == "stable" else record.development_url
                 gitops.fetch_commit(folder, url, commit)
-        return folder
+            except BaseException as error:
+                try:
+                    gitops.remove(folder)
+                except OSError:
+                    pass  # the next fetch removes it before fetching again
+                if isinstance(error, Stop):
+                    raise Stop(
+                        error.status,
+                        f"{repository}'s target source couldn't be fetched: {error.message}",
+                        next=error.next,
+                        **error.detail,
+                    ) from None
+                if isinstance(error, OSError):
+                    raise failed(f"{repository}'s target source couldn't be fetched: {error}") from None
+                raise
+        return folder, True
+
+    def fetch_sources(self) -> None:
+        """Fetch every repository's target source at once, with Git alone, before an upgrade
+        runs its preflights and owners' `upgrade` phases from them; every fetch that failed stops
+        the run, which `resume` fetches again."""
+        block = Block("sources", "", "", "", self.footer)
+        block.message = f"Fetching the target source of {len(self.repositories)} repositories at once"
+        started = time.monotonic()
+
+        def attempt(repository: str) -> tuple[bool, Stop | None]:
+            try:
+                return self.fetch(repository)[1], None
+            except Stop as stop:
+                return False, stop
+
+        keys = [repository.key for repository in self.repositories]
+        with ThreadPoolExecutor(max_workers=max(len(keys), 1)) as pool:
+            results = self.screen.run_live(block, lambda: list(pool.map(attempt, keys)))
+        failures = [stop for _, stop in results if stop is not None]
+        if failures:
+            said = [stop.message if stop.message.endswith(".") else f"{stop.message}." for stop in failures]
+            raise Stop(
+                "failed",
+                " ".join(said) + " Nothing has changed.",
+                reason="transient"
+                if any(stop.detail.get("reason") == "transient" for stop in failures)
+                else "fetch",
+                next=(
+                    Next("dp-instance resume", "fetches them again and carries on, once they can be fetched"),
+                ),
+            )
+        fetched = sum(new for new, _ in results)
+        if fetched:
+            self.timed("fetched", f"{fetched} target source{'s' if fetched != 1 else ''}", started)
 
     def cli(self, repository: str, command: str, *, fetched: bool = False) -> Cli:
         project = self.source(repository) if fetched else None
@@ -201,20 +248,6 @@ class Run:
 
     def applied_record(self, repository: str) -> SourceRecord:
         return self.instance.record(repository, applied=self.in_progress(repository))
-
-    def branch_records(self, repository: str) -> set[str]:
-        """The template commits an upgrade under way has recorded on its branch since `main`.
-        Its steps that applied from the branch published from one of them, which is the
-        upgrade's own work, not drift."""
-        if not self.in_progress(repository):
-            return set()
-        checkout = self.checkout(repository)
-        found = set()
-        for commit in gitops.file_history(checkout, gitops.main_commit(checkout), SOURCE_RECORD.as_posix()):
-            record = SourceRecord.read(checkout, commit)
-            if record is not None:
-                found.add(record.commit)
-        return found
 
     @contextmanager
     def applied_code(self, repositories, block: Block):
@@ -248,11 +281,13 @@ class Run:
     # The sequence ---------------------------------------------------------------------
 
     def declarations(
-        self, places: dict[str, Path] | None = None, *, target: bool = False
+        self, places: dict[str, Path] | None = None, *, only: tuple[str, str] | None = None
     ) -> dict[tuple[str, str], Declaration]:
         """Each component's `steps --json`, read in parallel: from each checkout, or from the
-        code in ``places`` for the repositories it holds. With ``target``, an upgrade's code
-        part reads the target's, from the owner's fetched CLI against the checkout."""
+        code in ``places`` for the repositories it holds. ``only`` reads one repository's
+        component alone. A component's `steps` loads its configuration, which it refuses at an
+        older schema, so an upgrade reads the target's only once `migrate` has brought the
+        configuration to it."""
         if places is None:
             places = {repository.key: self.checkout(repository.key) for repository in self.repositories}
         jobs = [
@@ -260,19 +295,12 @@ class Run:
             for repository in self.repositories
             if repository.key in places
             for component in repository.components
+            if only in (None, (repository.key, component.key))
         ]
 
         def read(job):
             repository, component = job
-            if target and repository in self.first_hop:
-                # The target's declaration, read from its own source: the checkout's
-                # configuration may still be in 2026.2's shape, which its conditions can't read.
-                source = self.source(repository)
-                cli = Cli(component.command, source, self.log, source)
-            elif target:
-                cli = self.cli(repository, component.command, fetched=True)
-            else:
-                cli = Cli(component.command, places[repository], self.log)
+            cli = Cli(component.command, places[repository], self.log)
             found = declaration(cli.document("steps", "--json"), component.command)
             if found.key != component.key:
                 raise failed(
@@ -282,7 +310,7 @@ class Run:
             return (repository, component.key), found
 
         block = Block("sequence", "", "", "", self.footer)
-        block.message = f"Reading the steps of {len(jobs)} components"
+        block.message = f"Reading the steps of {len(jobs)} component{'s' if len(jobs) != 1 else ''}"
         with ThreadPoolExecutor(max_workers=4) as pool:
             return dict(self.screen.run_live(block, lambda: list(pool.map(read, jobs))))
 
@@ -303,46 +331,157 @@ class Run:
 
     def build(self) -> None:
         """The entries of a new run: before anything changes, then the code (an upgrade) or
-        the platform's steps (an apply). An upgrade runs its preflights and each owner's
-        `upgrade` phase from the target's fetched CLI, as the target declares them; the drift
-        check stays on the code the platform runs. A repository the upgrade leaves unchanged
-        takes no `upgrade` phase."""
+        the platform's steps (an apply), from the declarations the checkouts hold. An upgrade
+        runs its preflights, which read no configuration, and each owner's whole `upgrade`
+        phase from the target's fetched CLI; the drift check stays on the code the platform
+        runs. A repository the upgrade leaves unchanged takes no `upgrade` phase. Its platform
+        part is counted from the checkouts' declarations until the upgraded code is read."""
+        self._progress = None
         if self.upgrading:
+            self.fetch_sources()
             self.record.data["unchanged"] = self.find_unchanged()
-        plan = self.plan(self.declarations(target=self.upgrading))
+        started = time.monotonic()
+        declarations = self.declarations()
+        read = f"the steps of {len(declarations)} components"
+        plan = self.plan(declarations)
         entries = plan.preflights()
         if self.upgrading:
+            self.record.data["platform_estimate"] = plan.estimate()
+            # The owners whose target is still at 2026.3's schema 1, which take `upgrade
+            # --channel`. Goes at the next stop.
+            self.record.data["schema_1_targets"] = [
+                repository.key for repository in self.repositories if self.schema_1_target(repository.key)
+            ]
             for entry in entries:
                 entry.fetched = True
-            if any(item.key not in self.first_hop for item in self.repositories):
-                entries.append(Entry(id="drift-check", kind="drift", description=DRIFT_TEXT))
-            if self.first_hop:
-                entries.append(Entry(id="published-outputs", kind="published", description=PUBLISHED_TEXT))
-            code = plan.code(self.first_hop)
+            entries.append(Entry(id="drift-check", kind="drift", description=DRIFT_TEXT))
+            code = plan.code()
             for entry in code:
                 entry.fetched = entry.kind == "upgrade"
             entries += code
         else:
             entries += plan.platform(upgrade=False)
             self.record.data["platform"] = True
+            if self.record.kind == "apply":
+                self.record.data["configuration_changes"] = self.configuration_changes(plan.declarations)
+                read += " and the instance's published outputs"
         self.record.entries = entries
-        self.record.save()
+        self.timed("read", read, started)
+
+    def configuration_changes(self, declarations) -> list[str]:
+        """The components whose configuration on `main` isn't the one they last published: what
+        a configuration change applies, which titles its pull requests."""
+        if self.instance.infrastructure is None:
+            return []
+        block = Block("sequence", "", "", "", self.footer)
+        block.message = "Reading the instance's published outputs"
+        places = {repository.key: self.checkout(repository.key) for repository in self.repositories}
+        return configuration.unapplied(places, declarations, self.aggregate(block, places))
+
+    def schema_1_target(self, repository: str) -> bool:
+        """Whether the target's fetched source bundles an engine from before 2026.4's, read
+        from its own `pyproject.toml`, so its `steps --json` is 2026.3's schema 1. A target
+        whose engine version doesn't read stops the run, since the upgrade can't tell how to
+        call it."""
+        engine = self.source(repository) / "tools" / "dp-template-engine" / "pyproject.toml"
+        try:
+            found = re.search(r'(?m)^version\s*=\s*"(\d+)\.(\d+)\.', engine.read_text(encoding="utf-8"))
+        except OSError:
+            found = None
+        if found is None:
+            raise failed(
+                f"{repository}'s target bundles no engine version dp-instance reads: {engine} is "
+                "missing or names none. Nothing has changed."
+            )
+        return (int(found.group(1)), int(found.group(2))) < FIRST_SCHEMA_2_ENGINE
 
     def build_platform(self) -> None:
-        """An upgrade's platform steps, read from the code its `upgrade` phases synced."""
-        plan = self.plan(self.declarations())
+        """An upgrade's platform steps, read from the code its `upgrade` phases synced, once
+        `migrate` brought each configuration to the target's schemas: only then do the target's
+        declarations read. What each `migrate` applied is judged by them too, before any
+        platform step."""
+        self.show_part("platform")
+        self._progress = None
+        started = time.monotonic()
+        declarations = self.declarations()
+        plan = self.plan(declarations)
         self.record.entries = self.record.entries + plan.platform(upgrade=True)
         self.record.data["platform"] = True
-        self.record.save()
+        self.timed("read", f"the steps of {len(declarations)} components", started)
+        self.migrated(declarations)
 
     # The screen -----------------------------------------------------------------------
 
     def footer(self) -> str:
-        total = len(self.record.data.get("entries", [])) or 1
-        return (
-            f"run step {max(self._position, 1)} of {total} · {self.record.data['goal']} · "
-            f"{duration(time.monotonic() - self.started)} so far"
-        )
+        shown = [self._progress] if self._progress else []
+        shown += [self.record.data["goal"], f"{duration(time.monotonic() - self.started)} so far"]
+        return " · ".join(shown)
+
+    def counted(self) -> dict[str, list[str]]:
+        """Each part's entries, by ID, in order."""
+        found: dict[str, list[str]] = {}
+        for entry in self.record.entries:
+            found.setdefault(part_of(entry), []).append(entry.id)
+        return found
+
+    def position(self, entry: Entry) -> tuple[str, int, int]:
+        """The entry's part, its position in that part and the part's count."""
+        members = self.counted().get(part_of(entry), [])
+        place = members.index(entry.id) + 1 if entry.id in members else len(members) + 1
+        return part_of(entry), place, max(len(members), place)
+
+    def count(self, entry: Entry) -> None:
+        """The footer's progress for the entry under way: its part, its position and count, and
+        the parts ahead, the platform's count estimated from the checkouts' declarations until
+        the target's are read, once `migrate` has run."""
+        part, place, total = self.position(entry)
+        counted = self.counted()
+        ahead = []
+        for later in list(PARTS)[list(PARTS).index(part) + 1 :]:
+            if later in counted:
+                ahead.append(f"{PARTS[later]}, {len(counted[later])}")
+            elif later == "platform" and self.record.data.get("platform_estimate") is not None:
+                ahead.append(f"{PARTS[later]}, about {self.record.data['platform_estimate']}")
+        self._progress = f"{PARTS[part]} {place} of {total}" + (f" · then {_and(ahead)}" if ahead else "")
+
+    def timed(self, label: str, text: str, started: float) -> None:
+        """Show work no entry holds, such as reading the steps, with its time, which counts in
+        the part under way."""
+        seconds = time.monotonic() - started
+        part = self._shown[0] if self._shown else "before"
+        reads = self.record.data.setdefault("reads", {})
+        reads[part] = round(reads.get(part, 0) + seconds, 1)
+        self.record.save()
+        self.screen.timed(label, text, seconds)
+
+    def show_part(self, part: str) -> None:
+        """Name a part as it starts."""
+        if self._shown is None or self._shown[0] != part:
+            self.screen.stage(PARTS[part])
+            self._shown = (part, None, None, None)
+
+    def close_part(self, part: str | None = None, seconds: float | None = None) -> None:
+        """End a part, by default the one being walked, with a line of its count and time: by
+        default its entries' times and its reads, which a resumed run's record keeps. A part
+        shows once in a command."""
+        part = part or self._part
+        self._part = None
+        if part is None or part in self._closed:
+            return
+        self._closed.add(part)
+        # Its entries that ran: all of them, but in a preview that ends at its first change.
+        steps = [item for item in self.counted().get(part, []) if self.record.outcome(item)]
+        if seconds is None:
+            seconds = self.record.data.get("reads", {}).get(part, 0) + sum(
+                (self.record.outcome(item) or {}).get("seconds") or 0 for item in steps
+            )
+        self.record.data.setdefault("parts", {})[part] = round(seconds, 1)
+        self.record.save()
+        self.screen.ended(PARTS[part], seconds, steps=len(steps), run=self.record.id)
+
+    def run_seconds(self) -> float:
+        """The run's own time: its parts', in every command that walked it."""
+        return round(sum(self.record.data.get("parts", {}).values()), 1)
 
     def header(self) -> None:
         self.screen.header(
@@ -365,12 +504,10 @@ class Run:
         )
 
     def enter(self, entry: Entry, until: str = "step") -> None:
-        """Name each level as it's entered: the stage, then repository, component and phase,
+        """Name each level as it's entered: the part, then repository, component and phase,
         down to ``until``, the level the caller shows itself."""
-        stage = stage_of(entry)
-        if self._shown is None or self._shown[0] != stage:
-            self.screen.stage(STAGES[stage])
-            self._shown = (stage, None, None, None)
+        stage = part_of(entry)
+        self.show_part(stage)
         if stage == "before":
             return
         depth = LEVELS.index(until)
@@ -384,12 +521,6 @@ class Run:
             branch = gitops.branch(self.checkout(entry.repository))
             if branch:
                 self.screen.labelled("Repo Branch:", branch)
-                if branch != "main":
-                    pull = github.pull_request(self.checkout(entry.repository), branch)
-                    if pull:
-                        self.screen.labelled(
-                            "Repo PR:", f"{github.describe(pull)} {pull.get('url', '')}".strip()
-                        )
             repository, component, phase = part, None, None
         if depth > 1 and entry.component != component:
             self.screen.blank()
@@ -399,7 +530,7 @@ class Run:
             self.screen.labelled("Component Name:", Text(entry.component, style="bold"))
             self.screen.labelled("Component Desc:", entry.component_description)
             component, phase = entry.component, None
-        if depth > 2 and entry.kind == "migrate":
+        if depth > 2 and entry.kind in ("upgrade", "migrate"):
             self.screen.blank()
             phase = None
         elif depth > 2 and entry.phase != phase:
@@ -413,7 +544,7 @@ class Run:
 
     def entered(self, entry: Entry, level: str) -> bool:
         """Whether the screen already shows the entry's repository part, component or phase."""
-        if self._shown is None or self._shown[0] != stage_of(entry):
+        if self._shown is None or self._shown[0] != part_of(entry):
             return False
         depth = LEVELS.index(level)
         return self._shown[1 : depth + 2] == level_key(entry, level)
@@ -425,11 +556,11 @@ class Run:
         keeps a line of its own only in a phase still under way."""
         entries = self.record.entries
         entry = entries[start]
-        if stage_of(entry) == "before":
+        if part_of(entry) == "before":
             self.replay_checks(start)
             return
         for depth, level in enumerate(LEVELS[:3]):
-            if level == "phase" and entry.kind == "migrate":
+            if level == "phase" and entry.kind in ("upgrade", "migrate"):
                 break
             if self.entered(entry, level):
                 continue
@@ -460,14 +591,14 @@ class Run:
         self.screen.show(block, compact=True)
 
     def replay_checks(self, start: int) -> None:
-        """The checks before the run (preflights, the drift check, published outputs) are its
+        """The checks before the run (preflights and the drift check) are its
         start: those that passed earlier take one line and don't run again. The first that
         didn't pass runs, and every check after it."""
         entries = self.record.entries
-        stage = [item for item in entries if stage_of(item) == "before"]
+        stage = [item for item in entries if part_of(item) == "before"]
         passed = list(
             takewhile(
-                lambda item: stage_of(item) == "before" and self.record.finished(item.id), entries[start:]
+                lambda item: part_of(item) == "before" and self.record.finished(item.id), entries[start:]
             )
         )
         names = list(dict.fromkeys(CHECKS[item.kind] for item in passed))
@@ -484,24 +615,43 @@ class Run:
             )
         if entry.kind == "drift":
             return Block("drift check", "", "", entry.description, self.footer)
-        if entry.kind == "published":
-            return Block("published outputs", "", "", entry.description, self.footer)
         if entry.kind == "migrate":
             return Block("migrate step", "", "migrate", entry.description, self.footer)
+        if entry.kind == "upgrade":
+            return Block("upgrade step", "", "upgrade", entry.description, self.footer)
         return Block("step", entry.step_counter, entry.step, entry.description, self.footer)
 
-    def finish(self, entry: Entry, block: Block, outcome: str, *, compact: bool = False, **detail) -> None:
+    def finish(
+        self,
+        entry: Entry,
+        block: Block,
+        outcome: str,
+        *,
+        compact: bool = False,
+        took: float | None = None,
+        **detail,
+    ) -> None:
+        """Show and record an entry's outcome and time: its block's, or ``took``, the step's own
+        time in a process that ran others."""
         block.finish(outcome)
+        if took is not None:
+            block.seconds = took
+        if outcome == "applied":
+            self.applied_change(entry, block)
         self.screen.show(block, compact=compact and not block.lines)
         if entry.repository in self.instance.components:
             self.record.data["commits"][entry.repository] = gitops.head(self.checkout(entry.repository))
         self.record.note(entry, outcome, block.elapsed(), details=block.details(), **detail)
+        part, place, total = self.position(entry)
         self.screen.emit(
             {
                 "event": "step",
                 "run": self.record.id,
                 "entry": entry.id,
                 "kind": entry.kind,
+                "part": PARTS[part],
+                "position": place,
+                "total": total,
                 "repository": entry.repository or None,
                 "component": entry.component or None,
                 "phase": entry.phase or None,
@@ -518,6 +668,7 @@ class Run:
         self.header()
         try:
             if not self.record.entries:
+                self.show_part("before")
                 self.build()
             self.walk_entries()
             if self.upgrading and not self.record.data.get("platform"):
@@ -528,7 +679,7 @@ class Run:
         except Stop as stop:
             return self.stopped(stop)
         self.record.complete()
-        self.screen.complete(time.monotonic() - self.started)
+        self.screen.complete(self.run_seconds())
         self.recommend()
         left = self.left()
         if left:
@@ -559,7 +710,12 @@ class Run:
         )
 
     def walk_entries(self) -> None:
+        """Walk the entries not yet walked in this command, in order, each part ending with a
+        line of its time."""
         for index, entry in enumerate(self.record.entries, 1):
+            if part_of(entry) != self._part:
+                self.close_part()
+                self._part = part_of(entry)
             if entry.id in self._walked:
                 continue
             self._position = index
@@ -568,18 +724,20 @@ class Run:
                 continue
             self.enter(entry)
             self._walked.add(entry.id)
+            self.count(entry)
+            self._pulls = {}
             block = self.block(entry)
             self._entry, self._block = entry, block
             handler = {
                 "preflight": self.preflight,
                 "drift": self.drift_check,
-                "published": self.published_check,
                 "migrate": self.migrate,
                 "upgrade": self.step,
                 "step": self.step,
             }[entry.kind]
             handler(entry, block)
             self._entry = self._block = None
+        self.close_part()
 
     # Each kind of entry -----------------------------------------------------------------
 
@@ -611,6 +769,15 @@ class Run:
             instance, applied=True
         )
         return ["--platform-version", version or self.manifest.platform_version]
+
+    def again(self) -> tuple[Next, ...]:
+        """A new run in place of resuming this one, when every repository is on `main`, the only
+        code `apply` runs: finished steps pass as no changes."""
+        if any(gitops.branch(self.checkout(item.key)) != "main" for item in self.repositories):
+            return ()
+        return (
+            Next("dp-instance apply", "starts a new run on main's code; finished steps pass as no changes"),
+        )
 
     def restart(self) -> str:
         """The command that starts this upgrade again."""
@@ -645,48 +812,108 @@ class Run:
         raise Stop("failed", message, reason="preflight", next=(again,))
 
     def drift_check(self, entry: Entry, block: Block) -> None:
-        target = self.manifest.platform_version
-        if self.channel == "stable":
-            already = [
-                repository.key
-                for repository in self.repositories
-                if repository.key not in self.first_hop | self.unchanged
-                and self.applied_record(repository.key).commit == self.manifest.sources[repository.key]
-            ]
-            if already:
-                for name in already:
-                    block.add("Drift:", f"{name} is already at Platform {target}")
-                raise Stop(
-                    "failed",
-                    f"{', '.join(already)} already at Platform {target}: an upgrade to it is under way.",
-                    reason="already-at-target",
-                    next=(
-                        Next(
-                            "dp-instance resume",
-                            "carries on the upgrade under way, if this workstation started it",
-                        ),
-                        Next(
-                            "dp-instance apply",
-                            "starts a new run on the checked-out code once every repository is at the target",
-                        ),
-                    ),
+        with self.applied_code(self.repositories, block) as places:
+            declarations = self.declarations(places)
+            aggregate = None
+            if self.absent or self.instance.infrastructure is not None:
+                aggregate = self.aggregate(block, places)
+            unfinished = self.unfinished(block, aggregate, declarations)
+            finished = tuple(item for item in self.repositories if item.key not in unfinished)
+            if self.channel == "stable":
+                self.check_not_at_target(block, finished)
+            checked = {key: value for key, value in declarations.items() if key[0] not in unfinished}
+            if aggregate is not None:
+                self.check_mapped(block, aggregate)
+                self.check_applied(block, places, checked, aggregate)
+            self.plan_drift(entry, block, finished, places, checked)
+
+    def unfinished(self, block: Block, aggregate: dict | None, declarations) -> set[str]:
+        """The repositories no run has finished. A run finishes a repository at its owner's
+        `merge`, which publishes the owner's `merged_commit`: unfinished, the owner's Component
+        Outputs hold it uncollected or, listing every component, don't register an owner whose
+        `steps --json` says its `merge` publishes it, as before its first publish. That absence
+        counts only while the infrastructure owner, which the outputs are read through and every
+        instance finishes first, shows its own `merged_commit`: an emptied store registers no
+        one. A first run that stopped part way leaves its repository unfinished too. The drift
+        check leaves their components out, a line each, and the run plans each of their steps for
+        review."""
+        if aggregate is None:
+            return set()
+        merged = merged_commits(aggregate)
+        infrastructure = self.manifest.repository(INFRASTRUCTURE)
+        whole = (
+            (aggregate.get("enumeration") or {}).get("status") == "complete"
+            and infrastructure is not None
+            and merged.get(infrastructure.owner.key) == "available"
+        )
+        found = [
+            repository
+            for repository in self.repositories
+            if merged.get(repository.owner.key) == "not_collected"
+            or (
+                whole
+                and repository.owner.key not in merged
+                and declarations[(repository.key, repository.owner.key)].publishes_merged_commit
+            )
+        ]
+        for repository in found:
+            for component in repository.components:
+                block.add(
+                    "Left Out:",
+                    f"{component.key}: no run has finished {repository.key}; the run plans each of its "
+                    "steps for review",
                 )
-        repositories = tuple(item for item in self.repositories if item.key not in self.first_hop)
-        with self.applied_code(repositories, block) as places:
-            if self.absent and INFRASTRUCTURE not in self.first_hop:
-                self.check_mapped(block, self.aggregate(block, places))
-            self.plan_drift(entry, block, repositories, places)
+        return {repository.key for repository in found}
+
+    def check_not_at_target(self, block: Block, repositories) -> None:
+        """On `stable`, a repository whose `main` already records the target, unless the
+        target leaves it unchanged, has an upgrade to it under way."""
+        target = self.manifest.platform_version
+        already = [
+            repository.key
+            for repository in repositories
+            if repository.key not in self.unchanged
+            and self.applied_record(repository.key).commit == self.manifest.sources[repository.key]
+        ]
+        if not already:
+            return
+        for name in already:
+            block.add("Drift:", f"{name} is already at Platform {target}")
+        raise Stop(
+            "failed",
+            f"{', '.join(already)} already at Platform {target}: an upgrade to it is under way.",
+            reason="already-at-target",
+            next=(
+                Next(
+                    "dp-instance resume",
+                    "carries on the upgrade under way, if this workstation started it",
+                ),
+                Next(
+                    "dp-instance apply",
+                    "starts a new run on main's code once every repository is at the target",
+                ),
+            ),
+        )
 
     def aggregate(self, block: Block, places: dict[str, Path]) -> dict:
         """The instance's Component Outputs, read by the Client Infrastructure Repository's CLI
-        from its applied code."""
+        from its applied code; another Platform Instance's are refused."""
         infrastructure = self.instance.infrastructure
         if infrastructure is None:
             raise failed("The repository map holds no Client Infrastructure Repository.", SETUP)
         listed = self.manifest.repository(INFRASTRUCTURE)
         command = listed.owner.command if listed is not None else INFRASTRUCTURE_COMMAND
         cli = Cli(command, places.get(INFRASTRUCTURE, infrastructure.path), self.log)
-        return self.screen.run_live(block, cli.document, "outputs", "aggregate")
+        found = self.screen.run_live(block, cli.document, "outputs", "aggregate")
+        key = (found.get("platform") or {}).get("key")
+        if key != self.instance.key:
+            raise failed(
+                f"The Component Outputs read through {INFRASTRUCTURE} belong to "
+                f"{key or 'no Platform Instance'}, and the map names {self.instance.key}; nothing has "
+                "changed.",
+                SETUP,
+            )
+        return found
 
     def check_mapped(self, block: Block, aggregate: dict) -> None:
         """An upgrade never leaves one of the instance's repositories behind. A repository the
@@ -727,10 +954,41 @@ class Run:
             ),
         )
 
-    def plan_drift(self, entry: Entry, block: Block, repositories, places: dict[str, Path]) -> None:
+    def check_applied(self, block: Block, places: dict[str, Path], declarations, aggregate: dict) -> None:
+        """An upgrade never carries a configuration change. A component whose configuration in
+        the code the platform runs isn't the one it last published holds a change merged to
+        `main` that no run has applied: the upgrade stops before planning, naming those
+        components and the configuration change that applies them; real drift keeps its own
+        stop. A repository with an upgrade under way is left out: the steps it applied from its
+        branch published the branch's configuration."""
+        settled = {key: place for key, place in places.items() if not self.in_progress(key)}
+        found = configuration.unapplied(settled, declarations, aggregate)
+        if not found:
+            return
+        for name in found:
+            block.add("Unapplied:", f"{name}: main's configuration isn't the one it last applied")
+        raise Stop(
+            "failed",
+            f"{', '.join(found)} {'holds' if len(found) == 1 else 'hold'} a configuration change "
+            "merged to main that no run has applied; nothing has changed. An upgrade never carries a "
+            "configuration change: apply it on its own first.",
+            reason="unapplied",
+            unapplied=found,
+            next=(
+                Next(
+                    "dp-instance apply",
+                    "applies main's configuration, reviewing each change before it applies",
+                ),
+                Next(self.restart(), "starts the upgrade again once that's applied"),
+            ),
+        )
+
+    def plan_drift(
+        self, entry: Entry, block: Block, repositories, places: dict[str, Path], declarations
+    ) -> None:
         """Plan every phase the drift check covers, as each repository's applied code declares
         them, where that code is."""
-        phases = Plan(self.manifest, repositories, self.declarations(places)).drift_targets()
+        phases = Plan(self.manifest, repositories, declarations).drift_targets()
         version = self.applied_version
 
         def plan_one(target_phase):
@@ -891,109 +1149,6 @@ class Run:
             ),
         )
 
-    def published_check(self, entry: Entry, block: Block) -> None:
-        """At the 2026.3 hop, 2026.2's plan can't run read only, so the drift check reads each
-        component's published outputs instead: each must be last published cleanly, from the
-        template commit its repository records. A component that never published its outputs,
-        as the templates on the older engine never did, can't be checked that way: it's a
-        decision to go on, since its 2026.3 steps plan against its live resources and each plan
-        is reviewed before it applies. Deleted at the 2026.4 stop."""
-        first = self.repositories[0]
-        with self.applied_code((first,), block) as places:
-            cli = Cli(first.owner.command, places[first.key], self.log)
-            aggregate = self.screen.run_live(block, cli.document, "outputs", "aggregate")
-        published = {
-            item["registration"]["component"]["key"]: item
-            for item in aggregate.get("components", [])
-            if isinstance(item, dict) and "registration" in item
-        }
-        self.check_mapped(block, aggregate)
-        problems, unpublished = [], []
-        for repository in self.repositories:
-            if repository.key not in self.first_hop:
-                continue
-            recorded = self.applied_record(repository.key)
-            accepted = {recorded.commit, *self.branch_records(repository.key)}
-            for component in repository.components:
-                found = published.get(component.key)
-                if found is None:
-                    unpublished.append((component.key, "not registered, so it never published its outputs"))
-                    continue
-                if found.get("status") != "available":
-                    if found.get("reason") == "unpublished":
-                        unpublished.append((component.key, "registered, but it never published its outputs"))
-                    else:
-                        problems.append(
-                            f"{component.key}: its outputs are {found.get('reason') or 'unavailable'}"
-                        )
-                    continue
-                source = (found.get("outputs") or {}).get("source") or {}
-                if source.get("dirty"):
-                    problems.append(f"{component.key}: last published from a checkout with uncommitted edits")
-                commit = (source.get("template") or {}).get("commit")
-                if commit not in accepted:
-                    since = " or one this run's branch has recorded since" if len(accepted) > 1 else ""
-                    problems.append(
-                        f"{component.key}: last published from template commit {commit or 'unknown'}, "
-                        f"not {recorded.commit}, which main records{since}"
-                    )
-        for name, why in unpublished:
-            block.add("Never Published:", f"{name}: {why}")
-        if problems:
-            for problem in problems:
-                block.add("Not Clean:", problem)
-            raise Stop(
-                "failed",
-                "Some components weren't last published cleanly from the commit their repository records.",
-                reason="not-published",
-                next=(
-                    Next(
-                        self.restart(),
-                        "starts the upgrade again once each component named not clean is applied and "
-                        "published cleanly from the commit its repository records, with its current tooling",
-                    ),
-                ),
-            )
-        if not unpublished:
-            self.finish(entry, block, "published cleanly", compact=True)
-            return
-        self.go_on_unpublished(entry, block, unpublished)
-        self.finish(entry, block, "approved", unpublished=[name for name, _ in unpublished])
-
-    def go_on_unpublished(self, entry: Entry, block: Block, unpublished: list[tuple[str, str]]) -> None:
-        """Going on with components that never published their outputs is a decision, with an
-        ID drawn from which ones and why; `--auto-approve` doesn't cover it."""
-        content = json.dumps({"kind": "unpublished", "components": sorted(unpublished)}, sort_keys=True)
-        identifier = hashlib.sha256(content.encode()).hexdigest()[:12]
-        if identifier in self.options.approvals:
-            block.add(
-                "Step Plan:",
-                Text("going on without their published outputs   approved by --approve", style="green"),
-            )
-            return
-        summary = (
-            f"{len(unpublished)} component{'s' if len(unpublished) != 1 else ''} never published "
-            "outputs to check against: their 2026.3 steps plan against their live resources, and "
-            "each plan is reviewed before it applies"
-        )
-        block.outcome = "change"
-        block.add("Step Plan:", summary)
-        block.add("Decision:", identifier)
-        if self.session.interactive:
-            key = self.screen.ask(block, [("y", "go on"), ("n", "stop the run here")], "Go on without them?")
-            if key == "y":
-                block.lines = [line for line in block.lines if line.label != "Decision:"]
-                block.lines[-1].text.append("   approved", style="green")
-                return
-        command = f"{self.restart()} --approve {identifier}"
-        raise Stop(
-            "decision",
-            f"{summary}.",
-            reason="decision",
-            decision={"id": identifier, "summary": summary, "entry": entry.id, "resume": command},
-            next=(Next(command, "goes on without their published outputs, as reviewed here"),),
-        )
-
     def migrate(self, entry: Entry, block: Block) -> None:
         checkout = self.checkout(entry.repository)
         before = gitops.head(checkout)
@@ -1004,7 +1159,13 @@ class Run:
             if self.change:
                 arguments += ["--change", self.change]
             arguments += self.approval_arguments(approvals)
-            call = self.screen.run_live(block, cli.run, *arguments, on_line=self.messages(block))
+            call = self.screen.run_live(
+                block,
+                cli.run,
+                *arguments,
+                on_line=self.messages(block),
+                on_event=self.pull_request_events(block),
+            )
             if call.status == "done":
                 break
             if call.status == "decision":
@@ -1027,8 +1188,10 @@ class Run:
             after = gitops.head(checkout)
             units, commit = [], after if after != before else None
             changed = commit is not None
+        reported = events[-1] if events else {}
         if not changed:
-            self.finish(entry, block, "no change", compact=True)
+            pulls = self.pull_requests(block, reported)
+            self.finish(entry, block, "no change", compact=True, pull_requests=pulls)
             return
         file = self.record.file("plans", f"{self._position:03d}-{entry.component}-migrate.txt")
         file.write_text("\n".join(call.stderr) + "\n", encoding="utf-8")
@@ -1041,6 +1204,7 @@ class Run:
             summary + (f", committed as {commit[:12]}" if commit else ", which changed no tracked file"),
         )
         block.add("Plan File:", self.relative(file))
+        pulls = self.pull_requests(block, reported)
         self.finish(
             entry,
             block,
@@ -1050,6 +1214,7 @@ class Run:
             units=units,
             commit=commit,
             decisions=self.record.data.get("decisions", {}).get(entry.id, []),
+            pull_requests=pulls,
         )
 
     def step(self, entry: Entry, block: Block) -> None:
@@ -1058,13 +1223,23 @@ class Run:
         supplied: dict | None = None
         plan_file = self.record.file("plans", f"{self._position:03d}-{entry.component}-{entry.step}.txt")
         while True:
-            plan_file.unlink(missing_ok=True)
+            # A step's plan is each attempt's own, except an owner's upgrade phase's once a step
+            # of it applied: a later attempt adds the plans of the steps still to apply.
+            if not any(step["status"] == "applied" for step in self.upgrade_steps(entry)):
+                plan_file.unlink(missing_ok=True)
             arguments = self.arguments(entry, plan_file, approvals, supplied is not None)
             block.outcome = "applying" if len(approvals) > len(self.options.approvals) else "planning"
             call = self.screen.run_live(
-                block, cli.run, *arguments, stdin=supplied, on_line=self.messages(block)
+                block,
+                cli.run,
+                *arguments,
+                stdin=supplied,
+                on_line=self.messages(block),
+                on_event=self.pull_request_events(block),
             )
             block.message = ""
+            if entry.kind == "upgrade":
+                self.upgrade_steps(entry, call)
             if call.status == "done":
                 self.applied(entry, block, call, plan_file, approvals)
                 return
@@ -1083,6 +1258,82 @@ class Run:
                 self.wait(entry, block, call)
             self.failure(entry, block, call)
 
+    # The walk's plan skip ---------------------------------------------------------------
+
+    def skipping(self) -> bool:
+        """Whether rule C holds: in an upgrade, since its drift check, nothing but
+        repository-only steps has applied, a `migrate` counting as one when every unit it
+        applied is a configuration unit, and the run hasn't waited on outside work or resumed."""
+        data = self.record.data
+        return self.upgrading and "drift_plans" in data and not data.get("plan_skip_off")
+
+    def end_plan_skip(self, block: Block | None, reason: str) -> None:
+        """Rule C no longer holds, for the rest of the run, which the record keeps with why."""
+        if not self.skipping():
+            return
+        self.record.data["plan_skip_off"] = reason
+        self.record.save()
+        line = f"off from here: {reason}; every later step plans as usual"
+        if block is not None:
+            block.add("Plan Skip:", line)
+        else:
+            self.screen.labelled("Plan Skip:", line)
+
+    def applied_change(self, entry: Entry, block: Block) -> None:
+        """An applied step ends rule C unless it writes only its repositories, as its
+        declaration says. A `migrate` is judged once the target's declarations, which name
+        each unit's kind, read: `migrated`."""
+        if entry.kind != "migrate" and not entry.repository_only:
+            self.end_plan_skip(block, f"{entry.where} applied a change")
+
+    def migrated(self, declarations: dict[tuple[str, str], Declaration]) -> None:
+        """Each `migrate` that applied only configuration units, as its component's target
+        declares them, leaves rule C holding, and its component never skips; one that applied
+        any other unit ends it."""
+        for entry in self.record.entries:
+            noted = self.record.outcome(entry.id) or {}
+            if entry.kind != "migrate" or noted.get("outcome") != "applied":
+                continue
+            units = noted.get("units") or []
+            declared = declarations.get((entry.repository, entry.component))
+            configuration = (
+                {unit.name for unit in declared.units if unit.kind == "configuration"} if declared else set()
+            )
+            if units and set(units) <= configuration:
+                migrated = self.record.data.setdefault("configuration_migrated", [])
+                component = f"{entry.repository}/{entry.component}"
+                if component not in migrated:
+                    migrated.append(component)
+                    self.record.save()
+                continue
+            applied = ", ".join(units) or "units it didn't name"
+            self.end_plan_skip(None, f"{entry.where} applied {applied}, not only configuration units")
+
+    def planned(self, entry: Entry) -> list[tuple[str, str]]:
+        """The Terraform steps a step's apply may skip, with each one's inputs hash from the
+        drift check: the step itself and, for a hold, the steps it guards until the step that
+        lifts it, each one its component takes the skip for, whose drift plan had no change.
+        None while rule C doesn't hold, or for a component whose configuration `migrate`
+        changed."""
+        component = f"{entry.repository}/{entry.component}"
+        if not self.skipping() or component in self.record.data.get("configuration_migrated", []):
+            return []
+        entries = self.record.entries
+        guarded = [entry]
+        if entry.holds_until:
+            for item in entries[entries.index(entry) + 1 :]:
+                if (item.repository, item.component) != (entry.repository, entry.component):
+                    continue
+                if item.step == entry.holds_until:
+                    break
+                guarded.append(item)
+        drift = self.record.data["drift_plans"]
+        return [
+            (item.step, drift[item.id]["inputs_hash"])
+            for item in guarded
+            if item.plan_skip and (drift.get(item.id) or {}).get("status") == "no-change"
+        ]
+
     # Pieces of a step -----------------------------------------------------------------
 
     def approval_arguments(self, approvals: list[str], *, auto: bool = False) -> list[str]:
@@ -1091,10 +1342,11 @@ class Run:
 
     def arguments(self, entry: Entry, plan_file: Path, approvals: list[str], supplied: bool) -> list[str]:
         if entry.kind == "upgrade":
+            # The whole phase: its steps change only the run's branch, which its pull request
+            # shows and the `merge` lands, so --auto-approve, which leaves restoring an edited
+            # template file or removing a file to a decision.
             arguments = [
                 "upgrade",
-                "--step",
-                entry.step,
                 "--json",
                 "--plan-file",
                 str(plan_file),
@@ -1117,28 +1369,31 @@ class Run:
                 arguments += ["--run-summary", str(self.summary(entry.repository))]
             if supplied:
                 arguments.append("--values-from-stdin")
+            planned = self.planned(entry)
+            if planned:
+                # Rule C alone: never --planned without --unchanged-since-planned.
+                arguments += [part for step, value in planned for part in ("--planned", f"{step}={value}")]
+                arguments.append("--unchanged-since-planned")
         if self.change:
             arguments += ["--change", self.change]
-        auto = entry.kind == "upgrade" and entry.step in BRANCH_STEPS
-        return arguments + self.approval_arguments(approvals, auto=auto)
+        return arguments + self.approval_arguments(approvals, auto=entry.kind == "upgrade")
 
     def target_arguments(self, repository: str) -> list[str]:
         """The owner's `upgrade` target: on `stable`, the Template Version tagged on the
-        manifest's commit; on `canary`, the commit itself."""
+        manifest's commit; on `canary`, the commit itself. 2026.4's engine works out the
+        channel from the target's form. A target on 2026.3's engine takes the channel too,
+        since that engine otherwise takes the channel the repository records and resolves a
+        commit only on `canary`; that goes at the next stop."""
         targets = self.record.data.setdefault("targets", {})
         if repository not in targets:
             commit = self.manifest.sources[repository]
-            if self.channel == "stable":
-                arguments = ["--channel", "stable", "--to", self.template_version(repository, commit)]
-            else:
-                arguments = ["--channel", "canary", "--to", commit]
+            target = self.template_version(repository, commit) if self.channel == "stable" else commit
+            arguments = ["--to", target]
+            if repository in self.record.data.get("schema_1_targets", []):
+                arguments = ["--channel", self.channel, *arguments]
             targets[repository] = arguments
             self.record.save()
-        arguments = list(targets[repository])
-        previous = self.record.data.get("previous_manifest")
-        if previous:
-            arguments += ["--previous-manifest", str(self.record.folder / previous)]
-        return arguments
+        return list(targets[repository])
 
     def template_version(self, repository: str, commit: str) -> str:
         record = SourceRecord.read(self.checkout(repository))
@@ -1158,8 +1413,7 @@ class Run:
 
     def summary(self, repository: str) -> Path:
         """The run's steps that changed something in this repository, its code's included,
-        which the `merge` step writes into the pull request's description; in an upgrade, with
-        the title that names its release."""
+        which the `merge` step writes into the pull request's description, with its title."""
         steps = []
         for entry in self.record.entries:
             if entry.repository != repository or entry.kind not in ("upgrade", "migrate", "step"):
@@ -1167,25 +1421,35 @@ class Run:
             if entry.phase == MERGE:
                 continue
             noted = self.record.outcome(entry.id) or {}
-            if noted.get("outcome") == "applied":
+            if noted.get("outcome") != "applied":
+                continue
+            # The owner's `upgrade` phase, walked whole, by each of its steps that applied.
+            for step in noted.get("steps") or [{"step": entry.step, "summary": noted.get("summary")}]:
+                if step.get("status", "applied") != "applied":
+                    continue
                 steps.append(
                     {
                         "component": entry.component,
                         "phase": entry.phase or entry.kind,
-                        "step": entry.step,
-                        "summary": noted.get("summary") or "applied",
+                        "step": step["step"],
+                        "summary": step.get("summary") or "applied",
                         "decisions": noted.get("decisions", []),
                     }
                 )
-        document = {"title": self.title(), "steps": steps} if self.upgrading else {"steps": steps}
+        document = {"title": self.title(), "steps": steps}
         path = self.record.file("summaries", f"{repository}.json")
         path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
         return path
 
     def title(self) -> str:
-        """An upgrade's pull requests' title, so `main`'s history tells a candidate from the
-        release: "Platform V", or on canary "Platform V from candidate N", N from the candidate
-        manifest's file name. The run's change stays "Platform V", since it names the branch."""
+        """The run's pull requests' title. A configuration change's names the components whose
+        configuration it applies: "Configuration change: <components>". An upgrade's names its
+        release, so `main`'s history tells a candidate from the release: "Platform V", or on
+        canary "Platform V from candidate N", N from the candidate manifest's file name. The
+        run's change stays as it is, since it names the branch."""
+        if not self.upgrading:
+            changed = self.record.data.get("configuration_changes") or []
+            return "Configuration change" + (f": {', '.join(changed)}" if changed else "")
         title = f"Platform {self.manifest.platform_version}"
         if self.channel != "canary":
             return title
@@ -1228,7 +1492,7 @@ class Run:
                 decision={**decision, "entry": entry.id},
                 next=(
                     Next("dp-instance resume", f"shows {entry.where}'s plan for review again"),
-                    Next("dp-instance apply", "starts a new run on the checked-out code"),
+                    *self.again(),
                 ),
             )
         # The steps before this one have finished, so a resume needs only the decisions this
@@ -1262,7 +1526,8 @@ class Run:
         work = [str(item) for item in handoff.get("work") or []]
         pages = self.pages(actions)
         block.outcome = "waiting: handoff"
-        block.lines = []
+        block.lines = [line for line in block.lines if line.label == "Pull Request:"]
+        self.end_plan_skip(block, f"{entry.where} waited on outside work")
         for system, count in by_system(actions).items():
             block.add(
                 "Waiting on required handoff:",
@@ -1284,7 +1549,7 @@ class Run:
                 Next(
                     "dp-instance resume", f"checks {entry.where} again and carries on once the work is done"
                 ),
-                Next("dp-instance apply", "starts a new run on the checked-out code"),
+                *self.again(),
             ),
         )
         if not self.session.interactive:
@@ -1295,7 +1560,16 @@ class Run:
                 raise stop
             block.outcome = "checking"
             check = self.screen.run_live(
-                block, cli.run, "plan", "--phase", entry.phase, "--step", entry.step, "--json", *self.version
+                block,
+                cli.run,
+                "plan",
+                "--phase",
+                entry.phase,
+                "--step",
+                entry.step,
+                "--json",
+                *self.version,
+                on_event=self.pull_request_events(block),
             )
             if check.status != "done":
                 if check.status in WAITS:
@@ -1316,6 +1590,9 @@ class Run:
             return
 
     def applied(self, entry: Entry, block: Block, call: Call, plan_file: Path, approvals: list[str]) -> None:
+        if entry.kind == "upgrade":
+            self.upgraded(entry, block, call, plan_file)
+            return
         events = call.finished(entry.step)
         if not events:
             raise failed(f"{entry.command} reported no step {entry.step}; its log has what it ran.")
@@ -1325,7 +1602,14 @@ class Run:
         decisions = self.record.data.get("decisions", {}).get(entry.id, [])
         if status != "applied":
             outcome = "no change" if status == "no-change" else str(status)
-            self.finish(entry, block, outcome, compact=True)
+            pulls = self.pull_requests(block, event)
+            skipped = event.get("skip_rule")
+            if skipped:
+                block.add(
+                    "Plan Skip:",
+                    f"no change, as the drift check planned it (rule {skipped}); Terraform didn't run",
+                )
+            self.finish(entry, block, outcome, compact=True, pull_requests=pulls, skip_rule=skipped)
             return
         how = (
             "approved"
@@ -1353,7 +1637,7 @@ class Run:
         else:
             text = Text("failed: " + "; ".join(verification.get("failures", [])), style="red")
         block.add("Step Verification:", text)
-        self.keep_pull_requests(entry, block)
+        pulls = self.pull_requests(block, event)
         self.finish(
             entry,
             block,
@@ -1361,37 +1645,109 @@ class Run:
             summary=event.get("summary"),
             plan=self.relative(plan_file) if plan_file.exists() and plan_file.stat().st_size else None,
             decisions=decisions,
+            pull_requests=pulls,
         )
 
-    def keep_pull_requests(self, entry: Entry, block: Block) -> None:
-        """Keep in the record each pull request a step that applied opened or merged: the run's
-        own after the owner's `pull-request` and `merge` steps, and the Adoption PR after a
-        phase that follows the merge, in a component that maintains a Managed Repository."""
-        listed = self.manifest.repository(entry.repository)
-        after_merge = {(item.component, item.phase) for item in listed.after_merge} if listed else set()
-        if entry.owner and (entry.kind == "upgrade" and entry.step == "pull-request" or entry.phase == MERGE):
-            if not self.change:
-                return
-            places = [(entry.repository, self.checkout(entry.repository), gitops.run_branch(self.change))]
-        elif (entry.component, entry.phase) in after_merge:
-            places = [
-                (item.name, item.path, github.ADOPTION_BRANCH)
-                for item in self.instance.managed
-                if item.managed_by == entry.component
-            ]
-        else:
+    def upgrade_steps(self, entry: Entry, call: Call | None = None) -> list[dict]:
+        """An owner's upgrade phase's steps over every attempt at it, a resumed run's earlier
+        ones included, each as it last finished, but a step that applied in any attempt stays
+        applied: a later attempt finds it done and reports no change. With ``call``, its
+        finished steps join them first. None for any other entry."""
+        if entry.kind != "upgrade":
+            return []
+        found = self.record.data.setdefault("upgrade_steps", {}).setdefault(entry.id, {})
+        if call is not None:
+            for event in call.finished():
+                if (found.get(event["step"]) or {}).get("status") != "applied":
+                    found[event["step"]] = {"status": event.get("status"), "summary": event.get("summary")}
+            self.record.save()
+        return [{"step": name, **value} for name, value in found.items()]
+
+    def upgraded(self, entry: Entry, block: Block, call: Call, plan_file: Path) -> None:
+        """The owner's `upgrade` phase, walked whole: each of its steps, over every attempt, on
+        a line of its own and in the record, and the phase applied when any step did."""
+        steps = self.upgrade_steps(entry)
+        if not steps:
+            raise failed(f"{entry.command} upgrade reported no step; its log has what it ran.")
+        for event in call.finished():
+            self.optional(event)
+        # A decision's lines give way to what each step did.
+        block.lines = [
+            line for line in block.lines if line.label not in ("Step Plan:", "Plan File:", "Decision:")
+        ]
+        for step in steps:
+            said = (step["summary"] or "applied") if step["status"] == "applied" else "no change"
+            block.add("Step Plan:", f"{step['step']}: {said}")
+        changed = [step for step in steps if step["status"] == "applied"]
+        shown = plan_file.exists() and plan_file.stat().st_size > 0
+        if changed and shown:
+            block.add("Plan File:", self.relative(plan_file))
+        events = call.finished()
+        pulls = self.pull_requests(
+            block, {"pull_requests": [item for event in events for item in event.get("pull_requests") or []]}
+        )
+        self.finish(
+            entry,
+            block,
+            "applied" if changed else "no change",
+            compact=not changed,
+            summary="; ".join(f"{step['step']}: {step['summary'] or 'applied'}" for step in changed) or None,
+            plan=self.relative(plan_file) if changed and shown else None,
+            steps=steps,
+            decisions=self.record.data.get("decisions", {}).get(entry.id, []),
+            pull_requests=pulls,
+        )
+
+    def pull_request_events(self, block: Block):
+        """Show each pull request the step reports as it happens, the moment its event arrives:
+        on its live block at a terminal, as a line of its own elsewhere, and as a JSON event."""
+
+        def seen(event: dict) -> None:
+            if event.get("event") == "pull_request" and event.get("url"):
+                self.show_pull_request(block, event["url"], event.get("state"), at_once=True)
+
+        return seen
+
+    def show_pull_request(self, block: Block, url: str, state: str | None, *, at_once: bool) -> None:
+        """Keep a pull request's last state for the step, on one line of its block."""
+        if url in self._pulls and self._pulls[url] == state:
             return
-        for repository, path, branch in places:
-            pull = github.pull_request(path, branch, state="all")
-            if pull is None:
-                continue
-            self.record.pull_request(repository, pull)
-            merged = self.record.data["pull_requests"][repository]["merge_commit"]
-            block.add(
-                "Pull Request:",
-                f"#{pull['number']} {pull.get('url') or ''}".strip()
-                + (f", merged as {merged[:12]}" if merged else ""),
+        self._pulls[url] = state
+        text = f"{url} ({state})" if state else url
+        line = next(
+            (
+                line
+                for line in block.lines
+                if line.label == "Pull Request:" and line.plain.split(" ")[0] == url
+            ),
+            None,
+        )
+        if line is None:
+            block.add("Pull Request:", text)
+        else:
+            line.text = Text(text)
+        if at_once:
+            if not self.screen.interactive:
+                self.screen.labelled("Pull Request:", text)
+            self.screen.emit(
+                {
+                    "event": "pull_request",
+                    "run": self.record.id,
+                    "entry": self._entry.id if self._entry is not None else None,
+                    "url": url,
+                    "state": state,
+                }
             )
+
+    def pull_requests(self, block: Block, event: dict | None = None) -> list[dict]:
+        """The pull requests the step reported, each in its last state: as each happened, then
+        as its finished event, when it has one, lists them; the step's outcome in the record
+        keeps them. An engine before 0.15 reports none, and one before 0.16 only when the step
+        finishes."""
+        for item in (event or {}).get("pull_requests") or []:
+            if isinstance(item, dict) and item.get("url"):
+                self.show_pull_request(block, item["url"], item.get("state"), at_once=False)
+        return [{"url": url, "state": state} for url, state in self._pulls.items()]
 
     def supply(self, entry: Entry, block: Block, call: Call) -> dict[str, dict[str, str]]:
         """Show the step that asks, as a block of its own naming the handoff pages that say how
@@ -1425,8 +1781,22 @@ class Run:
         return pages
 
     def wait(self, entry: Entry, block: Block, call: Call) -> None:
-        """A component's stop for values, a sign-in or runs still going stops the run for the
-        same, naming what it waits for and the commands that continue."""
+        """A component's stop for values, a sign-in, runs still going or a step still pending
+        stops the run for the same, naming what it waits for and the commands that continue."""
+        if call.status in ("pending", "runs"):
+            self.end_plan_skip(block, f"{entry.where} waited on outside work")
+        if call.status == "pending":
+            waits_for = ((call.result or {}).get("pending") or {}).get("message") or call.message
+            block.add("Still Waiting:", waits_for)
+            raise Stop(
+                "pending",
+                f"{entry.where} still waits: {waits_for}",
+                reason="pending",
+                pending={"entry": entry.id, "message": waits_for},
+                next=(
+                    Next("dp-instance resume", f"checks {entry.where} again and carries on once it's ready"),
+                ),
+            )
         if call.status == "values":
             supply = ((call.result or {}).get("values") or {}).get("supply") or []
             for secret in supply:
@@ -1493,10 +1863,7 @@ class Run:
             reason="failed",
             next=(
                 Next("dp-instance resume", f"carries on from {entry.where} once the failure is fixed"),
-                Next(
-                    "dp-instance apply",
-                    "starts a new run on the checked-out code; finished steps pass as no changes",
-                ),
+                *self.again(),
             ),
         )
 
@@ -1532,32 +1899,26 @@ class Run:
     # Stops ----------------------------------------------------------------------------
 
     def hold_lines(self) -> list[Next]:
-        """A run that stopped between a component's `hold` and `release`, or at `hold` while
-        runs are still going, leaves the hold on; its Next block names the command that lifts
-        it without carrying on."""
+        """A run that stopped after a step that holds, such as Data Engineering's `hold`, or at
+        it while runs are still going, before the step its `holds_until` names applied, leaves
+        the hold on; its Next block names the command that lifts it without carrying on: that
+        step alone, in its phase."""
         found = []
-        entries = self.record.entries
         on = ("applied", WAITING_FOR["runs"])
-        for entry in entries:
-            if entry.step != "hold" or (self.record.outcome(entry.id) or {}).get("outcome") not in on:
+        for entry in self.record.entries:
+            if not entry.holds_until or (self.record.outcome(entry.id) or {}).get("outcome") not in on:
                 continue
-            release = next(
-                (
-                    item
-                    for item in entries
-                    if (item.repository, item.component, item.step)
-                    == (entry.repository, entry.component, "release")
-                ),
-                None,
-            )
-            if release is None or (self.record.outcome(release.id) or {}).get("outcome") != "applied":
-                found.append(
-                    Next(
-                        f"uv run --locked {entry.command} apply --step release",
-                        f"in {self.checkout(entry.repository)}: lifts {entry.component}'s hold without "
-                        "carrying on; dp-instance resume carries on to its release step instead",
-                    )
+            lifted = f"{entry.repository}/{entry.component}/{entry.holds_until_phase}/{entry.holds_until}"
+            if (self.record.outcome(lifted) or {}).get("outcome") == "applied":
+                continue
+            found.append(
+                Next(
+                    f"uv run --locked {entry.command} apply --phase {entry.holds_until_phase} "
+                    f"--step {entry.holds_until}",
+                    f"in {self.checkout(entry.repository)}: lifts {entry.component}'s hold without "
+                    f"carrying on; dp-instance resume carries on to its {entry.holds_until} step instead",
                 )
+            )
         return found
 
     def stopped(self, stop: Stop) -> Result:
@@ -1569,10 +1930,12 @@ class Run:
                 "interrupted": "interrupted",
                 "drift": "drift",
                 "already-at-target": "drift",
-                "not-published": "not published cleanly",
+                "unapplied": "unapplied",
                 "unmapped": "not mapped",
             }.get(reason, outcome)
-            self.finish(entry, block, outcome)
+            # A step that stops has no finished event: the pull requests it reported as they
+            # happened are its only report.
+            self.finish(entry, block, outcome, pull_requests=self.pull_requests(block))
         next_steps = stop.next
         if reason == "transient" and not next_steps:
             # A read that failed for a moment inside a run, its retries spent: the run goes on

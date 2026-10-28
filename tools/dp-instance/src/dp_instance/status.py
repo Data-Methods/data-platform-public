@@ -1,28 +1,24 @@
 """`dp-instance` alone, or `status`: where the instance stands, planning nothing.
 
-It shows the active run's journey from its record, then what the repositories record, what
-the hold acts on, their open pull requests, and each Managed Repository's adoption: whether
-its adoption pull request is merged and released, and which Platform Version each
-Environment's workflows pin, read once its tags and `main` are fetched. It reads the run
-record, Git and GitHub, and the hold from the cluster when it can reach it, so it runs from
-any workstation, with no network check: outside the instance's network the hold is unknown.
-It asks nothing: it prints, names what comes next and returns.
+It shows the active run's journey from its record, each part with its time and each step's
+pull requests as it reported them, then what the repositories record, this dp-instance's
+version and any newer one published, with the install a next release needs before its
+upgrade; each of its own two parts, the run record and the instance, ends with its time. It
+reads the run record and Git, and starts no component CLI, so it answers quickly from any
+workstation. It asks nothing: it prints, names what comes next and returns.
 """
 
 from __future__ import annotations
 
-import re
-from contextlib import nullcontext
-
 from rich.text import Text
 
-from . import github, gitops, hold, record, targets
-from .instance import INFRASTRUCTURE, Mapped
-from .manifest import Releases, family
+from . import gitops, installed, record, targets
+from .manifest import family
 from .outcome import Next, Result, Stop
 from .screen import NAME_LABELS, level_line
 from .sequence import Entry
 from .session import Session
+from .walk import PARTS, part_of
 
 REASONS = {
     "decision": "stopped for review",
@@ -31,21 +27,26 @@ REASONS = {
     "values": "waiting for values only a person supplies",
     "sign-in": "waiting for a sign-in",
     "runs": "waiting for runs to finish",
+    "pending": "waiting for a step still pending",
     "failed": "stopped on a failure",
     "preflight": "stopped: a preflight failed",
     "interrupted": "interrupted",
     "drift": "stopped on drift",
+    "unapplied": "stopped: a configuration change merged to main isn't applied",
     "already-at-target": "stopped: the upgrade is already under way",
-    "not-published": "stopped: a component wasn't published cleanly",
     "unmapped": "stopped: a repository of the instance isn't in the repository map",
+    "fetch": "stopped: a target source couldn't be fetched",
 }
 
 
 def journey(session: Session, run: record.Record) -> None:
-    """The run as its record left it: every step's outcome and time, and its details."""
+    """The run as its record left it: every step's outcome and time, and its details, and each
+    part that ended with its time."""
     screen = session.screen
     shown = (None, None, None, None)
-    for entry in run.entries:
+    entries = run.entries
+    parts = run.data.get("parts", {})
+    for index, entry in enumerate(entries):
         shown = _enter(screen, entry, shown)
         level, counter, name = _labels(entry)
         noted = run.outcome(entry.id)
@@ -53,14 +54,17 @@ def journey(session: Session, run: record.Record) -> None:
             screen.print(level_line(level, counter, "not reached"))
             if name:
                 screen.labelled(NAME_LABELS.get(level, "Step Name:"), name)
-            continue
-        screen.print(level_line(level, counter, noted["outcome"], noted.get("seconds")))
-        if name:
-            screen.labelled(NAME_LABELS.get(level, "Step Name:"), Text(name, style="bold"))
-        for label, text in noted.get("details", []):
-            screen.labelled(label, text)
-        if noted.get("details"):
-            screen.blank()
+        else:
+            screen.print(level_line(level, counter, noted["outcome"], noted.get("seconds")))
+            if name:
+                screen.labelled(NAME_LABELS.get(level, "Step Name:"), Text(name, style="bold"))
+            for label, text in noted.get("details", []):
+                screen.labelled(label, text)
+            if noted.get("details"):
+                screen.blank()
+        part = part_of(entry)
+        if part in parts and (index + 1 == len(entries) or part_of(entries[index + 1]) != part):
+            screen.part(PARTS[part], sum(part_of(item) == part for item in entries), parts[part])
 
 
 def _labels(entry: Entry) -> tuple[str, str, str]:
@@ -68,18 +72,18 @@ def _labels(entry: Entry) -> tuple[str, str, str]:
         return "preflight", entry.preflight_counter, entry.component
     if entry.kind == "drift":
         return "drift check", "", ""
-    if entry.kind == "published":
-        return "published outputs", "", ""
     if entry.kind == "migrate":
         return "migrate step", "", "migrate"
+    if entry.kind == "upgrade":
+        return "upgrade step", "", "upgrade"
     return "step", entry.step_counter, entry.step
 
 
 def _enter(screen, entry: Entry, shown: tuple) -> tuple:
     stage, repository, component, phase = shown
-    now = "before" if entry.kind in ("preflight", "drift", "published") else "run"
+    now = part_of(entry)
     if now != stage:
-        screen.stage("before anything changes" if now == "before" else "run sequence")
+        screen.stage(PARTS[now])
         repository = component = phase = None
     if now == "before":
         return now, None, None, None
@@ -96,106 +100,13 @@ def _enter(screen, entry: Entry, shown: tuple) -> tuple:
         )
         screen.labelled("Component Name:", Text(entry.component, style="bold"))
         component, phase = entry.component, None
-    if entry.kind != "migrate" and entry.phase != phase:
+    if entry.kind not in ("upgrade", "migrate") and entry.phase != phase:
         screen.blank()
         screen.print(level_line("phase", entry.phase_counter))
         screen.labelled("Phase Name:", Text(entry.phase, style="bold"))
         screen.blank()
         phase = entry.phase
     return now, repository, component, phase
-
-
-def _pins(managed: Mapped, revision: str, infrastructure: str) -> set[str]:
-    """The Client Infrastructure Repository commits a revision's workflows pin."""
-    listing = gitops.git(
-        "ls-tree", "--name-only", revision, ".github/workflows/", cwd=managed.path, check=False
-    )
-    if not listing.ok:
-        return set()
-    pattern = re.compile(rf"uses:\s*[^\s@]*/{re.escape(infrastructure)}/[^\s@]*@([0-9a-f]{{40}})")
-    found = set()
-    for name in listing.stdout.splitlines():
-        content = gitops.show(managed.path, revision, name) or ""
-        found.update(pattern.findall(content))
-    return found
-
-
-def _pinned_version(session: Session, releases: Releases, pins: set[str]) -> str:
-    """The Platform Version a set of pinned infrastructure commits records."""
-    infrastructure = session.instance.infrastructure
-    if infrastructure is None or len(pins) != 1:
-        return "unknown" if pins else "no pins found"
-    pin = next(iter(pins))
-    text = gitops.show(infrastructure.path, pin, ".dp-template/template-source.json")
-    if text is None:
-        return f"commit {pin[:12]} (fetch the infrastructure checkout to read it)"
-    match = re.search(r'"commit"\s*:\s*"([0-9a-f]{40})"', text)
-    commit = match.group(1) if match else None
-    for version, document in releases.documents():
-        sources = document.get("sources") or {}
-        if commit and sources.get(INFRASTRUCTURE) == commit:
-            return f"Platform {version}"
-    return f"infrastructure commit {pin[:12]}"
-
-
-def adoption(session: Session, releases: Releases, managed: Mapped) -> dict:
-    """A Managed Repository's adoption, from GitHub, and from Git once the checkout has
-    fetched its tags and `main`. Checks and reviewers matter only while the pull request is
-    open."""
-    screen = session.screen
-    found: dict = {"repository": managed.name}
-    with screen.console.status(f"Fetching {managed.name}") if session.interactive else nullcontext():
-        fetched = gitops.git("fetch", "--quiet", "--tags", cwd=managed.path, check=False).ok
-    found["fetched"] = fetched
-    screen.blank()
-    screen.labelled("Repo Name:", Text(managed.name, style="bold"))
-    pull = github.pull_request(managed.path, github.ADOPTION_BRANCH, state="all")
-    if pull is None:
-        screen.labelled("Adoption PR:", "none open or merged")
-    else:
-        merge = (pull.get("mergeCommit") or {}).get("oid")
-        state = "draft" if pull.get("isDraft") else str(pull.get("state", "")).lower()
-        if merge:
-            main = gitops.contains(managed.path, merge, "origin/main")
-            tags = gitops.git(
-                "tag", "--list", "v*", "--sort=-v:refname", cwd=managed.path, check=False
-            ).stdout.split()
-            released = bool(tags) and gitops.contains(managed.path, merge, tags[0])
-            state = ("merged" if main else "merged on GitHub") + (
-                f", released in {tags[0]}" if released else ", not released yet"
-            )
-        screen.labelled("Adoption PR:", f"#{pull['number']} {state} {pull.get('url', '')}".strip())
-        if pull.get("state") == "OPEN":
-            screen.labelled("Adoption Checks:", github.checks(pull))
-            reviewers = github.reviewers(pull)
-            if reviewers:
-                screen.labelled("Adoption Reviewers:", ", ".join(reviewers))
-        found["pull_request"] = {"number": pull["number"], "state": state}
-    infrastructure = session.instance.infrastructure
-    if infrastructure is not None:
-        name = gitops.repository_name(infrastructure.remote)
-        tags = gitops.git(
-            "tag", "--list", "v*", "--sort=-v:refname", cwd=managed.path, check=False
-        ).stdout.split()
-        for environment, revision in (
-            ("Integration", "origin/main"),
-            ("Production", tags[0] if tags else None),
-        ):
-            if revision is None:
-                screen.labelled(f"{environment} Pins:", "no release tag yet")
-                continue
-            if not gitops.git("rev-parse", "--verify", "--quiet", revision, cwd=managed.path, check=False).ok:
-                screen.labelled(
-                    f"{environment} Pins:", f"unknown: {revision} isn't fetched in {managed.stored}"
-                )
-                continue
-            pinned = _pinned_version(session, releases, _pins(managed, revision, name))
-            screen.labelled(
-                f"{environment} Pins:",
-                f"{pinned} ({revision})" if fetched else f"{pinned} ({revision}, as last fetched)",
-            )
-            found[environment.lower()] = pinned
-    return found
 
 
 def _candidate_release(session: Session, detail: dict) -> str | None:
@@ -220,12 +131,27 @@ def _candidate_release(session: Session, detail: dict) -> str | None:
     return release
 
 
+def _own_version(session: Session, detail: dict) -> None:
+    """This dp-instance's version, and the newest published, when it's newer."""
+    own = installed.version()
+    try:
+        newest = next(reversed(session.releases.tools()), None)
+    except Stop:
+        newest = None
+    detail["dp_instance"] = {"installed": own, "newest": newest}
+    shown = own or "a local copy, not a published version"
+    if newest is not None and not installed.at_least(own, newest):
+        shown += f"; {newest} is published, which dp-instance update installs"
+    session.screen.labelled("dp-instance:", shown)
+
+
 def status(session: Session) -> Result:
     screen = session.screen
     instance = session.instance
     run = record.active(instance.state)
     detail: dict = {"active": None}
     screen.header("status", ("instance", instance.key))
+    screen.begin("the run record")
     if run is not None:
         screen.blank()
         screen.print(Text.assemble((run.data["goal"], "bold cyan"), f" · run {run.id}"))
@@ -280,9 +206,10 @@ def status(session: Session) -> Result:
         else:
             screen.note("No run on this workstation.")
 
+    screen.begin("the instance")
     screen.stage("the instance")
     releases = session.releases
-    upcoming: Next | None = None
+    upcoming: tuple[Next, ...] = ()
     try:
         current = targets.current(instance, releases)
         screen.labelled("Repositories Record:", current.describe())
@@ -290,21 +217,18 @@ def status(session: Session) -> Result:
         if current.version:
             release = targets.next_release(releases, current.version)
             if release:
-                upcoming = Next(
-                    f"dp-instance upgrade --to {release}",
+                upcoming = targets.upgrade_steps(
+                    releases,
+                    release,
                     f"takes Platform {release}, {targets.describe_next(current.version, release)}",
                 )
         elif current.canary:
             release = _candidate_release(session, detail)
             if release:
-                upcoming = Next(f"dp-instance upgrade --to {release}", f"Platform {release} is published")
+                upcoming = targets.upgrade_steps(releases, release, f"Platform {release} is published")
     except Stop as stop:
         screen.labelled("Repositories Record:", f"unknown: {stop.message}")
-    with screen.console.status("Reading the hold from the cluster") if session.interactive else nullcontext():
-        found = hold.read(instance)
-    if found.describe() is not None:
-        screen.labelled("Hold:", found.describe(), "bold yellow" if found.held else None)
-    detail["hold"] = {"held": list(found.held), "unknown": found.unknown}
+    _own_version(session, detail)
     repositories = []
     for item in instance.repositories:
         if item.managed_by:
@@ -317,16 +241,9 @@ def status(session: Session) -> Result:
             screen.labelled("Repo Template:", recorded.describe())
         if found["branch"]:
             screen.labelled("Repo Branch:", found["branch"])
-            if found["branch"] != "main":
-                pull = github.pull_request(item.path, found["branch"])
-                if pull:
-                    screen.labelled("Repo PR:", f"{github.describe(pull)} {pull.get('url', '')}".strip())
-                    found["pull_request"] = pull["number"]
         repositories.append(found)
     detail["repositories"] = repositories
-    if instance.managed:
-        screen.stage("adoption")
-        detail["adoption"] = [adoption(session, releases, managed) for managed in instance.managed]
+    screen.end()
 
     steps: list[Next] = []
     if run is not None:
@@ -334,7 +251,7 @@ def status(session: Session) -> Result:
             Next("dp-instance resume", "carries on from where the run stopped")
         ]
     elif upcoming:
-        steps = [upcoming]
+        steps = list(upcoming)
     if steps:
         screen.next_block(steps, session.relative(run.folder) + "/" if run is not None else None)
     return Result("status", "done", None, tuple(steps), detail)

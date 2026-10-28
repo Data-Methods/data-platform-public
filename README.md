@@ -11,7 +11,8 @@ in order, showing each plan and asking before each change. Read a tool before ru
 
 - A workstation inside the instance's private network, such as its Azure Virtual Desktop or
   Bastion VM: steps stop outside it.
-- uv, Git, OpenSSH, the Azure CLI, the GitHub CLI, Terraform 1.15.x, `kubectl` and `kubelogin`.
+- uv, Git 2.31 or newer, OpenSSH, the Azure CLI, the GitHub CLI, Terraform 1.15.x, `kubectl`
+  and `kubelogin`.
 - The Azure CLI signed in to the instance's tenant and subscription. On a shared machine, set
   `AZURE_CONFIG_DIR` to this instance's own folder in every shell before `az login`.
 - Membership of the instance's Platform Operators group and Infra Admin Group, every role
@@ -27,10 +28,10 @@ in order, showing each plan and asking before each change. Read a tool before ru
 
 ## Install
 
-Install the commit a release's manifest names as `dp_instance_commit`, then start a new shell:
+Install this repository's newest `dp-instance/<version>` tag, then start a new shell:
 
 ```bash
-uv tool install --reinstall "git+https://github.com/Data-Methods/data-platform-public@<commit>#subdirectory=tools/dp-instance"
+uv tool install --reinstall "git+https://github.com/Data-Methods/data-platform-public@dp-instance/<version>#subdirectory=tools/dp-instance"
 uv tool update-shell
 ```
 
@@ -39,15 +40,16 @@ In a new, empty folder, outside any folder OneDrive, iCloud Drive, Dropbox or Go
 ```bash
 git clone <Client Infrastructure Repository URL>
 dp-instance setup     # prints a git clone for each other repository: clone them, run setup again
-dp-instance template-access setup --key-vault <vault>   # every template in dp-instance.json
+dp-instance setup --approve <id>   # writes the map setup showed
+dp-instance template-access setup  # every template in dp-instance.json
 dp-instance template-access check
 ```
 
-`<vault>` is `infrastructure_key_vault.name` in `config/infrastructure/platform_foundation.json`:
-`setup` restores each template's key from it and names any template it couldn't set up. At a
-first deployment, before the vault exists, run `dp-instance template-access setup <template>`
-for each template instead, and send the public key it prints to Data Methods, never the
-private key.
+`template-access setup` restores each template's key from the Platform Infrastructure Key Vault
+that `config/infrastructure/platform_foundation.json` names. At a first deployment, before the
+vault exists, run
+`dp-instance template-access setup <template>` for each template instead, and send the public
+key it prints to Data Methods, never the private key.
 
 A checkout's Python environment, its `.venv`, doesn't survive a move: after moving a checkout,
 delete its `.venv` and run `uv sync --locked` in it, with the extras its own docs use, such as
@@ -60,13 +62,16 @@ dp-instance status                           # where the instance stands; change
 dp-instance upgrade                          # to the next stop: the next Platform Version, or a newer fix
 dp-instance upgrade --to <Platform Version>  # to a release you name
 dp-instance plan                             # preview a configuration change
-dp-instance apply --change "<what changes>"  # apply this branch's committed configuration
+dp-instance plan --step <repo/component/phase/step>    # preview one step
+dp-instance apply                            # apply main's configuration, once its change merges
 dp-instance resume                           # carry on where the run stopped
 dp-instance verify                           # check every step
+dp-instance verify --step <repo/component/phase/step>  # check one step
 dp-instance secret list [<name>]             # every secret, or one, and its state
 dp-instance secret set <name>                # at a terminal, replace the values you supply of one secret
 dp-instance secret reload [<name>]           # restart what reads a secret changed in Key Vault
 dp-instance secret rotate <name>             # replace a platform-generated secret
+dp-instance update                           # install the newest dp-instance
 ```
 
 Before an upgrade, read each changed template's release notes, at its commit in the manifest's
@@ -94,26 +99,24 @@ Every stop ends with **Next**, the commands that continue:
   types them.
 - **Sign-in:** run the command it names, such as `az login`, then `dp-instance resume`.
 - **Runs to finish:** Dagster runs still going; `dp-instance resume` waits again.
+- **Pending:** a step still waits on an earlier change or outside work; `dp-instance resume`
+  checks it again.
 
 A run lives on the workstation that started it. Never stop one while a step applies. A run
 stopped inside Data Engineering's hold queues new Dagster runs: resume promptly, or lift the hold
 in the Client Infrastructure Repository:
-`uv run --locked dp-data-engineering apply --step release`.
+`uv run --locked dp-data-engineering apply --phase runtime_workloads --step release`.
 
 When `dp-instance resume` can't get past one step, and the accountable person has reviewed
-its plan, apply that step alone with its component CLI. Run it in the step's repository, on
-the run's branch, such as `platform-2026.3.1` for the change `Platform 2026.3.1`, with the
-arguments `dp-instance` passes; the run's log, `.dp-instance/runs/<run>/log.txt`, shows them:
+its plan, apply that step alone with its component CLI, in the step's repository as the run
+left it, with the arguments the run's log, `.dp-instance/runs/<run>/log.txt`, shows:
 
 ```bash
 uv run --locked <component CLI> apply --phase <phase> --step <step> --platform-version <Platform Version> --change "<change>"
 ```
 
-At a terminal it shows the step's plan and asks before applying it. It applies only that step,
-publishes the step's outputs, commits and pushes on the run's branch any files the step
-writes, and verifies it. Then `dp-instance resume` carries on: it plans that step again, finds
-no change and goes on. If the step committed files, `resume` says the repository moved and
-names the command that continues.
+Approve the plan it shows. Then, with nothing else committed or changed in that checkout, run
+`dp-instance resume`.
 
 An upgrade ends with the Managed Repository's adoption pull request open, for its Production
 Data Engineers to merge, deploying Integration, and release, deploying Production:
@@ -148,3 +151,4 @@ each decision's plan file and ID to the accountable person; on their word, run
 | 5 | Decision |
 | 6 | Sign-in to renew |
 | 7 | Runs to finish |
+| 8 | A step still pending |

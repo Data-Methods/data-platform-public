@@ -3,23 +3,33 @@
 The statuses and exit codes are the components' own (the engine's common interface), so a
 person or an agent reads `dp-instance` the way it reads any component. Every stop names what it
 waits for: 0 done, 1 failed, 2 a usage error, 3 an external handoff, 4 values only a person
-supplies, 5 a decision, 6 a sign-in to renew, 7 runs a step waits out.
+supplies, 5 a decision, 6 a sign-in to renew, 7 runs a step waits out, 8 a step still pending.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-EXIT_CODES = {"done": 0, "failed": 1, "handoff": 3, "values": 4, "decision": 5, "sign-in": 6, "runs": 7}
+EXIT_CODES = {
+    "done": 0,
+    "failed": 1,
+    "handoff": 3,
+    "values": 4,
+    "decision": 5,
+    "sign-in": 6,
+    "runs": 7,
+    "pending": 8,
+}
 USAGE = 2
 # The stops for what a run waits on besides a decision or an external handoff.
-WAITS = ("values", "sign-in", "runs")
+WAITS = ("values", "sign-in", "runs", "pending")
 # What a step's line says while the run waits on each stop.
 WAITING_FOR = {
     "handoff": "waiting: handoff",
     "values": "waiting: values",
     "sign-in": "waiting: a sign-in",
     "runs": "waiting: runs to finish",
+    "pending": "waiting: pending",
 }
 
 

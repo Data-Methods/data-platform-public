@@ -3,16 +3,18 @@
     dp-instance [status]                    where the instance stands, planning nothing
     dp-instance setup                       map the instance's repositories
     dp-instance upgrade [--to VERSION]      one run, from the code into the platform
-    dp-instance plan                        preview the next change; starts no run
-    dp-instance apply                       a new run on the checked-out code
+    dp-instance plan [--step NAME]          preview the next change, or one step; starts no run
+    dp-instance apply                       a new run on main's code: a configuration change
     dp-instance resume                      carry on from where the active run stopped
-    dp-instance verify                      the completion check
+    dp-instance verify [--step NAME]        the completion check, or one step's verify
     dp-instance template-access setup|check
     dp-instance secret list|set|reload|rotate
+    dp-instance update                      install the newest published dp-instance
 
 Every command takes --json: one JSON object per line on stdout, ending with the result, and
 no question asked. Exit codes: 0 done, 1 failed, 2 a usage error, 3 an external handoff,
-4 values only a person supplies, 5 a decision, 6 a sign-in to renew, 7 runs a step waits out.
+4 values only a person supplies, 5 a decision, 6 a sign-in to renew, 7 runs a step waits out,
+8 a step still pending.
 """
 
 from __future__ import annotations
@@ -21,7 +23,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from . import runs, secrets, setup, status, template_access, views
+from . import runs, secrets, setup, status, template_access, update, views
 from .outcome import USAGE, Result, Stop
 from .screen import Screen
 from .session import Options, Session, terminal
@@ -35,18 +37,20 @@ def _parser() -> argparse.ArgumentParser:
         default=argparse.SUPPRESS,
         help="Write one JSON object per line to stdout, ending with the result; never ask.",
     )
-    approving = argparse.ArgumentParser(add_help=False)
+    automatic = argparse.ArgumentParser(add_help=False)
+    automatic.add_argument(
+        "--auto-approve",
+        action="store_true",
+        help="Approve each step's plan, and the restarts of secret commands, without stopping.",
+    )
+    # A decision's ID, which only a stop names: resume and the secret commands take it.
+    approving = argparse.ArgumentParser(add_help=False, parents=[automatic])
     approving.add_argument(
         "--approve",
         action="append",
         default=[],
         metavar="ID",
         help="Approve the decision with this ID, as a review showed it. Repeatable.",
-    )
-    approving.add_argument(
-        "--auto-approve",
-        action="store_true",
-        help="Approve each step's plan, and the restarts of secret commands, without stopping.",
     )
     parser = argparse.ArgumentParser(
         prog="dp-instance",
@@ -61,7 +65,7 @@ def _parser() -> argparse.ArgumentParser:
         "--approve", action="append", default=[], metavar="ID", help="Write the map setup showed."
     )
     upgrade = commands.add_parser(
-        "upgrade", parents=[common, approving], help="Upgrade to the next release, or the one --to names."
+        "upgrade", parents=[common, automatic], help="Upgrade to the next release, or the one --to names."
     )
     target = upgrade.add_mutually_exclusive_group()
     target.add_argument(
@@ -76,27 +80,31 @@ def _parser() -> argparse.ArgumentParser:
         # Data Methods' own pre-release instance only: an unpublished candidate manifest.
         help=argparse.SUPPRESS,
     )
-    commands.add_parser("plan", parents=[common], help="Preview the next change; starts no run.")
-    apply = commands.add_parser(
-        "apply", parents=[common, approving], help="Start a new run on the checked-out code."
-    )
-    apply.add_argument(
-        "--change",
-        metavar="TEXT",
-        help='Name the change, such as "Raise the node count": it titles the pull requests.',
+    preview = commands.add_parser("plan", parents=[common], help="Preview the next change; starts no run.")
+    commands.add_parser(
+        "apply",
+        parents=[common, automatic],
+        help="Apply main's configuration: a new run on main's code, once your change is merged.",
     )
     commands.add_parser(
         "resume", parents=[common, approving], help="Carry on from where the active run stopped."
     )
-    commands.add_parser("verify", parents=[common], help="Run every step's read-only verify.")
+    check = commands.add_parser("verify", parents=[common], help="Run every step's read-only verify.")
+    for sub, what in ((preview, "Plan"), (check, "Verify")):
+        sub.add_argument(
+            "--step",
+            metavar="NAME",
+            help=f"{what} one step alone, by its full name: repository/component/phase/step.",
+        )
+    commands.add_parser("update", parents=[common], help="Install the newest published dp-instance.")
 
     access = commands.add_parser("template-access", parents=[common], help="Set up or check template access.")
     access_commands = access.add_subparsers(dest="access", metavar="ACTION", required=True)
     for name, text, default in (
         (
             "setup",
-            "Set up template access: each key, its vault copy, SSH alias and Git rule.",
-            "with --key-vault, every template in dp-instance.json whose key the vault holds",
+            "Set up template access: each key, its vault copy and SSH alias.",
+            "every template in dp-instance.json whose key the Platform Infrastructure Key Vault holds",
         ),
         ("check", "Check template access.", "every template set up here or mapped"),
     ):
@@ -105,23 +113,13 @@ def _parser() -> argparse.ArgumentParser:
         sub.add_argument(
             "--instance", metavar="KEY", help="The Platform Instance Key; read from the map by default."
         )
-        sub.add_argument(
-            "--key-vault",
-            metavar="NAME",
-            help="The Platform Infrastructure Key Vault, once it exists: infrastructure_key_vault.name in "
-            "the Client Infrastructure Repository's config/infrastructure/platform_foundation.json.",
-        )
-        sub.add_argument(
-            "--development",
-            action="store_true",
-            # Data Methods' own pre-release instance only: the key for the development repository.
-            help=argparse.SUPPRESS,
-        )
         if name == "setup":
             sub.add_argument(
-                "--migrate-legacy-infrastructure-key",
+                "--development",
                 action="store_true",
-                help="Adopt the older Infrastructure key, without rotating it.",
+                # Data Methods' own pre-release instance only: a named template's key for its
+                # development repository. Setup with no template restores every one the vault holds.
+                help=argparse.SUPPRESS,
             )
 
     secret = commands.add_parser("secret", parents=[common], help="List, set, reload or rotate secrets.")
@@ -158,23 +156,15 @@ def _dispatch(arguments, screen: Screen) -> Result:
                 start,
                 arguments.template,
                 instance=arguments.instance,
-                key_vault=arguments.key_vault,
                 development=arguments.development,
-                migrate_legacy=arguments.migrate_legacy_infrastructure_key,
             )
-        return template_access.check(
-            screen,
-            start,
-            arguments.template,
-            instance=arguments.instance,
-            key_vault=arguments.key_vault,
-            development=arguments.development,
-        )
+        return template_access.check(screen, start, arguments.template, instance=arguments.instance)
+    if arguments.command == "update":
+        return update.update(screen)
     options = Options(
         json=arguments.json,
         auto_approve=getattr(arguments, "auto_approve", False),
         approvals=tuple(getattr(arguments, "approve", ())),
-        change=getattr(arguments, "change", None),
     )
     session = Session(options, start, screen=screen)
     command = arguments.command or "status"
@@ -187,9 +177,9 @@ def _dispatch(arguments, screen: Screen) -> Result:
     if command == "resume":
         return runs.resume(session)
     if command == "plan":
-        return views.plan(session)
+        return views.plan(session, arguments.step)
     if command == "verify":
-        return views.verify(session)
+        return views.verify(session, arguments.step)
     if arguments.secret == "list":
         return secrets.list_secrets(session, arguments.name)
     if arguments.secret == "set":
@@ -199,7 +189,17 @@ def _dispatch(arguments, screen: Screen) -> Result:
     return secrets.rotate(session, arguments.name)
 
 
+def utf8_output() -> None:
+    """Write UTF-8 to the output and error streams whatever the console's code page: on Windows a
+    pipe or a redirect takes the code page, such as cp1252, which can't encode characters such
+    as the arrow in an upgrade's goal, and the command would stop at the first."""
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure") and (stream.encoding or "").lower().replace("-", "") != "utf8":
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
+
 def main(argv: list[str] | None = None) -> int:
+    utf8_output()
     parser = _parser()
     try:
         arguments = parser.parse_args(argv)
@@ -231,6 +231,8 @@ def main(argv: list[str] | None = None) -> int:
             screen.next_block(stop.next)
     except KeyboardInterrupt:
         result = Result(command, "failed", "Interrupted.")
+    # Every command's total, the time it took, and its parts' times.
+    result.detail.update(screen.total())
     screen.emit(result.describe())
     return result.code
 

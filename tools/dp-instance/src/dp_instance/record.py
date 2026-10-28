@@ -1,7 +1,7 @@
 """A run and its record, in `.dp-instance/runs/<run>/`.
 
 A run is one journey through the whole sequence. Its record holds the manifest it runs, the
-commits it's tied to, each step's outcome as it happens, the pull requests it opened and merged,
+commits it's tied to, each step's outcome as it happens with the pull requests the step reports,
 where it stopped and why, its log, its plan files and its handoff pages. `status` reads it
 without planning anything, and `resume` carries on from where it stopped. The record never
 stands in for a plan: each step is still planned right before it's applied.
@@ -24,7 +24,7 @@ ACTIVE = ("running", "stopped", "failed")
 REPLACE_TRIES = 20
 REPLACE_WAIT = 0.1
 # Outcomes after which a resumed run passes a step without running it again.
-FINISHED = ("applied", "no change", "passed", "no drift", "published cleanly", "approved", "skipped")
+FINISHED = ("applied", "no change", "passed", "no drift", "approved", "skipped")
 
 
 def now() -> str:
@@ -143,16 +143,6 @@ class Record:
             **{key: value for key, value in detail.items() if value not in (None, [], {})},
         }
         self.data["position"] = entry.id
-        self.save()
-
-    def pull_request(self, repository: str, pull: dict) -> None:
-        """Keep a pull request of the run's in a repository, as GitHub lists it: its number, its
-        URL and, once merged, the commit it merged as."""
-        self.data.setdefault("pull_requests", {})[repository] = {
-            "number": pull["number"],
-            "url": pull.get("url"),
-            "merge_commit": (pull.get("mergeCommit") or {}).get("oid"),
-        }
         self.save()
 
     def stop(self, status: str, reason: str, message: str, **detail) -> None:

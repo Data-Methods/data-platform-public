@@ -6,7 +6,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import installed
+from . import gitops, installed, template_access
 from .instance import Instance
 from .manifest import Releases
 from .screen import Screen
@@ -22,7 +22,6 @@ class Options:
     json: bool = False
     auto_approve: bool = False
     approvals: tuple[str, ...] = ()
-    change: str | None = None
 
 
 class Session:
@@ -31,6 +30,8 @@ class Session:
         self.screen = screen or Screen(json_mode=options.json, interactive=terminal())
         self.instance = Instance.find(start)
         self.instance.check()
+        # The instance's template access reaches the Git commands and component CLIs it starts.
+        gitops.pass_configuration(template_access.rewrites(self.instance.key, self.instance))
         self.releases = Releases(self.instance.state / "releases.git")
 
     @property
@@ -44,5 +45,5 @@ class Session:
             return str(path)
 
     @staticmethod
-    def own_commit() -> str | None:
-        return installed.commit()
+    def own_version() -> str | None:
+        return installed.version()

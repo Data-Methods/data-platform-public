@@ -40,6 +40,12 @@ def main(argv: list[str] | None = None) -> int:
         if args.action in {"configure", "reconfigure"}:
             configure(args.file, reconfigure=args.action == "reconfigure")
             return 0
+        if args.action == "tunnel" and not args.file.is_file():
+            raise CommandError(
+                f"No configuration file {args.file.absolute()}. configure wrote bastion-vm.json in "
+                "the folder it ran in, $HOME/bastion-vm in Azure Cloud Shell by the README's steps: "
+                "copy it to this machine and run tunnel in its folder, or name it with --file."
+            )
         config = WorkstationConfig.load(args.file)
         azure = AzureCli(subscription=config.subscription_id)
         validate_context(config, azure)

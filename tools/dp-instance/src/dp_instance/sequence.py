@@ -3,24 +3,29 @@
 
 Repositories contain components, components contain phases and phases contain steps.
 Before anything changes, every component's `preflight` step runs and, in an upgrade run, the
-drift check. An upgrade run then runs each repository owner's `upgrade` phase and every
-component's `migrate` step, repository by repository; its preflights and `upgrade` phases are
-the target's, as the target declares them. Then, per repository, each component's phases,
-the owner's `merge` phase, and the phases that read the merged commit.
+drift check. An upgrade run then runs each repository owner's `upgrade` phase, walked whole,
+and every component's `migrate` step, repository by repository; its preflights and `upgrade`
+phases run from the target's CLI, as the checkouts declare them, since a target's `steps
+--json` refuses configuration its `migrate` hasn't brought to the target's schemas yet. Then,
+per repository, each component's phases as the target declares them, the owner's `merge`
+phase, and the phases that read the merged commit.
 """
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 
 from .manifest import Manifest, Repository
 from .outcome import failed
 
 UPGRADE = "upgrade"
 MERGE = "merge"
-# The one-time move onto the release repositories, which only a repository at its 2026.2 to
-# 2026.3 hop takes. Deleted at the 2026.4 stop.
-FIRST_MOVE = "first-move"
+# The output an owner's `merge` publishes once a run has applied every other phase of its
+# repository: the commit it landed on `main`.
+MERGED_COMMIT = "merged_commit"
+# The `steps --json` schemas this dp-instance reads: 2026.4's, and 2026.3's during the upgrade
+# to 2026.4. Schema 1 goes at the next stop.
+SCHEMAS = (1, 2)
 
 
 @dataclass(frozen=True)
@@ -28,6 +33,25 @@ class Step:
     name: str
     description: str
     enabled: bool | None
+    # Whether the step writes only its repositories. Schema 1 declares none.
+    repository_only: bool = False
+    # The later step of the same component its effect lasts until, such as `hold`'s `release`.
+    holds_until: str | None = None
+    # A Terraform step, `terraform`, or one the component does itself, `native`.
+    kind: str = "native"
+    # The names of the Component Outputs it publishes.
+    outputs: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class Unit:
+    """One of a component's `migrate` units, in execution order: its kind is `configuration`,
+    `file`, `external-state` or `managed`; a configuration unit's ``versions`` are each phase
+    document's before and after."""
+
+    name: str
+    kind: str
+    versions: dict[str, list[int]] | None
 
 
 @dataclass(frozen=True)
@@ -54,6 +78,13 @@ class Declaration:
     upgrade: Phase | None
     migrate: str | None
     phases: tuple[Phase, ...]
+    # Its `steps --json` schema: 2, or 2026.3's 1.
+    schema: int
+    # The `migrate` units. Schema 1 lists none.
+    units: tuple[Unit, ...] = ()
+    # Whether its `apply` takes the walk's plan skip, `--planned` and
+    # `--unchanged-since-planned`: engine 0.16.0 on.
+    plan_skip: bool = False
 
     @property
     def owner(self) -> bool:
@@ -61,6 +92,19 @@ class Declaration:
 
     def phase(self, name: str) -> Phase | None:
         return next((phase for phase in self.phases if phase.name == name), None)
+
+    def phase_of(self, step: str) -> str:
+        """The phase that declares ``step``, whether or not the configuration switches it off."""
+        return next(
+            (phase.name for phase in self.phases if any(item.name == step for item in phase.steps)), ""
+        )
+
+    @property
+    def publishes_merged_commit(self) -> bool:
+        """Whether its `merge` publishes `merged_commit`, as an owner with Component Outputs'
+        does."""
+        merge = self.phase(MERGE)
+        return merge is not None and any(MERGED_COMMIT in step.outputs for step in merge.steps)
 
     @property
     def after_merge(self) -> list[str]:
@@ -73,7 +117,15 @@ def _phase(data: dict) -> Phase:
         data["name"],
         data.get("description") or "",
         tuple(
-            Step(step["name"], step.get("description") or "", step.get("enabled", True))
+            Step(
+                step["name"],
+                step.get("description") or "",
+                step.get("enabled", True),
+                bool(step.get("repository_only", False)),
+                step.get("holds_until"),
+                step.get("kind") or "native",
+                tuple(step.get("outputs") or ()),
+            )
             for step in data.get("steps", [])
         ),
         bool(data.get("after_merge", False)),
@@ -81,9 +133,9 @@ def _phase(data: dict) -> Phase:
 
 
 def declaration(document: dict, command: str) -> Declaration:
-    """Read a component's `steps --json`."""
+    """Read a component's `steps --json`, at schema 2 or 1."""
     try:
-        if document.get("schema_version") != 1:
+        if document.get("schema_version") not in SCHEMAS:
             raise ValueError
         component = document["component"]
         preflight = document.get("preflight")
@@ -96,6 +148,12 @@ def declaration(document: dict, command: str) -> Declaration:
             _phase(upgrade) if upgrade else None,
             migrate["description"] if migrate else None,
             tuple(_phase(phase) for phase in document.get("phases", [])),
+            document["schema_version"],
+            tuple(
+                Unit(unit["name"], unit["kind"], unit.get("versions"))
+                for unit in (migrate or {}).get("units") or []
+            ),
+            document.get("plan_skip") is True,
         )
     except (KeyError, TypeError, ValueError):
         raise failed(f"{command} steps --json isn't a declaration this dp-instance reads.") from None
@@ -106,7 +164,7 @@ class Entry:
     """One place in the run: a component's preflight, the drift check, or a step."""
 
     id: str
-    kind: str  # preflight, drift, published, upgrade, migrate or step
+    kind: str  # preflight, drift, upgrade, migrate or step
     description: str = ""
     repository: str = ""
     component: str = ""
@@ -125,6 +183,14 @@ class Entry:
     # An entry run from the owner's CLI fetched at the target: an upgrade's preflights and
     # its owners' `upgrade` phases.
     fetched: bool = False
+    # The later step of the component that lifts this step's hold, and its phase; empty for a
+    # step that holds nothing.
+    holds_until: str = ""
+    holds_until_phase: str = ""
+    # Whether the step writes only its repositories, as its declaration says.
+    repository_only: bool = False
+    # A Terraform step whose component's `apply` takes the walk's plan skip.
+    plan_skip: bool = False
 
     def describe(self) -> dict:
         return asdict(self)
@@ -138,15 +204,24 @@ class Entry:
         """Where the entry is, in the vocabulary the screen teaches."""
         if self.kind == "preflight":
             return f"preflight {self.preflight_counter} ({self.component})"
-        if self.kind in ("drift", "published"):
-            return "the drift check" if self.kind == "drift" else "the published outputs check"
+        if self.kind == "drift":
+            return "the drift check"
         if self.kind == "migrate":
             return f"{self.component}'s migrate step"
+        if self.kind == "upgrade":
+            return f"{self.component}'s upgrade phase"
         return f"step {self.step_counter} {self.step} in {self.component}'s {self.phase} phase"
 
 
 def _join(names: list[str]) -> str:
     return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
+
+
+def parse_step(name: str) -> tuple[str, str] | None:
+    """The repository and component a step's full name, `repository/component/phase/step`,
+    names; None when it isn't one."""
+    parts = name.split("/")
+    return (parts[0], parts[1]) if len(parts) == 4 and all(parts) else None
 
 
 @dataclass(frozen=True)
@@ -207,6 +282,10 @@ class Plan:
                 step=step.name,
                 phase_counter=f"{names.index(phase.name) + 1}/{len(names)}",
                 step_counter=f"{number}/{len(steps)}",
+                holds_until=step.holds_until or "",
+                holds_until_phase=declared.phase_of(step.holds_until) if step.holds_until else "",
+                repository_only=step.repository_only,
+                plan_skip=declared.plan_skip and step.kind == "terraform",
                 **self._base(repository, component, kind, upgrade),
             )
 
@@ -227,23 +306,30 @@ class Plan:
             for number, (repository, component) in enumerate(found, 1)
         ]
 
-    def code(self, first_hop: set[str]) -> list[Entry]:
-        """An upgrade run's code: each owner's `upgrade` phase, then every component's
-        `migrate` step, repository by repository. Only a repository at its first hop takes
-        the first move, and one the upgrade leaves unchanged takes no `upgrade` phase."""
+    def code(self) -> list[Entry]:
+        """An upgrade run's code, from the declarations the checkouts hold before it: each
+        owner's `upgrade` phase, which the target's CLI walks whole, then every component's
+        `migrate` step, repository by repository. Neither reads the target's declarations,
+        which only configuration `migrate` has brought to the target's schemas can give. A
+        repository the upgrade leaves unchanged takes no `upgrade` phase."""
         entries = []
         for repository in self.repositories:
             owner = repository.owner
-            declared = self.declared(repository.key, owner.key)
-            upgrade = declared.upgrade
+            upgrade = self.declared(repository.key, owner.key).upgrade
             if upgrade is None:
                 raise failed(f"{owner.key} declares no upgrade phase, so it can't own {repository.key}.")
-            if repository.key not in first_hop:
-                upgrade = replace(
-                    upgrade, steps=tuple(step for step in upgrade.steps if step.name != FIRST_MOVE)
-                )
             if repository.key not in self.unchanged:
-                entries.extend(self._phase_entries(repository, owner, upgrade, True, "upgrade"))
+                entries.append(
+                    Entry(
+                        id=f"{repository.key}/{owner.key}/{UPGRADE}",
+                        description=upgrade.description,
+                        phase=UPGRADE,
+                        step=UPGRADE,
+                        # It changes no platform resource: it moves the code on the run's branch.
+                        repository_only=True,
+                        **self._base(repository, owner, "upgrade", True),
+                    )
+                )
             for component in repository.components:
                 migrate = self.declared(repository.key, component.key).migrate
                 if migrate:
@@ -256,6 +342,11 @@ class Plan:
                         )
                     )
         return entries
+
+    def estimate(self) -> int:
+        """About how many steps an upgrade's platform part holds, from the declarations the
+        checkouts hold before it."""
+        return sum(len(phase.runs) for declared in self.declarations.values() for phase in declared.phases)
 
     def check_after_merge(self, repository: Repository) -> None:
         """The manifest's `after_merge`, which the Command Center computes from each phase's
@@ -293,6 +384,29 @@ class Plan:
                     raise failed(f"{item.component} declares no phase {item.phase}.")
                 entries.extend(self._phase_entries(repository, component, phase, upgrade))
         return entries
+
+    def step(self, name: str) -> Entry | None:
+        """The platform step a full name, `repository/component/phase/step`, names, as a run's
+        entries name it; None when it names no step the configuration runs."""
+        parts = name.split("/")
+        if len(parts) != 4:
+            return None
+        repository_key, component_key, phase_name, step_name = parts
+        repository = next((item for item in self.repositories if item.key == repository_key), None)
+        if repository is None or (repository_key, component_key) not in self.declarations:
+            return None
+        component = next(item for item in repository.components if item.key == component_key)
+        phase = self.declared(repository_key, component_key).phase(phase_name)
+        if phase is None:
+            return None
+        return next(
+            (
+                entry
+                for entry in self._phase_entries(repository, component, phase, False)
+                if entry.step == step_name
+            ),
+            None,
+        )
 
     def drift_targets(self) -> list[tuple[Repository, str, str]]:
         """What the drift check plans: every component's phases except the owner's
