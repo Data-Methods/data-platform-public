@@ -2,18 +2,20 @@
 
 A run has up to three parts, each counted and timed on its own. Before anything changes, an
 upgrade fetches every repository's target source at once, every component's `preflight` step
-runs and, in an upgrade run, the drift check. An upgrade's code part then runs each owner's
-`upgrade` phase and every `migrate` step. In the platform part, each step is planned only
-after the steps before it have applied: a step with no change passes, and at a step with a
-change the run stops for review and, on approval, applies exactly that plan, which the
-component verifies before the next step starts. While rule C holds in an upgrade, a Terraform
-step whose drift plan had no change is named to its component's `apply` with that plan's
-inputs hash, and reports no change without running Terraform while the hash still matches:
-rule C holds until a step that writes more than its repositories applies, the run waits on
-outside work, or it resumes, and never for a component whose configuration `migrate` changed.
-At a terminal a person is asked with single keypresses; without one, or with `--json`, every
-question is a stop naming the command that continues. Each pull request a step reports is
-shown as it arrives, and its last state kept.
+runs, all at once, and, in an upgrade run, the drift check. An upgrade's code part then runs
+each owner's `upgrade` phase and every `migrate` step. In the platform part, each step is
+planned only after the steps before it have applied: a step with no change passes, and at a
+step with a change the run stops for review and, on approval, applies exactly that plan, which
+the component verifies before the next step starts. While rule C holds in an upgrade, a
+Terraform step whose drift plan had no change is named to its component's `apply` with that
+plan's inputs hash, and reports no change without running Terraform while the hash still
+matches; while its repository is at the commit the drift check planned, a hold names the native
+steps it guards whose drift plan had no change too, which its preview doesn't plan. Rule C
+holds until a step that writes more than its repositories applies, the run waits on outside
+work, or it resumes, and never for a component whose configuration `migrate` changed. At a
+terminal a person is asked with single keypresses; without one, or with `--json`, every
+question is a stop naming the command that continues. Each pull request a step reports is shown
+as it arrives, and its last state kept.
 """
 
 from __future__ import annotations
@@ -23,14 +25,13 @@ import json
 import re
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
-from itertools import takewhile
 from pathlib import Path
 
 from rich.text import Text
 
-from . import configuration, gitops, handoffs, prompts, targets
+from . import configuration, earlier, gitops, handoffs, prompts, targets
 from .components import Call, Cli, Log
 from .instance import (
     INFRASTRUCTURE,
@@ -40,9 +41,9 @@ from .instance import (
     merged_commits,
     registrations,
 )
-from .manifest import Manifest
+from .manifest import Manifest, cli_platform_version
 from .outcome import WAITING_FOR, WAITS, Next, Result, Stop, failed
-from .record import Record
+from .record import NOT_STARTED, Record, mark_replaced, under_way
 from .screen import Block, duration
 from .sequence import MERGE, Declaration, Entry, Plan, declaration
 from .session import Session
@@ -55,6 +56,9 @@ CHECKS = {"preflight": "preflights", "drift": "the drift check"}
 # the channel from its target; an engine before it takes `upgrade --channel`. Goes at the next
 # stop.
 FIRST_SCHEMA_2_ENGINE = (0, 15)
+# The reason a new upgrade stops when it can't read the steps while a run had stopped, which it
+# keeps as it was.
+KEPT = "stopped-run-kept"
 # How many of a decision's plan lines its JSON result carries.
 PLAN_HEAD = 40
 LEVELS = ("repository", "component", "phase", "step")
@@ -223,6 +227,54 @@ class Run:
         if fetched:
             self.timed("fetched", f"{fetched} target source{'s' if fetched != 1 else ''}", started)
 
+    def earlier_runs(self) -> None:
+        """As an upgrade starts, the open pull requests and branches each earlier upgrade run
+        left in its repositories, and whether that run touched the platform, which then may be
+        part-way between releases. They're only named: closing them is the call of the person
+        accountable for the instance. A lookup that failed is one line, and the upgrade goes
+        on."""
+        if not self.change:
+            return
+        started = time.monotonic()
+        block = Block("earlier runs", "", "", "", self.footer)
+        block.message = "Looking for earlier upgrade runs' pull requests and branches"
+        checkouts = {repository.key: self.checkout(repository.key) for repository in self.repositories}
+        found, failures = self.screen.run_live(
+            block,
+            earlier.find,
+            self.instance.state,
+            self.record.id,
+            gitops.run_branch(self.change),
+            checkouts,
+        )
+        if not found and not failures:
+            return
+        self.timed("looked for", "earlier upgrade runs' pull requests and branches", started)
+        for item in found:
+            self.screen.blank()
+            said = (
+                "it touched the platform, which may be part-way between releases"
+                if item.touched_platform
+                else "it didn't touch the platform"
+            )
+            self.screen.labelled("Earlier Run:", f"{item.run}, on {item.branch}: {said}")
+            for left in item.left:
+                for url, state in left.pull_requests:
+                    self.screen.labelled("Pull Request:", f"{url} ({state})")
+                self.screen.labelled("Branch:", f"{left.repository}'s {left.branch}, {left.where}")
+        if found:
+            self.screen.note(
+                "dp-instance leaves them as they are: closing them is the call of the person accountable "
+                "for the instance."
+            )
+        if failures:
+            more = f" and {len(failures) - 1} more" if len(failures) > 1 else ""
+            self.screen.labelled("Not Looked Up:", f"{failures[0].rstrip('.')}{more}; the upgrade goes on")
+        described = {"earlier": [item.describe() for item in found], "failures": failures}
+        self.record.data["earlier_runs"] = described
+        self.record.save()
+        self.screen.emit({"event": "earlier_runs", "run": self.record.id, **described})
+
     def cli(self, repository: str, command: str, *, fetched: bool = False) -> Cli:
         project = self.source(repository) if fetched else None
         return Cli(command, self.checkout(repository), self.log, project)
@@ -335,14 +387,17 @@ class Run:
         runs its preflights, which read no configuration, and each owner's whole `upgrade`
         phase from the target's fetched CLI; the drift check stays on the code the platform
         runs. A repository the upgrade leaves unchanged takes no `upgrade` phase. Its platform
-        part is counted from the checkouts' declarations until the upgraded code is read."""
+        part is counted from the checkouts' declarations until the upgraded code is read. An
+        upgrade reads the steps first, then fetches the target's sources."""
         self._progress = None
+        started = time.monotonic()
+        declarations = self.read_steps()
+        read = f"the steps of {len(declarations)} components"
         if self.upgrading:
+            self.timed("read", read, started)
+            self.earlier_runs()
             self.fetch_sources()
             self.record.data["unchanged"] = self.find_unchanged()
-        started = time.monotonic()
-        declarations = self.declarations()
-        read = f"the steps of {len(declarations)} components"
         plan = self.plan(declarations)
         entries = plan.preflights()
         if self.upgrading:
@@ -365,8 +420,38 @@ class Run:
             if self.record.kind == "apply":
                 self.record.data["configuration_changes"] = self.configuration_changes(plan.declarations)
                 read += " and the instance's published outputs"
+            self.timed("read", read, started)
         self.record.entries = entries
-        self.timed("read", read, started)
+
+    def read_steps(self) -> dict[tuple[str, str], Declaration]:
+        """The checkouts' declarations. A new upgrade replaces the run that stopped before it
+        only once it has read them: a checkout that run left part way, such as with the target's
+        code and configuration its `migrate` hasn't brought to the target's schemas yet, refuses
+        its steps, and the upgrade then stops, never started, with that run as it was, for
+        `resume`."""
+        replaces = self.record.data.get("replaces")
+        try:
+            declarations = self.declarations()
+        except Stop as stop:
+            previous = under_way(self.instance.state, replaces) if replaces else None
+            if previous is None:
+                raise
+            said = stop.message if stop.message.endswith(".") else f"{stop.message}."
+            raise Stop(
+                stop.status,
+                f"{said} The upgrade didn't start: run {previous.id}, which stopped, is as it was.",
+                reason=KEPT,
+                kept=previous.id,
+                next=(
+                    *stop.next,
+                    Next("dp-instance resume", f"carries run {previous.id} on from where it stopped"),
+                ),
+            ) from None
+        if replaces:
+            mark_replaced(self.instance.state, replaces)
+            del self.record.data["replaces"]
+            self.record.save()
+        return declarations
 
     def configuration_changes(self, declarations) -> list[str]:
         """The components whose configuration on `main` isn't the one they last published: what
@@ -430,11 +515,14 @@ class Run:
         place = members.index(entry.id) + 1 if entry.id in members else len(members) + 1
         return part_of(entry), place, max(len(members), place)
 
-    def count(self, entry: Entry) -> None:
-        """The footer's progress for the entry under way: its part, its position and count, and
-        the parts ahead, the platform's count estimated from the checkouts' declarations until
-        the target's are read, once `migrate` has run."""
+    def count(self, entry: Entry, last: Entry | None = None) -> None:
+        """The footer's progress for the entry under way, or the entries from ``entry`` to
+        ``last`` under way at once: its part, its position and count, and the parts ahead, the
+        platform's count estimated from the checkouts' declarations until the target's are read,
+        once `migrate` has run."""
         part, place, total = self.position(entry)
+        if last is not None and last.id != entry.id:
+            place = f"{place}-{self.position(last)[1]}"
         counted = self.counted()
         ahead = []
         for later in list(PARTS)[list(PARTS).index(part) + 1 :]:
@@ -557,7 +645,7 @@ class Run:
         entries = self.record.entries
         entry = entries[start]
         if part_of(entry) == "before":
-            self.replay_checks(start)
+            self.replay_checks()
             return
         for depth, level in enumerate(LEVELS[:3]):
             if level == "phase" and entry.kind in ("upgrade", "migrate"):
@@ -590,17 +678,14 @@ class Run:
         block.outcome, block.seconds, block.live = f"{noted['outcome']} earlier", noted["seconds"], False
         self.screen.show(block, compact=True)
 
-    def replay_checks(self, start: int) -> None:
-        """The checks before the run (preflights and the drift check) are its
-        start: those that passed earlier take one line and don't run again. The first that
-        didn't pass runs, and every check after it."""
-        entries = self.record.entries
-        stage = [item for item in entries if part_of(item) == "before"]
-        passed = list(
-            takewhile(
-                lambda item: part_of(item) == "before" and self.record.finished(item.id), entries[start:]
-            )
-        )
+    def replay_checks(self) -> None:
+        """The checks before the run (preflights and the drift check) are its start: those
+        that passed earlier take one line and don't run again. Each preflight that didn't pass
+        runs, and every check after the preflights."""
+        stage = [item for item in self.record.entries if part_of(item) == "before"]
+        passed = [item for item in stage if self.record.finished(item.id) and item.id not in self._walked]
+        if not passed:
+            return
         names = list(dict.fromkeys(CHECKS[item.kind] for item in passed))
         named = names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
         seconds = sum(self.record.outcome(item.id).get("seconds") or 0 for item in passed)
@@ -719,6 +804,10 @@ class Run:
             if entry.id in self._walked:
                 continue
             self._position = index
+            if entry.kind == "preflight":
+                self.replay_checks()
+                self.preflights([item for item in self.record.entries if item.kind == "preflight"])
+                continue
             if self.record.finished(entry.id):
                 self.replay(index - 1)
                 continue
@@ -729,7 +818,6 @@ class Run:
             block = self.block(entry)
             self._entry, self._block = entry, block
             handler = {
-                "preflight": self.preflight,
                 "drift": self.drift_check,
                 "migrate": self.migrate,
                 "upgrade": self.step,
@@ -756,7 +844,7 @@ class Run:
     def version(self) -> list[str]:
         """The Platform Version the run brings the instance to, from its manifest, which
         `preflight`, `upgrade`, `plan`, `apply` and `verify` take."""
-        return ["--platform-version", self.manifest.platform_version]
+        return ["--platform-version", cli_platform_version(self.manifest.platform_version)]
 
     @property
     def applied_version(self) -> list[str]:
@@ -768,7 +856,7 @@ class Run:
         version = targets.current(instance, releases, applied=True).version or targets.candidate_of(
             instance, applied=True
         )
-        return ["--platform-version", version or self.manifest.platform_version]
+        return ["--platform-version", cli_platform_version(version or self.manifest.platform_version)]
 
     def again(self) -> tuple[Next, ...]:
         """A new run in place of resuming this one, when every repository is on `main`, the only
@@ -786,30 +874,98 @@ class Run:
             return f"dp-instance upgrade --manifest {origin}"
         return f"dp-instance upgrade --to {self.manifest.platform_version}"
 
-    def preflight(self, entry: Entry, block: Block) -> None:
-        cli = self.cli_for(entry)
-        call = self.screen.run_live(
-            block, cli.run, "preflight", "--json", *self.version, on_line=self.messages(block)
+    def preflights(self, entries: list[Entry]) -> None:
+        """Every preflight not yet passed, all at once, each in its own process and shown as it
+        finishes, with its own time. Once every one has finished, the run stops if any didn't
+        pass, naming each together: for a sign-in to renew, or anything else a component waits
+        on, when one does."""
+        entries = [entry for entry in entries if entry.id not in self._walked]
+        if not entries:
+            return
+        self.enter(entries[0])
+        self._walked.update(entry.id for entry in entries)
+        self.count(entries[0], entries[-1])
+        clis = {entry.id: self.cli_for(entry) for entry in entries}
+        blocks = {entry.id: self.block(entry) for entry in entries}
+        group = Block("preflights", "", "", "", self.footer)
+        group.outcome = "checking"
+        finished: dict[str, Call] = {}
+
+        def say() -> None:
+            group.message = (
+                f"Running {len(entries)} preflight{'s' if len(entries) != 1 else ''} at once: "
+                f"{len(finished)} done"
+            )
+
+        def run(entry: Entry) -> tuple[Entry, Call]:
+            return entry, clis[entry.id].run("preflight", "--json", *self.version)
+
+        def work() -> None:
+            with ThreadPoolExecutor(max_workers=len(entries)) as pool:
+                for future in as_completed([pool.submit(run, entry) for entry in entries]):
+                    entry, call = future.result()
+                    finished[entry.id] = call
+                    self.preflighted(entry, blocks[entry.id], call)
+                    say()
+
+        say()
+        self.screen.run_live(group, work)
+        failures = [(entry, finished[entry.id]) for entry in entries if finished[entry.id].status != "done"]
+        if not failures:
+            return
+        waiting = next(((entry, call) for entry, call in failures if call.status in WAITS), None)
+        # The stop names the preflight it waits on, or the first that failed.
+        stopped, call = waiting or failures[0]
+        self._entry, self._block = stopped, blocks[stopped.id]
+        detail: dict = {"reason": call.status if waiting else "preflight"}
+        if call.status == "sign-in":
+            detail["sign_in"] = {"entry": stopped.id, "command": self.sign_in_next(call)[0].command}
+        raise Stop(
+            call.status if waiting else "failed",
+            " ".join(self.preflight_failure(entry, call) for entry, call in failures),
+            failures=[
+                {
+                    "entry": entry.id,
+                    "component": entry.component,
+                    "status": call.status,
+                    "message": call.message,
+                }
+                for entry, call in failures
+            ],
+            next=(
+                *self.sign_in_next(call),
+                Next(
+                    "dp-instance resume",
+                    "runs each preflight that didn't pass and every check after them, then carries on, "
+                    "once that's done",
+                ),
+            ),
+            **detail,
         )
+
+    def preflighted(self, entry: Entry, block: Block, call: Call) -> None:
+        """Show and record one preflight as it finishes: passed, or each failure it names, the
+        sign-in it waits for or an excerpt of its output, and its log."""
         if call.status == "done":
             self.finish(entry, block, "passed", compact=True)
             return
         for event in call.finished("preflight"):
             for failure in event.get("failures", []):
                 block.add("Failure:", failure)
-        again = Next(
-            "dp-instance resume",
-            "runs this preflight and every check after it, then carries on, once that's done",
-        )
-        if call.status in WAITS:
-            self.wait(entry, block, call)
+        if call.status == "sign-in":
+            block.add("Sign-In:", call.message)
         if not block.lines:
             self.excerpt(block, call)
-        message = f"{entry.component}'s preflight failed."
-        if call.temporary:
-            # Its retries spent: say it looked temporary and that nothing changed.
-            message = f"{entry.component}'s preflight failed: {call.message}"
-        raise Stop("failed", message, reason="preflight", next=(again,))
+        self.finish(entry, block, WAITING_FOR.get(call.status, "failed"))
+
+    @staticmethod
+    def preflight_failure(entry: Entry, call: Call) -> str:
+        """One preflight that didn't pass, in a sentence: what it waits for, or that it failed and,
+        when it looked temporary and its retries are spent, why, and that nothing changed."""
+        if call.status in WAITS or call.temporary:
+            said = call.message if call.message.endswith(".") else f"{call.message}."
+            return f"{entry.component}'s preflight {'waits' if call.status in WAITS else 'failed'}: {said}"
+        return f"{entry.component}'s preflight failed."
 
     def drift_check(self, entry: Entry, block: Block) -> None:
         with self.applied_code(self.repositories, block) as places:
@@ -1033,16 +1189,16 @@ class Run:
         if failures:
             self.planning_failed(block, failures)
         drifted = False
-        # Each Terraform step's plan, by its entry: its status and the hash of its inputs, so a
-        # later walk can tell when the drift check already planned exactly what it would plan.
+        # Each step's plan, by its entry: its status and, for a Terraform step, the hash of its
+        # inputs, so a later walk can tell when the drift check already planned exactly what it
+        # would plan.
         planned = self.record.data.setdefault("drift_plans", {})
         for repository, component, phase, file, call in results:
             for event in call.finished():
-                if event.get("inputs_hash"):
-                    planned[f"{repository}/{component}/{phase}/{event['step']}"] = {
-                        "status": event.get("status"),
-                        "inputs_hash": event["inputs_hash"],
-                    }
+                planned[f"{repository}/{component}/{phase}/{event['step']}"] = {
+                    "status": event.get("status"),
+                    **({"inputs_hash": event["inputs_hash"]} if event.get("inputs_hash") else {}),
+                }
                 self.optional(event)
                 if event.get("status") == "change":
                     drifted = True
@@ -1056,6 +1212,9 @@ class Run:
                         "Pending:",
                         f"{component} {phase}/{event['step']}: waits on outside work or an earlier change",
                     )
+        # The commit of the code each repository's phases were planned on: a hold names a
+        # native step only while its repository's checkout is still at it.
+        self.record.data["drift_commits"] = {key: gitops.head(place) for key, place in places.items()}
         self.record.save()
         if drifted:
             raise Stop(
@@ -1085,7 +1244,8 @@ class Run:
         component waits on, stops the run for it; any other failure is left to the decision to
         go on without those phases, once the phases that planned show no drift."""
         for _, component, phase, call in failures:
-            block.add("Failure:", f"{component} {phase}: {call.message}")
+            label = "Sign-In:" if call.status == "sign-in" else "Failure:"
+            block.add(label, f"{component} {phase}: {call.message}")
         block.add("Log:", self.relative(self.record.log_path))
         waiting = next((call for *_, call in failures if call.status in WAITS), None)
         if waiting is not None:
@@ -1095,7 +1255,9 @@ class Run:
                 reason="drift-check",
                 next=(
                     *self.sign_in_next(waiting),
-                    Next(self.restart(), "starts the upgrade again once that's fixed"),
+                    Next(
+                        "dp-instance resume", "plans the drift check again and carries on, once that's done"
+                    ),
                 ),
             )
 
@@ -1309,17 +1471,20 @@ class Run:
             applied = ", ".join(units) or "units it didn't name"
             self.end_plan_skip(None, f"{entry.where} applied {applied}, not only configuration units")
 
-    def planned(self, entry: Entry) -> list[tuple[str, str]]:
-        """The Terraform steps a step's apply may skip, with each one's inputs hash from the
-        drift check: the step itself and, for a hold, the steps it guards until the step that
-        lifts it, each one its component takes the skip for, whose drift plan had no change.
-        None while rule C doesn't hold, or for a component whose configuration `migrate`
-        changed."""
+    def planned(self, entry: Entry) -> tuple[list[tuple[str, str]], list[str]]:
+        """What a step's apply may skip planning, from the drift check, each step its component
+        takes the skip for whose drift plan had no change: the Terraform steps, with each one's
+        inputs hash, the step itself and, for a hold, the steps it guards until the step that
+        lifts it; and the native steps the hold guards, by name, only while the hold's
+        repository is at the commit the drift check planned: a native step has no inputs hash,
+        so code that changed since, such as the target's, may plan it differently. A native step
+        the run reaches plans as usual. Nothing while rule C doesn't hold, or for a component
+        whose configuration `migrate` changed."""
         component = f"{entry.repository}/{entry.component}"
         if not self.skipping() or component in self.record.data.get("configuration_migrated", []):
-            return []
+            return [], []
         entries = self.record.entries
-        guarded = [entry]
+        guarded = []
         if entry.holds_until:
             for item in entries[entries.index(entry) + 1 :]:
                 if (item.repository, item.component) != (entry.repository, entry.component):
@@ -1328,11 +1493,19 @@ class Run:
                     break
                 guarded.append(item)
         drift = self.record.data["drift_plans"]
-        return [
-            (item.step, drift[item.id]["inputs_hash"])
-            for item in guarded
-            if item.plan_skip and (drift.get(item.id) or {}).get("status") == "no-change"
+        unchanged = [
+            item for item in [entry, *guarded] if (drift.get(item.id) or {}).get("status") == "no-change"
         ]
+        terraform = [
+            (item.step, drift[item.id]["inputs_hash"])
+            for item in unchanged
+            if item.plan_skip and drift[item.id].get("inputs_hash")
+        ]
+        native = [item.step for item in unchanged if item is not entry and item.unchanged_native]
+        planned_on = self.record.data.get("drift_commits", {}).get(entry.repository)
+        if native and planned_on != gitops.head(self.checkout(entry.repository)):
+            native = []
+        return terraform, list(dict.fromkeys(native))
 
     # Pieces of a step -----------------------------------------------------------------
 
@@ -1369,10 +1542,11 @@ class Run:
                 arguments += ["--run-summary", str(self.summary(entry.repository))]
             if supplied:
                 arguments.append("--values-from-stdin")
-            planned = self.planned(entry)
-            if planned:
-                # Rule C alone: never --planned without --unchanged-since-planned.
-                arguments += [part for step, value in planned for part in ("--planned", f"{step}={value}")]
+            terraform, native = self.planned(entry)
+            # Rule C alone: never --planned or --unchanged without --unchanged-since-planned.
+            arguments += [part for step, value in terraform for part in ("--planned", f"{step}={value}")]
+            arguments += [part for step in native for part in ("--unchanged", step)]
+            if terraform or native:
                 arguments.append("--unchanged-since-planned")
         if self.change:
             arguments += ["--change", self.change]
@@ -1941,6 +2115,9 @@ class Run:
             # A read that failed for a moment inside a run, its retries spent: the run goes on
             # from here once the service answers.
             next_steps = (Next("dp-instance resume", "carries on from here once the service answers"),)
+        if reason == "sign-in" and not any(item.command == "dp-instance resume" for item in next_steps):
+            # A read that waits for a sign-in inside a run: the run goes on from here once signed in.
+            next_steps = (*next_steps, Next("dp-instance resume", "carries on from here once signed in"))
         steps = (*next_steps, *self.hold_lines())
         detail = {key: value for key, value in stop.detail.items() if key != "reason"}
         self.record.stop(
@@ -1951,6 +2128,10 @@ class Run:
             next=[item.describe() for item in steps],
             **detail,
         )
+        if reason == KEPT:
+            # It never started: the run it would have replaced stays the active one.
+            self.record.data["status"] = NOT_STARTED
+            self.record.save()
         style = {"failed": "bold red", "decision": "bold yellow"}.get(stop.status, "bold orange1")
         self.screen.blank()
         self.screen.note(stop.message, style)

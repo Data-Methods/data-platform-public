@@ -19,6 +19,10 @@ from .outcome import failed
 from .sequence import Entry
 
 ACTIVE = ("running", "stopped", "failed")
+# A new upgrade that stopped reading the steps while another run had stopped: it replaced
+# nothing and never started, so it isn't one of the workstation's runs, and the run that
+# stopped stays the active one.
+NOT_STARTED = "not started"
 # Windows refuses to replace a file another program has open, such as a reader of the record or
 # an antivirus scan of a file just written; that passes within moments.
 REPLACE_TRIES = 20
@@ -165,7 +169,7 @@ def runs_folder(state: Path) -> Path:
 
 
 def records(state: Path, kinds: tuple[str, ...] = ("upgrade", "apply")) -> list[Record]:
-    """This workstation's runs, newest first."""
+    """This workstation's runs, newest first; a new upgrade that never started isn't one."""
     folder = runs_folder(state)
     if not folder.is_dir():
         return []
@@ -176,16 +180,34 @@ def records(state: Path, kinds: tuple[str, ...] = ("upgrade", "apply")) -> list[
                 record = Record.load(path)
             except (OSError, ValueError):
                 continue
-            if record.data.get("kind") in kinds:
+            if record.data.get("kind") in kinds and record.status != NOT_STARTED:
                 found.append(record)
     return found
 
 
 def active(state: Path) -> Record | None:
     """The run under way or stopped: the newest run, unless it completed. A new run replaces
-    the one before it, so only the newest can be active."""
+    the one before it, an upgrade once it has read the steps, so only the newest can be
+    active."""
     found = records(state)
     return found[0] if found and found[0].status in ACTIVE else None
+
+
+def under_way(state: Path, identifier: str) -> Record | None:
+    """The run, while it's under way or stopped."""
+    try:
+        found = Record.load(runs_folder(state) / identifier)
+    except (OSError, ValueError):
+        return None
+    return found if found.status in ACTIVE else None
+
+
+def mark_replaced(state: Path, identifier: str) -> None:
+    """Mark the run replaced, if it's under way or stopped, as the run after it starts."""
+    found = under_way(state, identifier)
+    if found is not None:
+        found.data["status"] = "replaced"
+        found.save()
 
 
 def replace_active(state: Path) -> None:

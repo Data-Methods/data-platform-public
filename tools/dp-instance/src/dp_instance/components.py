@@ -5,7 +5,9 @@ engine version. With `--json` it writes one JSON object per line to stdout, one 
 step starts and finishes and a result last, and everything meant for a person to stderr,
 which goes to the run's log. Values a person supplies go to its stdin as one JSON document
 and nowhere else. A command that only reads runs again when it fails for a moment; one that
-writes never does.
+writes never does. A command that fails because the Azure CLI's token cache lost the signed-in
+account is a sign-in to renew, never any other failure: one that only reads runs once more
+first, and one that writes never does.
 """
 
 from __future__ import annotations
@@ -20,9 +22,12 @@ from datetime import datetime
 from pathlib import Path
 
 from . import processes, transient
-from .outcome import EXIT_CODES, USAGE, Stop, failed
+from .outcome import EXIT_CODES, USAGE, Next, Stop, failed
 
 WINDOWS_FILE_LOCK = "os error 1224"
+# The Azure CLI's words when its token cache has lost the signed-in account, as several of its
+# processes refreshing the cache at once can leave it: a sign-in to renew, with `az login`.
+AZURE_TOKEN_CACHE = "does not exist in msal token cache"
 # The commands that only read, which a failure that looks temporary runs again.
 READS = (("steps",), ("outputs", "aggregate"), ("preflight",), ("plan",), ("verify",))
 
@@ -30,6 +35,13 @@ READS = (("steps",), ("outputs", "aggregate"), ("preflight",), ("plan",), ("veri
 def read_command(arguments) -> tuple[str, ...] | None:
     """The read-only command ``arguments`` run, if they run one."""
     return next((words for words in READS if tuple(arguments[: len(words)]) == words), None)
+
+
+def signed_out(call: Call) -> bool:
+    """Whether the command failed because the Azure CLI's token cache lost the signed-in
+    account."""
+    said = "\n".join((*call.stderr, str((call.result or {}).get("message") or ""))).lower()
+    return call.status == "failed" and AZURE_TOKEN_CACHE in said
 
 
 def uv_run(command: str, project: Path | None) -> list[str]:
@@ -198,12 +210,30 @@ class Cli:
 
     def _started(self, arguments, stdin, on_event, on_line) -> Call:
         """uv failing on a Windows file lock (os error 1224, usually an antivirus scan holding a
-        file in uv's cache) before the command starts is retried once; a second failure stands."""
+        file in uv's cache) before the command starts is retried once; a second failure stands.
+        A command that only reads and that the Azure CLI's token cache failed runs once more,
+        as several of its processes refreshing the cache at once can leave it for a moment;
+        failing that way again, it waits for a sign-in. One that writes waits for it at once."""
         call, retry = self._once(arguments, stdin, on_event, on_line)
         if retry:
             self.log.write("   Windows os error 1224 before the command started: retrying once.")
             call, _ = self._once(arguments, stdin, on_event, on_line)
+        if signed_out(call) and read_command(arguments) is not None:
+            self._report(
+                f"{self.label(arguments)}: the Azure CLI's token cache lost the signed-in account; "
+                "running it once more."
+            )
+            call, _ = self._once(arguments, stdin, on_event, on_line)
+        if signed_out(call):
+            call.status = "sign-in"
         return call
+
+    def label(self, arguments) -> str:
+        """The command, as a retry's line names it: its CLI, its words and its phase."""
+        label = " ".join((self.command, *(read_command(arguments) or arguments[:1])))
+        if "--phase" in arguments:
+            label += f" --phase {arguments[arguments.index('--phase') + 1]}"
+        return label
 
     def _report(self, line: str) -> None:
         self.log.write(f"   {line}")
@@ -220,12 +250,9 @@ class Cli:
         moment runs again after a wait, up to three times, each retry said in one line; a
         sign-in to renew never does, nor does a command that writes."""
         call = self._started(arguments, stdin, on_event, on_line)
-        words = read_command(arguments)
-        if words is None:
+        if read_command(arguments) is None:
             return call
-        label = " ".join((self.command, *words))
-        if "--phase" in arguments:
-            label += f" --phase {arguments[arguments.index('--phase') + 1]}"
+        label = self.label(arguments)
         retried = 0
         while call.status in ("failed", "usage"):
             found = transient.classify("\n".join((*call.stderr, call.message)))
@@ -238,10 +265,20 @@ class Cli:
         return call
 
     def document(self, *arguments: str) -> dict:
-        """A command that prints one JSON document, such as `steps --json`."""
+        """A command that prints one JSON document, such as `steps --json`; one that waits for a
+        sign-in stops for it, naming the command that renews it."""
         call = self.run(*arguments)
         if call.status != "done":
             message = f"{self.command} {' '.join(arguments)} failed: {call.message}"
+            if call.status == "sign-in":
+                command = ((call.result or {}).get("sign_in") or {}).get("command") or "az login"
+                raise Stop(
+                    "sign-in",
+                    message,
+                    reason="sign-in",
+                    sign_in={"command": command},
+                    next=(Next(command, "renews the sign-in, which only you can do"),),
+                )
             if call.temporary is not None:
                 raise Stop("failed", message, reason="transient")
             raise failed(message)

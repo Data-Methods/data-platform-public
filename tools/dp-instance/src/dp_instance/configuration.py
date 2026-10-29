@@ -3,8 +3,9 @@
 Each Component Outputs publish carries the hash of the configuration it was applied from, as
 the engine stamps it: SHA-256 over each of the component's phases' `config/<component>/<phase>.json`,
 in name order, each name and its content followed by a NUL, a missing file counting as empty.
-The engine hashes the files as the checkout holds them, so this does too. A component whose
-configuration differs from the one it last published holds a change no run has applied.
+The engine hashes each file's content with its line endings as LF, so this does too: a
+checkout that holds the files with CRLF, as Git on Windows can, hashes the same. A component
+whose configuration differs from the one it last published holds a change no run has applied.
 Hashes are compared, never commits: a run publishes from its branch, whose commit a squash
 merge never puts on `main`. A component that has published no outputs is skipped.
 """
@@ -24,7 +25,7 @@ def digest(checkout: Path, declared: Declaration) -> str:
     names = sorted(f"{declared.key}/{phase.name}.json" for phase in declared.phases if phase.name != MERGE)
     for name in names:
         path = checkout / "config" / name
-        content = path.read_bytes() if path.is_file() else b""
+        content = path.read_bytes().replace(b"\r\n", b"\n") if path.is_file() else b""
         found.update(name.encode() + b"\0" + content + b"\0")
     return found.hexdigest()
 

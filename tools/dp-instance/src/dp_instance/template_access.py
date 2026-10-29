@@ -13,7 +13,8 @@ Before the configuration names a vault, or before Azure has it, the key stays on
 workstation alone. With no template named, `setup`
 restores and sets up every template in `dp-instance.json` whose key the vault holds, and names
 any the instance has no access to yet. `check` confirms the key, the vault match, the SSH
-configuration and, with `git ls-remote`, every mapped template's reach through its alias.
+configuration and, with `git ls-remote`, every mapped template's reach through its alias, naming
+each repository by its GitHub HTTPS URL.
 Canary alone also keeps a key for each development repository, under `<template>-dev`, whose
 alias the engine derives the same way: `setup --development` sets up one, and `setup` with no
 template restores each the vault holds.
@@ -545,10 +546,17 @@ def _rules(key: str, checkouts: dict[str, Path]) -> list[tuple[str, str]]:
     configuration takes it."""
     found = []
     for template, checkout in checkouts.items():
-        record = SourceRecord.read(checkout)
-        if record is None:
+        try:
+            record = SourceRecord.read(checkout)
+            urls = (
+                [(template, record.release_url), (template + DEVELOPMENT, record.development_url)]
+                if record is not None
+                else []
+            )
+        except Stop:
+            # A record it can't read takes no rule; its own template's setup reports it.
             continue
-        for name, url in ((template, record.release_url), (template + DEVELOPMENT, record.development_url)):
+        for name, url in urls:
             access = Access(key, name)
             base = alias_url(access, url)
             if base is not None and access.private.is_file():
@@ -628,14 +636,16 @@ def ssh_command() -> Next:
 
 def reach(access: Access, url: str) -> str:
     """That Git reaches the record's ``url`` through the alias, after its own rules and with
-    the ssh it runs."""
+    the ssh it runs, naming the repository by its GitHub HTTPS URL, the alias's host, whichever
+    form the record names it in."""
+    prefix = f"git@{access.alias}:"
     through = gitops.git("ls-remote", "--get-url", url).stdout.strip()
-    if not through.startswith(f"git@{access.alias}:"):
+    if not through.startswith(prefix):
         source = "directly" if through == url else f"from {through}"
         raise failed(f"Git fetches {url} {source}, not through {access.alias}")
     found = gitops.git("ls-remote", url, "HEAD", check=False)
     if found.ok:
-        return f"{url} answers through {access.alias}"
+        return f"https://github.com/{through.removeprefix(prefix)} answers through {access.alias}"
     if re.search(f"could not resolve hostname {re.escape(access.alias)}", found.stderr, re.IGNORECASE):
         raise failed(
             f"Git can't use {access.alias}: the ssh Git runs doesn't read the SSH configuration "

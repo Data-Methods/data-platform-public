@@ -47,6 +47,15 @@ def family(version: str) -> tuple[int, int]:
     return version_key(version)[:2]
 
 
+def cli_platform_version(version: str) -> str:
+    """The Platform Version as a component CLI's `--platform-version` takes it: `YYYY.N` for a
+    release whose fix part is `.0`, such as 2026.5 for 2026.5.0, since an engine before 0.17
+    refuses a `.0`, and any other as it is. Removed at the 2026.6.0 stop: an instance that skips
+    2026.4.1 still runs an engine before 0.17 on its way to 2026.5.0."""
+    match = VERSION.fullmatch(version)
+    return f"{match[1]}.{match[2]}" if match and match[3] == "0" else version
+
+
 def install_spec(revision: str, *, development: bool = False) -> str:
     """What uv installs dp-instance from: a published version's tag, or a commit, of the public
     repository, or a candidate's commit of its development repository."""

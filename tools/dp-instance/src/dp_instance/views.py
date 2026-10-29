@@ -4,7 +4,8 @@
 nothing, walks the steps in order, ends at the first step with a change and lists the steps
 after it unplanned. `verify` is the completion check: every step's read-only verify, by phase,
 six phases at a time, each step shown with its own time; a step that isn't converged says
-what's left in its own words. Either takes one step by its full name,
+what's left in its own words, and a phase that waits for a sign-in stops it for the sign-in,
+since its steps verified nothing. Either takes one step by its full name,
 `repository/component/phase/step`, and plans or verifies that step alone. Each writes only its
 own record in `.dp-instance/runs/`.
 """
@@ -21,7 +22,7 @@ from rich.text import Text
 from . import targets
 from .components import StepReports
 from .manifest import Manifest
-from .outcome import WAITS, Next, Result, Stop, failed
+from .outcome import WAITING_FOR, WAITS, Next, Result, Stop, failed
 from .record import Record, runs_folder
 from .screen import Block
 from .sequence import Entry, parse_step
@@ -89,15 +90,7 @@ class Preview(View):
         self.show_part("before")
         self.build()
         entries = self.record.entries
-        for index, entry in enumerate(entries, 1):
-            if entry.kind != "preflight":
-                break
-            self._position = index
-            self.enter(entry)
-            self.count(entry)
-            block = self.block(entry)
-            self._entry, self._block = entry, block
-            self.preflight(entry, block)
+        self.preflights([entry for entry in entries if entry.kind == "preflight"])
         self.close_part("before")
         self._entry = self._block = None
         groups = [
@@ -274,6 +267,7 @@ class Verification(View):
         self.header()
         started = time.monotonic()
         self.show_part("platform")
+        again = f"dp-instance verify --step {step}" if step else "dp-instance verify"
         try:
             if step:
                 entries = [self.single(step)]
@@ -281,7 +275,10 @@ class Verification(View):
                 self.build()
                 entries = [entry for entry in self.record.entries if entry.kind == "step"]
         except Stop as stop:
-            return Result("verify", stop.status, stop.message, stop.next, {"run": self.record.id})
+            steps = stop.next
+            if stop.status == "sign-in":
+                steps = (*steps, Next(again, "checks again once signed in"))
+            return Result("verify", stop.status, stop.message, steps, {"run": self.record.id})
         results = self.verify_phases(entries, step is not None)
         problems = []
         failed_phases: set[tuple[str, str, str, str]] = set()
@@ -293,6 +290,20 @@ class Verification(View):
         self.record.complete()
         self.close_part("platform", time.monotonic() - started)
         self.screen.blank(2)
+        signed_out = next((call for call, _ in results.values() if call.status == "sign-in"), None)
+        if signed_out is not None:
+            # A phase that couldn't sign in verified nothing: what's left can't be told yet.
+            message = f"Not every step could be verified; a sign-in to renew: {signed_out.message}"
+            self.screen.print(Text.assemble(("Not verified.", "bold orange1"), f" {message}"))
+            steps = (*self.sign_in_next(signed_out), Next(again, "checks again once signed in"))
+            self.screen.next_block(steps, self.relative(self.record.folder) + "/")
+            return Result(
+                "verify",
+                "sign-in",
+                message,
+                steps,
+                {"run": self.record.id, "sign_in": {"command": steps[0].command}},
+            )
         if not problems:
             self.screen.print(
                 Text.assemble(
@@ -312,7 +323,6 @@ class Verification(View):
             self.screen.print(Text(entry.where, style="bold"))
             for message in messages:
                 self.screen.print(Text(message))
-        again = f"dp-instance verify --step {step}" if step else "dp-instance verify"
         steps = (
             Next(
                 "dp-instance apply",
@@ -383,6 +393,12 @@ class Verification(View):
         if not events:
             if call.status == "done":
                 self.finish(entry, block, "skipped", compact=True, took=took)
+                return None
+            if call.status == "sign-in":
+                if self.phase_of(entry) not in failed_phases:
+                    failed_phases.add(self.phase_of(entry))
+                    block.add("Sign-In:", call.message)
+                self.finish(entry, block, WAITING_FOR["sign-in"], took=took, pull_requests=pulls)
                 return None
             message = f"not verified: its {entry.phase} phase's verify failed, as its first step says"
             if self.phase_of(entry) not in failed_phases:

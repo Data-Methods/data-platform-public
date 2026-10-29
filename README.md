@@ -2,7 +2,8 @@
 
 `dp-instance` upgrades a Platform Instance, applies its configuration changes and manages its
 secrets and template access. It runs every component's steps across the instance's repositories
-in order, showing each plan and asking before each change. Read a tool before running it.
+in order, showing each plan and asking before each change to the platform. Read a tool before
+running it.
 
 - [Release Manifests](platform-releases/README.md): one per Platform Version.
 - [Linux Bastion VM](tools/bastion-vm-linux/README.md): a private Linux VM for platform work.
@@ -74,19 +75,23 @@ dp-instance secret rotate <name>             # replace a platform-generated secr
 dp-instance update                           # install the newest dp-instance
 ```
 
-Before an upgrade, read each changed template's release notes, at its commit in the manifest's
-`sources`, outside the instance folder:
+Before an upgrade, run `dp-instance update`, then `dp-instance apply` for any configuration
+change merged to `main`; if it refuses, run what it names. Read in order the release notes of
+each template whose commit in the manifest's `sources` differs from the instance's, at that
+commit, outside the instance folder:
 
 ```bash
 git init release-notes && cd release-notes
-git fetch --depth=1 git@dm-<instance>-<template>:Data-Methods/<template>-template.git <commit>
+git fetch --depth=1 git@dm-<Platform Instance Key>-<template>:Data-Methods/<template>-template.git <commit>
 git show FETCH_HEAD:docs/releases/<Platform Version>.md
 ```
 
-A step with a change shows its plan file, under `.dp-instance/runs/<run>/plans/`: `y` applies
+The code part's upgrade steps change only branches, each shown in a draft pull request, and
+apply without asking unless one restores an edited template file or removes a file. Every other
+step with a change shows its plan file, under `.dp-instance/runs/<run>/plans/`: `y` applies
 exactly that plan, `n` stops. Approval is the call of the person accountable for the instance;
 stop and ask about any destroy (`-`) or replace (`-/+`) of data, or a change the release notes
-don't explain. Until the first platform step is approved, only branches have changed.
+don't explain.
 
 Every stop ends with **Next**, the commands that continue:
 
@@ -118,8 +123,11 @@ uv run --locked <component CLI> apply --phase <phase> --step <step> --platform-v
 Approve the plan it shows. Then, with nothing else committed or changed in that checkout, run
 `dp-instance resume`.
 
-An upgrade ends with the Managed Repository's adoption pull request open, for its Production
-Data Engineers to merge, deploying Integration, and release, deploying Production:
+A completed run may recommend optional handoffs: outside work that nothing waits on, each on
+its page under `.dp-instance/runs/<run>/handoffs/`.
+
+When an upgrade opens the Managed Repository's adoption pull request, its Production Data
+Engineers merge it, deploying Integration, and release it, deploying Production:
 `gh release create vX.Y.Z --target <main commit> --generate-notes`.
 
 ## Troubleshooting

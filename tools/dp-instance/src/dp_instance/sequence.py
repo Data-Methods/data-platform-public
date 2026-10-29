@@ -85,6 +85,9 @@ class Declaration:
     # Whether its `apply` takes the walk's plan skip, `--planned` and
     # `--unchanged-since-planned`: engine 0.16.0 on.
     plan_skip: bool = False
+    # Whether its `apply` takes `--unchanged STEP` beside `--unchanged-since-planned`: a native
+    # step the drift check planned with no change, which a hold's preview then doesn't plan.
+    unchanged_natives: bool = False
 
     @property
     def owner(self) -> bool:
@@ -154,6 +157,7 @@ def declaration(document: dict, command: str) -> Declaration:
                 for unit in (migrate or {}).get("units") or []
             ),
             document.get("plan_skip") is True,
+            document.get("unchanged_natives") is True,
         )
     except (KeyError, TypeError, ValueError):
         raise failed(f"{command} steps --json isn't a declaration this dp-instance reads.") from None
@@ -191,6 +195,8 @@ class Entry:
     repository_only: bool = False
     # A Terraform step whose component's `apply` takes the walk's plan skip.
     plan_skip: bool = False
+    # A native step whose component's `apply` takes `--unchanged`.
+    unchanged_native: bool = False
 
     def describe(self) -> dict:
         return asdict(self)
@@ -286,6 +292,7 @@ class Plan:
                 holds_until_phase=declared.phase_of(step.holds_until) if step.holds_until else "",
                 repository_only=step.repository_only,
                 plan_skip=declared.plan_skip and step.kind == "terraform",
+                unchanged_native=declared.unchanged_natives and step.kind == "native",
                 **self._base(repository, component, kind, upgrade),
             )
 

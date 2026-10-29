@@ -1,10 +1,11 @@
 """The commands that run the sequence: `upgrade`, `apply` and `resume`.
 
 `upgrade` starts one run from the code into the platform: to the release `--to` names or, with
-none named, the next stop, which it names first. `apply` always starts a new run on `main`'s
-code, a Configuration Change, its finished steps passing as no changes. `resume` carries on from
-where the active run stopped, the one place a run's record decides where to start. It refuses if
-the commits it's tied to have moved, except forward on the run's own branch, as a step applied by
+none named, the next stop, which it names first; it replaces the run that stopped before it
+only once it has read the steps. `apply` always starts a new run on `main`'s code, a
+Configuration Change, its finished steps passing as no changes. `resume` carries on from where
+the active run stopped, the one place a run's record decides where to start. It refuses if the
+commits it's tied to have moved, except forward on the run's own branch, as a step applied by
 hand leaves them.
 """
 
@@ -67,7 +68,8 @@ def upgrade(session: Session, version: str | None, manifest_file: str | None) ->
     target.check_install(session.own_version())
     goal = _goal(session, target, channel)
     state = session.instance.state
-    record.replace_active(state)
+    # The run that stopped before it, which it replaces once it has read the steps.
+    previous = record.active(state)
     run = Record.new(
         record.runs_folder(state),
         "upgrade",
@@ -77,6 +79,7 @@ def upgrade(session: Session, version: str | None, manifest_file: str | None) ->
         change=target.change,
         manifest_origin=manifest_file or f"platform-release/{target.platform_version}",
         chosen=chosen,
+        replaces=previous.id if previous is not None else None,
     )
     run.manifest_path.write_text(target.text, encoding="utf-8")
     run.data["commits"] = _commits(session, target)

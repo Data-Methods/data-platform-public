@@ -162,6 +162,17 @@ def run_branch(change: str) -> str:
     return re.sub(r"[^a-z0-9.]+", "-", change.lower()).strip("-.")
 
 
+def has_branch(path: Path, name: str) -> bool:
+    """Whether the checkout has the local branch."""
+    return git("rev-parse", "--verify", "--quiet", f"refs/heads/{name}", cwd=path, check=False).ok
+
+
+def on_origin(path: Path, name: str) -> bool:
+    """Whether the checkout's origin has the branch, asked of origin itself, once: a failure
+    stops, naming Git's own first line of error."""
+    return bool(git("ls-remote", "--heads", "origin", f"refs/heads/{name}", cwd=path).stdout.strip())
+
+
 def applied_checkout(source: Path, commit: str, destination: Path) -> Path:
     """A throwaway checkout of one commit of a local repository, sharing its objects, with the
     same origin URL, so a component reads it as that repository. Nothing is fetched."""
