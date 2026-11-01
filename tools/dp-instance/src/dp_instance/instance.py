@@ -1,23 +1,28 @@
-"""The instance folder: its repository map, `dp-instance.json`, and `.dp-instance/`.
+"""The instance folder and `.dp-instance/`, which holds the repository map, `repositories.json`.
 
 `dp-instance setup` writes the map: the Platform Instance Key and each repository's remote
 and path. Every other command finds the map from the current folder or one above it, and
-checks it against the checkouts before doing anything else.
+checks it against the checkouts before doing anything else. Before Platform 2026.5.0 the map
+was `dp-instance.json`, beside `.dp-instance/`: the first command that finds it there moves it
+in, unchanged.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
 from . import gitops
-from .outcome import Next, failed
+from .outcome import Next, Stop, failed
 from .sequence import MERGED_COMMIT
 
-MAP_FILE = "dp-instance.json"
 STATE_FOLDER = ".dp-instance"
+MAP_FILE = Path(STATE_FOLDER, "repositories.json")
+# The map's place before Platform 2026.5.0. Removed at the 2026.6.0 stop, with the move.
+EARLIER_MAP_FILE = "dp-instance.json"
 SOURCE_RECORD = Path(".dp-template/template-source.json")
 # The Client Infrastructure Repository's template, and its owner's CLI, which reads the
 # instance's published Component Outputs.
@@ -158,6 +163,68 @@ def stored_path(root: Path, path: Path) -> str:
         return str(path.resolve())
 
 
+def applied_record(checkout: Path) -> SourceRecord | None:
+    """A Component Repository's record as its `main` holds it, the code last merged, which the
+    platform runs; as checked out when `main` holds none."""
+    return SourceRecord.read(checkout, gitops.main_commit(checkout)) or SourceRecord.read(checkout)
+
+
+def state_folder(root: Path) -> Path:
+    """`.dp-instance/` in an instance folder, which belongs to dp-instance alone and ignores
+    itself."""
+    folder = root / STATE_FOLDER
+    folder.mkdir(exist_ok=True)
+    ignore = folder / ".gitignore"
+    if not ignore.exists():
+        ignore.write_text("*\n", encoding="utf-8")
+    return folder
+
+
+def map_path(root: Path) -> Path | None:
+    """The folder's repository map, `.dp-instance/repositories.json`, or the earlier
+    `dp-instance.json` until a command moves it in; None when it has neither. A folder with both
+    stops every command."""
+    current, earlier = root / MAP_FILE, root / EARLIER_MAP_FILE
+    if earlier.is_file() and current.is_file():
+        raise failed(
+            f"{root} holds both {EARLIER_MAP_FILE} and {MAP_FILE.as_posix()}, so dp-instance moved "
+            f"neither: dp-instance 3.0.0 reads {MAP_FILE.as_posix()}."
+        )
+    if earlier.is_file():
+        return earlier
+    return current if current.is_file() else None
+
+
+def move_earlier_map(root: Path) -> bool:
+    """Move a map from before Platform 2026.5.0 into `.dp-instance/`, unchanged; whether there
+    was one to move. Removed at the 2026.6.0 stop."""
+    earlier = root / EARLIER_MAP_FILE
+    if not earlier.is_file():
+        return False
+    moved = state_folder(root) / MAP_FILE.name
+    try:
+        os.replace(earlier, moved)
+    except OSError as error:
+        raise failed(
+            f"Couldn't move {earlier} to {moved}: {error.strerror or error}; nothing has changed. Run "
+            "the command again once nothing holds either file open."
+        ) from None
+    return True
+
+
+def unmapped_infrastructure(start: Path) -> Path | None:
+    """The Client Infrastructure Repository checkout ``start`` is in, as template access reads it
+    before the instance is mapped, at a first deployment; None in any other folder."""
+    checkout = next((item for item in (start, *start.parents) if (item / ".git").exists()), None)
+    if checkout is None:
+        return None
+    try:
+        record = SourceRecord.read(checkout)
+    except Stop:
+        return None
+    return checkout if record is not None and record.template == INFRASTRUCTURE else None
+
+
 @dataclass
 class Instance:
     root: Path
@@ -166,16 +233,7 @@ class Instance:
 
     @property
     def state(self) -> Path:
-        return self.prepare()
-
-    def prepare(self) -> Path:
-        """`.dp-instance/`, which belongs to dp-instance alone and ignores itself."""
-        folder = self.root / STATE_FOLDER
-        folder.mkdir(exist_ok=True)
-        ignore = folder / ".gitignore"
-        if not ignore.exists():
-            ignore.write_text("*\n", encoding="utf-8")
-        return folder
+        return state_folder(self.root)
 
     def own(self, kind: str, repository: str) -> Path:
         """A folder of dp-instance's own for one repository, `.dp-instance/<kind>/` and eight
@@ -197,20 +255,27 @@ class Instance:
     def managed(self) -> list[Mapped]:
         return [item for item in self.repositories if item.managed_by]
 
-    @classmethod
-    def find(cls, start: Path) -> Instance:
-        """The instance whose map is in ``start`` or a folder above it."""
-        for folder in (start.resolve(), *start.resolve().parents):
-            if (folder / MAP_FILE).is_file():
-                return cls.load(folder)
-        raise failed(
-            f"No {MAP_FILE} here or in a folder above. Run setup in the instance folder.",
-            Next("dp-instance setup", "maps the instance's repositories in the current folder"),
+    @staticmethod
+    def locate(start: Path) -> Path | None:
+        """The instance folder: ``start``, or the nearest folder above it, with a repository map."""
+        return next(
+            (folder for folder in (start.resolve(), *start.resolve().parents) if map_path(folder)), None
         )
 
     @classmethod
+    def find(cls, start: Path) -> Instance:
+        """The instance whose map is in ``start`` or a folder above it."""
+        root = cls.locate(start)
+        if root is None:
+            raise failed(
+                f"No {MAP_FILE.as_posix()} here or in a folder above. Run setup in the instance folder.",
+                Next("dp-instance setup", "maps the instance's repositories in the current folder"),
+            )
+        return cls.load(root)
+
+    @classmethod
     def load(cls, root: Path) -> Instance:
-        path = root / MAP_FILE
+        path = map_path(root) or root / MAP_FILE
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
             key = data["platform_instance_key"]
@@ -237,7 +302,7 @@ class Instance:
         return cls(root.resolve(), key, repositories)
 
     def save(self) -> Path:
-        path = self.root / MAP_FILE
+        path = self.state / MAP_FILE.name
         document = {
             "schema_version": 1,
             "platform_instance_key": self.key,
@@ -272,9 +337,7 @@ class Instance:
         """A Component Repository's record, as checked out, or with ``applied`` as `main`
         holds it: the code last merged, which the platform runs."""
         checkout = self.components[template].path
-        found = SourceRecord.read(checkout, gitops.main_commit(checkout) if applied else None)
-        if applied and found is None:
-            found = SourceRecord.read(checkout)
+        found = applied_record(checkout) if applied else SourceRecord.read(checkout)
         if found is None:
             raise failed(f"{self.components[template].stored} has no template source record.", SETUP)
         return found

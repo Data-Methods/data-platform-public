@@ -2,8 +2,9 @@
 moment: a dropped or refused connection, DNS, a TLS handshake, throttling or a server error.
 
 The engine's classifier, with Git's own words for the same failures, for dp-instance's own Git
-network calls and the component calls that only read. A write never retries: a resumed run
-plans it again. A sign-in to renew never retries either.
+network calls, which it retries, and the component calls that only read, which the engine
+retries itself. A write never retries: a resumed run plans it again. A sign-in to renew never
+retries either.
 """
 
 from __future__ import annotations
@@ -11,7 +12,6 @@ from __future__ import annotations
 import re
 import sys
 import time
-from collections.abc import Callable
 
 # The waits before each retry: three retries over about two minutes.
 DELAYS = (10, 30, 60)
@@ -127,13 +127,13 @@ def say(line: str) -> None:
     sys.stderr.flush()
 
 
-def retries(found: str | None, retried: int, *, label: str, report: Callable[[str], None] = say) -> bool:
+def retries(found: str | None, retried: int, *, label: str) -> bool:
     """After a failure and ``retried`` retries, whether to try again: a temporary failure, with
     retries left. Reports it in one line and waits before returning True."""
     if found is None or retried >= len(DELAYS):
         return False
     delay = DELAYS[retried]
-    report(f"{label}: {found}; retrying in {delay}s ({retried + 1} of {len(DELAYS)}).")
+    say(f"{label}: {found}; retrying in {delay}s ({retried + 1} of {len(DELAYS)}).")
     _sleep(delay)
     return True
 

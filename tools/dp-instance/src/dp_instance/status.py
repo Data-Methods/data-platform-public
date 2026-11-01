@@ -2,17 +2,21 @@
 
 It shows the active run's journey from its record, each part with its time and each step's
 pull requests as it reported them, then what the repositories record, this dp-instance's
-version and any newer one published, with the install a next release needs before its
-upgrade; each of its own two parts, the run record and the instance, ends with its time. It
-reads the run record and Git, and starts no component CLI, so it answers quickly from any
-workstation. It asks nothing: it prints, names what comes next and returns.
+version and any newer one published, and each component whose configuration on `main` no run
+has applied; each of its own two parts, the run record and the instance, ends with its time.
+Next, it names `dp-instance apply` when a change awaits, then the install a next release needs,
+then its upgrade. It reads the run record and Git, and starts only the Client Infrastructure
+Repository's `outputs aggregate`, so it answers quickly from any workstation. It asks nothing:
+it prints, names what comes next and returns.
 """
 
 from __future__ import annotations
 
 from rich.text import Text
 
-from . import gitops, installed, record, targets
+from . import configuration, gitops, installed, record, targets
+from .components import Cli, Log
+from .instance import INFRASTRUCTURE_COMMAND
 from .manifest import family
 from .outcome import Next, Result, Stop
 from .screen import NAME_LABELS, level_line
@@ -36,6 +40,8 @@ REASONS = {
     "already-at-target": "stopped: the upgrade is already under way",
     "unmapped": "stopped: a repository of the instance isn't in the repository map",
     "fetch": "stopped: a target source couldn't be fetched",
+    "development-keys": "stopped: a development repository's key isn't on this workstation",
+    "unknown-platform-version": "stopped: which Platform Version the instance runs isn't known",
 }
 
 
@@ -145,6 +151,50 @@ def _own_version(session: Session, detail: dict) -> None:
     session.screen.labelled("dp-instance:", shown)
 
 
+def _unapplied(session: Session, run: record.Record | None, detail: dict) -> list[str]:
+    """Each component whose configuration on `main` no run has applied, from the instance's
+    published Component Outputs. A repository whose upgrade is under way on the active run's
+    branch is left out: its steps published the branch's configuration."""
+    instance = session.instance
+    if instance.infrastructure is None:
+        detail["unapplied"] = None
+        return []
+    branch = gitops.run_branch(run.data["change"]) if run is not None and run.data.get("change") else None
+    settled = [
+        item
+        for item in instance.components.values()
+        if branch is None
+        or gitops.branch(item.path) != branch
+        or gitops.head(item.path) == gitops.main_commit(item.path)
+    ]
+    try:
+        aggregate = Cli(INFRASTRUCTURE_COMMAND, instance.infrastructure.path, Log(None)).document(
+            "outputs", "aggregate"
+        )
+    except Stop as stop:
+        session.screen.blank()
+        session.screen.labelled("Unapplied:", f"not checked: {stop.message}")
+        detail["unapplied"] = None
+        return []
+    key = (aggregate.get("platform") or {}).get("key")
+    if key != instance.key:
+        session.screen.blank()
+        session.screen.labelled(
+            "Unapplied:",
+            f"not checked: the Component Outputs belong to {key or 'no Platform Instance'}, and the map "
+            f"names {instance.key}",
+        )
+        detail["unapplied"] = None
+        return []
+    found = configuration.unapplied(settled, aggregate)
+    if found:
+        session.screen.blank()
+    for name in found:
+        session.screen.labelled("Unapplied:", f"{name}: main's configuration isn't the one it last applied")
+    detail["unapplied"] = found
+    return found
+
+
 def status(session: Session) -> Result:
     screen = session.screen
     instance = session.instance
@@ -243,6 +293,7 @@ def status(session: Session) -> Result:
             screen.labelled("Repo Branch:", found["branch"])
         repositories.append(found)
     detail["repositories"] = repositories
+    unapplied = _unapplied(session, run, detail)
     screen.end()
 
     steps: list[Next] = []
@@ -250,8 +301,16 @@ def status(session: Session) -> Result:
         steps = [Next(**item) for item in (run.data.get("stop") or {}).get("next", [])] or [
             Next("dp-instance resume", "carries on from where the run stopped")
         ]
-    elif upcoming:
-        steps = list(upcoming)
+    else:
+        if unapplied:
+            steps.append(
+                Next(
+                    "dp-instance apply",
+                    f"applies main's configuration of {', '.join(unapplied)}, reviewing each change "
+                    "before it applies",
+                )
+            )
+        steps += upcoming
     if steps:
         screen.next_block(steps, session.relative(run.folder) + "/" if run is not None else None)
     return Result("status", "done", None, tuple(steps), detail)

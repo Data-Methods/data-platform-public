@@ -8,7 +8,6 @@ A published manifest and its tag never change.
 | --- | --- |
 | `platform_version` | The Platform Version, `YYYY.N` or `YYYY.N.P`. |
 | `dp_instance` | `minimum`, the oldest `dp-instance` version this release runs; an older one stops with the exact install command. |
-| `dp_instance_commit` | The `dp-instance` commit that an older `dp-instance`, one that reads no `dp_instance`, installs. |
 | `sources` | Each template the release covers and its exact release commit. The template's release notes are in that commit, `docs/releases/<Platform Version>.md`. |
 | `order` | The repositories in the order they run. An instance without a repository skips it. |
 

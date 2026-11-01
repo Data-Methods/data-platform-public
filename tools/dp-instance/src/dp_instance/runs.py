@@ -11,12 +11,26 @@ hand leaves them.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from . import gitops, record, targets
 from .manifest import Manifest, parse, published, version_key
 from .outcome import Next, Result, Stop, failed
 from .record import Record
 from .session import Session
 from .walk import Run
+
+# The stop a resume ends rule C after, by the reason the run stopped; any other failed stop is a
+# failure.
+RESUMED_AFTER = {
+    "declined": "a decline",
+    "sign-in": "a failure",
+    "drift-check": "a stop in the drift check",
+    "handoff": "outside work",
+    "pending": "outside work",
+    "runs": "outside work",
+    "values": "a stop for values",
+}
 
 
 def _commits(session: Session, manifest: Manifest) -> dict[str, str]:
@@ -89,7 +103,10 @@ def upgrade(session: Session, version: str | None, manifest_file: str | None) ->
 
 def _check_on_merged_main(session: Session, manifest: Manifest) -> None:
     """Stop unless every repository the run walks is on `main`, and its `main` is `origin/main`
-    as just fetched: what a configuration change applies is merged on GitHub."""
+    as just fetched: what a configuration change applies is merged on GitHub. A repository whose
+    origin has no `main` yet is new, whether GitHub doesn't have it yet or a run created it and
+    stopped before pushing: it isn't fetched, and the run records its `main`, which the
+    component's `first-push` step sends."""
     mapped = session.instance.components
     keys = [item.key for item in manifest.order if item.key in mapped]
     elsewhere = {key: gitops.branch(mapped[key].path) for key in keys}
@@ -105,6 +122,9 @@ def _check_on_merged_main(session: Session, manifest: Manifest) -> None:
     behind, ahead = [], []
     for key in keys:
         path = mapped[key].path
+        if not gitops.origin_has_main(path):
+            _check_first_push(key, path)
+            continue
         gitops.remote_git("fetch", "--quiet", "origin", "main", cwd=path)
         merged = gitops.main_commit(path)
         if gitops.head(path) != merged:
@@ -122,6 +142,26 @@ def _check_on_merged_main(session: Session, manifest: Manifest) -> None:
             for key in behind
         ),
     )
+
+
+def _check_first_push(key: str, path: Path) -> None:
+    """A new repository's first run pushes its checkout's `main` as committed: stop unless it
+    has a commit, and no change or file that isn't committed, which a step would apply and the
+    push leave out."""
+    again = Next("dp-instance apply", "pushes main as committed and carries on")
+    if gitops.commit_of(path) is None:
+        raise failed(
+            f"{key}'s origin has no main yet, and its main has no commit to push: commit its files first.",
+            again,
+        )
+    files = gitops.uncommitted(path, untracked=True)
+    if files:
+        shown = ", ".join(files[:3]) + (f" and {len(files) - 3} more" if len(files) > 3 else "")
+        raise failed(
+            f"{key}'s origin has no main yet, and its checkout has changes or files that aren't committed "
+            f"({shown}): its first push sends main as committed, so commit or discard them first.",
+            again,
+        )
 
 
 def _check_names_every_repository(session: Session, manifest: Manifest) -> None:
@@ -219,6 +259,22 @@ def _moved(run: Record, mapped: dict) -> tuple[list[str], dict[str, str]]:
     return moved, forward
 
 
+def _resumed_after(run: Record, forward: dict[str, str]) -> str | None:
+    """Why resuming ends the walk's plan skip, rule C, by the stop the run resumes; None after a
+    decision, a step's plan or the drift check's going on without the phases it couldn't plan,
+    whether `--approve` or a person at a terminal approves it. A step applied by hand that the
+    resume carries forward ends it whatever the stop; one that committed nothing shows only as a
+    decision's step with nothing left to apply, which the walk judges: `decision_resumed`."""
+    stop = run.data.get("stop") or {}
+    reason = stop.get("reason")
+    if forward:
+        return "the run resumed after a step applied by hand"
+    if reason == "decision":
+        return None
+    after = RESUMED_AFTER.get(reason) or ("a failure" if run.status == "failed" else None)
+    return f"the run resumed after {after}" if after else "the run resumed"
+
+
 def resume(session: Session) -> Result:
     state = session.instance.state
     run = record.active(state)
@@ -268,8 +324,18 @@ def resume(session: Session) -> Result:
                 ),
                 Next("dp-instance resume", "carries on once the checkout is clean"),
             )
+    resumed_after = _resumed_after(run, forward)
+    # The step a decision's resume carries on at, which the walk checks still has its change to
+    # apply; never the drift check, which plans every phase again.
+    stopped = (run.data.get("stop") or {}).get("entry")
+    at = next((entry for entry in run.entries if entry.id == stopped and entry.kind != "drift"), None)
+    run.data.pop("decision_resumed", None)
+    if resumed_after is None and at is not None:
+        run.data["decision_resumed"] = at.id
     run.data["status"], run.data["stop"] = "running", None
-    # A resumed run never skips a plan: whatever happened while it stood still, every step plans.
-    run.data.setdefault("plan_skip_off", "the run resumed")
+    # A run resumed after any stop but a decision never skips a plan: whatever happened while it
+    # stood still, every step plans.
+    if resumed_after is not None:
+        run.data.setdefault("plan_skip_off", resumed_after)
     run.save()
     return Run(session, run, manifest).walk()

@@ -4,10 +4,10 @@ Each component runs as `uv run --locked <command>` in its own checkout, so it ke
 engine version. With `--json` it writes one JSON object per line to stdout, one line as each
 step starts and finishes and a result last, and everything meant for a person to stderr,
 which goes to the run's log. Values a person supplies go to its stdin as one JSON document
-and nowhere else. A command that only reads runs again when it fails for a moment; one that
-writes never does. A command that fails because the Azure CLI's token cache lost the signed-in
-account is a sign-in to renew, never any other failure: one that only reads runs once more
-first, and one that writes never does.
+and nowhere else. The engine retries its own reads; a read that still failed the way a network
+or a busy service fails for a moment says so, and isn't run again. A command that fails because
+the Azure CLI's token cache lost the signed-in account is a sign-in to renew, never any other
+failure: one that only reads runs once more first, and one that writes never does.
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ WINDOWS_FILE_LOCK = "os error 1224"
 # The Azure CLI's words when its token cache has lost the signed-in account, as several of its
 # processes refreshing the cache at once can leave it: a sign-in to renew, with `az login`.
 AZURE_TOKEN_CACHE = "does not exist in msal token cache"
-# The commands that only read, which a failure that looks temporary runs again.
+# The commands that only read: one the token cache failed runs once more.
 READS = (("steps",), ("outputs", "aggregate"), ("preflight",), ("plan",), ("verify",))
 
 
@@ -73,7 +73,7 @@ class Log:
 @dataclass
 class Call:
     """One component process: its result, the events it wrote and its human lines. A read
-    whose last failure looked temporary holds what it looked like and how often it ran again."""
+    whose failure looked temporary, after the engine's own retries, holds what it looked like."""
 
     status: str
     code: int
@@ -83,7 +83,6 @@ class Call:
     stdout: str = ""
     seconds: float = 0.0
     temporary: str | None = None
-    retried: int = 0
 
     def finished(self, step: str | None = None) -> list[dict]:
         return [
@@ -99,12 +98,16 @@ class Call:
 
     @property
     def message(self) -> str:
+        """What it said, and, when it looked temporary and doesn't say so, that it did."""
         if self.result and self.result.get("message"):
             text = str(self.result["message"])
         else:
             last = self.excerpt(1)
             text = last[0] if last else f"exit code {self.code}"
-        return transient.exhausted(text, self.temporary, self.retried)
+        if self.temporary is None or "looked temporary" in text:
+            return text
+        end = "" if text.endswith(".") else "."
+        return f"{text}{end} It looked temporary ({self.temporary}); nothing changed."
 
 
 class StepReports:
@@ -208,26 +211,6 @@ class Cli:
         )
         return call, retry
 
-    def _started(self, arguments, stdin, on_event, on_line) -> Call:
-        """uv failing on a Windows file lock (os error 1224, usually an antivirus scan holding a
-        file in uv's cache) before the command starts is retried once; a second failure stands.
-        A command that only reads and that the Azure CLI's token cache failed runs once more,
-        as several of its processes refreshing the cache at once can leave it for a moment;
-        failing that way again, it waits for a sign-in. One that writes waits for it at once."""
-        call, retry = self._once(arguments, stdin, on_event, on_line)
-        if retry:
-            self.log.write("   Windows os error 1224 before the command started: retrying once.")
-            call, _ = self._once(arguments, stdin, on_event, on_line)
-        if signed_out(call) and read_command(arguments) is not None:
-            self._report(
-                f"{self.label(arguments)}: the Azure CLI's token cache lost the signed-in account; "
-                "running it once more."
-            )
-            call, _ = self._once(arguments, stdin, on_event, on_line)
-        if signed_out(call):
-            call.status = "sign-in"
-        return call
-
     def label(self, arguments) -> str:
         """The command, as a retry's line names it: its CLI, its words and its phase."""
         label = " ".join((self.command, *(read_command(arguments) or arguments[:1])))
@@ -246,22 +229,28 @@ class Cli:
         on_event: Callable[[dict], None] | None = None,
         on_line: Callable[[str], None] | None = None,
     ) -> Call:
-        """Run one command. A read that fails the way a network or a busy service fails for a
-        moment runs again after a wait, up to three times, each retry said in one line; a
-        sign-in to renew never does, nor does a command that writes."""
-        call = self._started(arguments, stdin, on_event, on_line)
-        if read_command(arguments) is None:
-            return call
-        label = self.label(arguments)
-        retried = 0
-        while call.status in ("failed", "usage"):
-            found = transient.classify("\n".join((*call.stderr, call.message)))
-            if not transient.retries(found, retried, label=label, report=self._report):
-                if found is not None:
-                    call.temporary, call.retried = found, retried
-                break
-            retried += 1
-            call = self._started(arguments, stdin, on_event, on_line)
+        """Run one command. uv failing on a Windows file lock (os error 1224, usually an
+        antivirus scan holding a file in uv's cache) before the command starts is retried once;
+        a second failure stands. A command that only reads and that the Azure CLI's token cache
+        failed runs once more, as several of its processes refreshing the cache at once can leave
+        it for a moment; failing that way again, it waits for a sign-in. One that writes waits for
+        it at once. A read that failed the way a network or a busy service fails for a moment,
+        the engine's own retries spent, holds what it looked like."""
+        call, retry = self._once(arguments, stdin, on_event, on_line)
+        if retry:
+            self.log.write("   Windows os error 1224 before the command started: retrying once.")
+            call, _ = self._once(arguments, stdin, on_event, on_line)
+        reads = read_command(arguments) is not None
+        if signed_out(call) and reads:
+            self._report(
+                f"{self.label(arguments)}: the Azure CLI's token cache lost the signed-in account; "
+                "running it once more."
+            )
+            call, _ = self._once(arguments, stdin, on_event, on_line)
+        if signed_out(call):
+            call.status = "sign-in"
+        if reads and call.status in ("failed", "usage"):
+            call.temporary = transient.classify("\n".join((*call.stderr, call.message)))
         return call
 
     def document(self, *arguments: str) -> dict:

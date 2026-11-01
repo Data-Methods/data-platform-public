@@ -7,7 +7,7 @@ deallocated. Read the tool before running it.
 
 ## Requirements
 
-- The object ID of the platform's Infra Admin Group, whose members sign in to the VM.
+- The object ID of the group whose members sign in to the VM.
 - Permission to create a dedicated resource group in the subscription and deploy its resources
   and Deployment Stack.
 - An RBAC administrator to run `authorize` after deployment.
@@ -35,7 +35,8 @@ if ($Commit -ne (git -C $Checkout rev-parse "$Tag^{commit}") -or (git -C $Checko
 
 `git -C $Checkout tag --list "bastion-vm-linux/*"` lists the versions. To upgrade, run
 `git -C $Checkout fetch --quiet --tags`, check out the new tag and run the check again. A new
-version uses the same `bastion-vm.json` and doesn't change an existing VM's guest.
+version uses the same `bastion-vm.json`, or names the change it needs, and doesn't change an
+existing VM's guest.
 
 ## Use
 
@@ -53,7 +54,7 @@ pwsh -NoProfile -File $BastionVm reconfigure         # changes the deployment se
 pwsh -NoProfile -File $BastionVm apply --dry-run     # lists what apply creates or updates
 pwsh -NoProfile -File $BastionVm apply               # deploys or updates the VM
 pwsh -NoProfile -File $BastionVm authorize --dry-run
-pwsh -NoProfile -File $BastionVm authorize           # grants the Infra Admin Group the VM login role
+pwsh -NoProfile -File $BastionVm authorize           # grants the group whose members sign in the VM login role
 pwsh -NoProfile -File $BastionVm status              # checks the stack and the login role
 pwsh -NoProfile -File $BastionVm connection          # prints the commands that connect over SSH
 pwsh -NoProfile -File $BastionVm tunnel              # a browser proxy to the platform's private sites

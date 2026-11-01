@@ -18,7 +18,7 @@ WORKSTATION_SIZE = "Standard_D2s_v7"
 
 
 def _authorization_context(config: WorkstationConfig) -> tuple[str, str]:
-    return config.resource_group_id, config.infra_admin_group_object_id
+    return config.resource_group_id, config.login_group_object_id
 
 
 def _authorization_assignment(
@@ -64,8 +64,8 @@ def authorization_changes(config: WorkstationConfig, azure: AzureCli) -> list[Ch
     return [
         Change(
             "assign Azure role",
-            "Virtual Machine Administrator Login to the Infra Admin Group",
-            "allow activated and permanent Infra Admins to use Entra SSH on the Bastion VM",
+            "Virtual Machine Administrator Login to the group whose members sign in",
+            "allow the group's members to use Entra SSH on the Bastion VM",
             (f"Scope: {resource_group_scope}",),
         )
     ]
@@ -104,7 +104,7 @@ def blockers(config: WorkstationConfig, azure: AzureCli) -> list[str]:
     ):
         return []
     return [
-        "Run 'bastion-vm-linux.ps1 authorize' after apply to grant the Infra Admin Group VM login."
+        "Run 'bastion-vm-linux.ps1 authorize' after apply to grant VM login to the group whose members sign in."
     ]
 
 
@@ -301,7 +301,7 @@ def _vm_id(desired: WorkstationConfig, azure: AzureCli) -> str:
 
 def _print_connection(desired: WorkstationConfig, azure: AzureCli) -> None:
     vm_id = _vm_id(desired, azure)
-    print("Connect from a local shell with your activated or permanent Infra Admin identity:")
+    print("Connect from a local shell as a member of the group whose members sign in:")
     print(
         "Use a dedicated AZURE_CONFIG_DIR when other sessions share this machine. "
         "Bastion tunnel authentication uses that profile's active subscription."
@@ -556,7 +556,7 @@ def _check_group_cleanup(
         if str(item.get("scope", "")).casefold() == config.resource_group_id.casefold()
         and not (
             str(item.get("principalId", "")).casefold()
-            == config.infra_admin_group_object_id.casefold()
+            == config.login_group_object_id.casefold()
             and str(item.get("roleDefinitionId", "")).rsplit("/", 1)[-1].casefold()
             == VM_ADMIN_LOGIN_ROLE_ID
         )

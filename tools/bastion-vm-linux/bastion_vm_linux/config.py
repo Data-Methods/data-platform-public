@@ -12,6 +12,9 @@ from uuid import UUID
 from .azure import AzureCli, CommandError
 
 DEFAULT_FILE = Path("bastion-vm.json")
+SCHEMA_VERSION = 2
+# The settings whose prompt isn't their name.
+PROMPTS = {"login_group_object_id": "Object ID of the group whose members sign in"}
 
 
 @dataclass(frozen=True)
@@ -21,7 +24,7 @@ class WorkstationConfig:
     tenant_id: str
     subscription_id: str
     resource_group_name: str
-    infra_admin_group_object_id: str
+    login_group_object_id: str
     name_prefix: str
     location: str
     vnet_address_prefix: str
@@ -29,8 +32,8 @@ class WorkstationConfig:
     workstation_subnet_prefix: str
 
     def __post_init__(self) -> None:
-        if type(self.schema_version) is not int or self.schema_version != 1:
-            raise ValueError("schema_version must be 1")
+        if type(self.schema_version) is not int or self.schema_version != SCHEMA_VERSION:
+            raise ValueError(f"schema_version must be {SCHEMA_VERSION}")
         for field in fields(self):
             if field.name != "schema_version":
                 value = getattr(self, field.name)
@@ -38,7 +41,7 @@ class WorkstationConfig:
                     raise ValueError(
                         f"{field.name} must be nonempty text without surrounding spaces"
                     )
-        for name in ("tenant_id", "subscription_id", "infra_admin_group_object_id"):
+        for name in ("tenant_id", "subscription_id", "login_group_object_id"):
             UUID(getattr(self, name))
         if not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,16}[a-z0-9]", self.name_prefix):
             raise ValueError("name_prefix must be 3-18 lowercase letters, digits or hyphens")
@@ -80,6 +83,11 @@ class WorkstationConfig:
             data = json.loads(path.read_text(encoding="utf-8"))
             if not isinstance(data, dict):
                 raise ValueError("configuration must be a JSON object")
+            if type(data.get("schema_version")) is int and data["schema_version"] == 1:
+                raise ValueError(
+                    "schema_version 1 is an earlier format: rename infra_admin_group_object_id to "
+                    f"login_group_object_id and set schema_version to {SCHEMA_VERSION}"
+                )
             return cls(**data)
         except (OSError, ValueError, TypeError) as exc:
             raise CommandError(f"Invalid workstation configuration {path}: {exc}") from exc
@@ -116,24 +124,25 @@ def configure(path: Path, *, reconfigure: bool = False) -> None:
     current = asdict(WorkstationConfig.load(path)) if path.exists() else {}
     account = AzureCli().account()
     defaults = {
-        "schema_version": 1,
+        "schema_version": SCHEMA_VERSION,
         "platform_instance_key": "",
         "tenant_id": account["tenantId"],
         "subscription_id": account["id"],
         "resource_group_name": "RG-DataPlatform-Bastion",
-        "infra_admin_group_object_id": "",
+        "login_group_object_id": "",
         "name_prefix": "dp-bastion",
         "location": "southcentralus",
         "vnet_address_prefix": "10.253.0.0/24",
         "bastion_subnet_prefix": "10.253.0.0/26",
         "workstation_subnet_prefix": "10.253.0.64/27",
     }
-    desired = {"schema_version": 1}
+    desired = {"schema_version": SCHEMA_VERSION}
     for name, default in defaults.items():
         if name == "schema_version":
             continue
         value = current.get(name, default)
-        answer = input(f"{name.replace('_', ' ').capitalize()} [{value}]: ").strip()
+        label = PROMPTS.get(name, name.replace("_", " ").capitalize())
+        answer = input(f"{label} [{value}]: ").strip()
         desired[name] = answer or value
     config = WorkstationConfig(**desired)
     if current:

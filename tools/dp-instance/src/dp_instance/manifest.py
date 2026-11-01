@@ -6,9 +6,9 @@ with the `dp-instance/X.Y.Z` tags of dp-instance's published versions; a shallow
 each manifest into `.dp-instance/releases.git`, using Git's own TLS and proxy settings. Tags
 are never moved, so a fetched manifest is kept, and a tag that moved stops every command.
 
-A manifest at schema version 2 names the oldest dp-instance version it runs. Platform 2026.3's,
-at schema version 1, name the dp-instance they run by its commit: this dp-instance reads them
-for `status` and as where an upgrade starts, and runs nothing else on them.
+A manifest names the oldest dp-instance version it runs, and a candidate manifest the development
+commit of the dp-instance canary installs. An instance's records are matched against every
+published manifest's raw JSON `sources`, whatever its schema (`Releases.documents`).
 """
 
 from __future__ import annotations
@@ -25,9 +25,6 @@ RELEASES_URL = "https://github.com/Data-Methods/data-platform-public.git"
 TAG_PREFIX = "refs/tags/platform-release/"
 TOOL_TAG_PREFIX = "refs/tags/dp-instance/"
 SCHEMA_VERSION = 2
-# Platform 2026.3's manifests, which name the dp-instance they run by its commit. Removed at the
-# 2026.5 stop.
-COMMIT_SCHEMA = 1
 VERSION = re.compile(r"^(\d{4})\.(\d+)(?:\.(\d+))?$")
 TEMPLATE_KEY = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
 COMPONENT_KEY = re.compile(r"^[a-z][a-z0-9_-]*$")
@@ -79,11 +76,10 @@ def published(origin: str) -> bool:
 
 
 def install_of(minimum: str | None, commit: str | None, origin: str) -> str | None:
-    """The command that installs the dp-instance a manifest runs: its minimum version's tag, or
-    the commit a candidate or a Platform 2026.3 manifest names."""
-    candidate = not published(origin)
-    if commit is not None and (candidate or minimum is None):
-        return install_command(commit, development=candidate)
+    """The command that installs the dp-instance a manifest runs: the development commit a
+    candidate names, or its minimum version's tag."""
+    if commit is not None and not published(origin):
+        return install_command(commit, development=True)
     return install_command(tool_tag(minimum)) if minimum is not None else None
 
 
@@ -115,12 +111,10 @@ class Repository:
 
 @dataclass(frozen=True)
 class Manifest:
-    schema_version: int
     platform_version: str
-    # The oldest dp-instance version the release runs; None at schema version 1.
-    minimum: str | None
-    # The commit Platform 2026.3's dp-instance installs, which 2026.4's manifests keep once so it
-    # points to the first versioned dp-instance; a candidate's names its development commit.
+    # The oldest dp-instance version the release runs.
+    minimum: str
+    # The development commit of the dp-instance a candidate runs; None on a published manifest.
     dp_instance_commit: str | None
     sources: dict[str, str]
     order: tuple[Repository, ...]
@@ -144,27 +138,18 @@ class Manifest:
         )
 
     def runs_on(self, own: str | None) -> bool:
-        """Whether dp-instance at version ``own`` runs the release: its minimum or a newer one.
-        A Platform 2026.3 manifest names its dp-instance by commit, so no version runs it."""
-        return self.schema_version == SCHEMA_VERSION and installed.at_least(own, self.minimum)
+        """Whether dp-instance at version ``own`` runs the release: its minimum or a newer one."""
+        return installed.at_least(own, self.minimum)
 
     def check_install(self, own: str | None) -> None:
-        """Stop unless dp-instance at version ``own`` runs the release. On Platform 2026.3, this
-        dp-instance runs only `status`, `update` and the upgrade to the next Platform Version."""
+        """Stop unless dp-instance at version ``own`` runs the release."""
         if self.runs_on(own):
             return
         shown = f"dp-instance {own}" if own else "a local copy of dp-instance"
-        if self.schema_version == COMMIT_SCHEMA:
-            message = (
-                f"Platform {self.platform_version} runs dp-instance at commit {self.dp_instance_commit}; "
-                f"this is {shown}, which runs on it only status, update and an upgrade to the next "
-                "Platform Version."
-            )
-        else:
-            message = (
-                f"Platform {self.platform_version} runs dp-instance {self.minimum} or later; this is {shown}."
-            )
-        raise failed(message, self.install("; then run the same command again"))
+        raise failed(
+            f"Platform {self.platform_version} runs dp-instance {self.minimum} or later; this is {shown}.",
+            self.install("; then run the same command again"),
+        )
 
 
 def _require(condition: bool, origin: str, message: str) -> None:
@@ -179,9 +164,10 @@ def minimum_of(document: dict) -> str | None:
     return found if isinstance(found, str) and installed.VERSION.fullmatch(found) else None
 
 
-def commit_of(document: dict) -> str | None:
-    """The dp-instance commit a manifest's JSON names, when it names a full one."""
-    found = document.get("dp_instance_commit")
+def commit_of(document: dict, origin: str) -> str | None:
+    """The development commit of dp-instance a candidate manifest's JSON names, when it names a
+    full one; a published manifest's is never read."""
+    found = None if published(origin) else document.get("dp_instance_commit")
     return found if isinstance(found, str) and gitops.COMMIT.fullmatch(found) else None
 
 
@@ -194,32 +180,24 @@ def parse(text: str, origin: str) -> Manifest:
     _require(isinstance(document, dict), origin, "it isn't a JSON object")
     schema = document.get("schema_version")
     if isinstance(schema, int) and schema > SCHEMA_VERSION:
-        command = install_of(minimum_of(document), commit_of(document), origin)
+        command = install_of(minimum_of(document), commit_of(document, origin), origin)
         raise failed(
-            f"The manifest {origin} is schema version {schema}; this dp-instance reads versions "
-            f"{COMMIT_SCHEMA} and {SCHEMA_VERSION}.",
+            f"The manifest {origin} is schema version {schema}; this dp-instance reads version "
+            f"{SCHEMA_VERSION}.",
             *((Next(command, "installs the dp-instance that reads it"),) if command else ()),
         )
-    _require(
-        schema in (COMMIT_SCHEMA, SCHEMA_VERSION),
-        origin,
-        f"schema_version must be {COMMIT_SCHEMA} or {SCHEMA_VERSION}",
-    )
+    _require(schema == SCHEMA_VERSION, origin, f"schema_version must be {SCHEMA_VERSION}")
     version = document.get("platform_version")
     _require(
         isinstance(version, str) and VERSION.fullmatch(version) is not None,
         origin,
         "platform_version must be YYYY.N or YYYY.N.P",
     )
-    minimum = minimum_of(document) if schema == SCHEMA_VERSION else None
+    minimum = minimum_of(document)
+    _require(minimum is not None, origin, "dp_instance.minimum must be a dp-instance version, X.Y.Z")
+    commit = commit_of(document, origin)
     _require(
-        minimum is not None or schema == COMMIT_SCHEMA,
-        origin,
-        "dp_instance.minimum must be a dp-instance version, X.Y.Z",
-    )
-    commit = commit_of(document)
-    _require(
-        commit is not None or (schema == SCHEMA_VERSION and document.get("dp_instance_commit") is None),
+        commit is not None or published(origin) or document.get("dp_instance_commit") is None,
         origin,
         "dp_instance_commit must be a full commit SHA",
     )
@@ -273,7 +251,7 @@ def parse(text: str, origin: str) -> Manifest:
     keys = [item.key for item in repositories]
     _require(len(set(keys)) == len(keys), origin, "order lists a repository twice")
     _require(set(keys) == set(sources), origin, "order and sources must name the same templates")
-    return Manifest(schema, version, minimum, commit, dict(sources), tuple(repositories), text, origin)
+    return Manifest(version, minimum, commit, dict(sources), tuple(repositories), text, origin)
 
 
 def read_file(path: Path) -> Manifest:
@@ -298,6 +276,7 @@ class Releases:
         self.url = url or RELEASES_URL
         self._refs: dict[str, str] | None = None
         self._published: dict[str, str] | None = None
+        self._documents: list[tuple[str, dict]] | None = None
 
     def _ready(self) -> None:
         if not (self.cache / "HEAD").exists():
@@ -377,17 +356,19 @@ class Releases:
 
     def documents(self) -> list[tuple[str, dict]]:
         """Every published manifest's JSON, newest first, as published: for matching an
-        instance's records, before any is read as a run's target."""
-        self.fetch_all()
-        found = []
-        for version in reversed(list(self.published())):
-            try:
-                document = json.loads(self.text(version))
-            except ValueError:
-                continue
-            if isinstance(document, dict):
-                found.append((version, document))
-        return found
+        instance's records, before any is read as a run's target. Read once per command."""
+        if self._documents is None:
+            self.fetch_all()
+            found = []
+            for version in reversed(list(self.published())):
+                try:
+                    document = json.loads(self.text(version))
+                except ValueError:
+                    continue
+                if isinstance(document, dict):
+                    found.append((version, document))
+            self._documents = found
+        return self._documents
 
     def manifest(self, version: str) -> Manifest:
         manifest = parse(self.text(version), f"platform-release/{version}")

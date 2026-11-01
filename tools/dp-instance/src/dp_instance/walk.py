@@ -1,21 +1,26 @@
 """A run: the sequencer walking the steps, one process per step.
 
 A run has up to three parts, each counted and timed on its own. Before anything changes, an
-upgrade fetches every repository's target source at once, every component's `preflight` step
-runs, all at once, and, in an upgrade run, the drift check. An upgrade's code part then runs
-each owner's `upgrade` phase and every `migrate` step. In the platform part, each step is
-planned only after the steps before it have applied: a step with no change passes, and at a
-step with a change the run stops for review and, on approval, applies exactly that plan, which
-the component verifies before the next step starts. While rule C holds in an upgrade, a
-Terraform step whose drift plan had no change is named to its component's `apply` with that
-plan's inputs hash, and reports no change without running Terraform while the hash still
-matches; while its repository is at the commit the drift check planned, a hold names the native
-steps it guards whose drift plan had no change too, which its preview doesn't plan. Rule C
-holds until a step that writes more than its repositories applies, the run waits on outside
-work, or it resumes, and never for a component whose configuration `migrate` changed. At a
-terminal a person is asked with single keypresses; without one, or with `--json`, every
-question is a stop naming the command that continues. Each pull request a step reports is shown
-as it arrives, and its last state kept.
+upgrade fetches every repository's target source at once and copies the release notes of each
+template it changes into the run's `notes/`, which it names before the code part and at every
+decision; every component's `preflight` step runs, all at once, and, in an upgrade run, the
+drift check. An upgrade's code part then runs each owner's `upgrade` phase and every `migrate`
+step. In the platform part, each step is planned only after the steps before it have applied: a
+step with no change passes, and at a step with a change the run stops for review and, on
+approval, applies exactly that plan, which the component verifies before the next step starts.
+A failed step's stop ends with its own command in its repository. While rule C holds in an
+upgrade, a Terraform step whose drift plan had no change is named to its component's `apply`
+with that plan's inputs hash, and reports no change without running Terraform while the hash
+still matches; while its repository is at the commit the drift check planned, a hold names the
+native steps it guards whose drift plan had no change too, which its preview doesn't plan. Rule
+C holds until a step applies that isn't declared to write only its repositories or to change
+nothing a Terraform root reads, the run waits on outside work, it resumes after any stop but a
+decision, or a decision's resume finds the step it stopped at with nothing left to apply, and
+never for a component whose configuration `migrate` changed. Only the latest drift check's plans
+count. At a terminal a person is asked with single keypresses; without one, or with `--json`,
+every question is a stop naming the command that continues. Each pull request a step reports is
+shown as it arrives, and its last state kept. A completed run names its recommended optional
+handoffs, and its `--json` result carries them as `handoffs`.
 """
 
 from __future__ import annotations
@@ -23,6 +28,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shutil
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -31,7 +37,7 @@ from pathlib import Path
 
 from rich.text import Text
 
-from . import configuration, earlier, gitops, handoffs, prompts, targets
+from . import configuration, earlier, gitops, handoffs, prompts, targets, template_access
 from .components import Call, Cli, Log
 from .instance import (
     INFRASTRUCTURE,
@@ -41,9 +47,9 @@ from .instance import (
     merged_commits,
     registrations,
 )
-from .manifest import Manifest, cli_platform_version
+from .manifest import Manifest, cli_platform_version, version_key
 from .outcome import WAITING_FOR, WAITS, Next, Result, Stop, failed
-from .record import NOT_STARTED, Record, mark_replaced, under_way
+from .record import FINISHED, NOT_STARTED, Record, mark_replaced, under_way
 from .screen import Block, duration
 from .sequence import MERGE, Declaration, Entry, Plan, declaration
 from .session import Session
@@ -52,16 +58,19 @@ from .session import Session
 PARTS = {"before": "before anything changes", "code": "the code", "platform": "the platform"}
 # The checks before the run, as a resumed run names those that passed earlier.
 CHECKS = {"preflight": "preflights", "drift": "the drift check"}
-# 2026.4's engine, the first whose `steps --json` is schema 2 and whose `upgrade` works out
-# the channel from its target; an engine before it takes `upgrade --channel`. Goes at the next
-# stop.
-FIRST_SCHEMA_2_ENGINE = (0, 15)
 # The reason a new upgrade stops when it can't read the steps while a run had stopped, which it
 # keeps as it was.
 KEPT = "stopped-run-kept"
 # How many of a decision's plan lines its JSON result carries.
 PLAN_HEAD = 40
+UNKNOWN_VERSION = (
+    "The drift check can't tell which Platform Version this instance runs: no repository's `main` "
+    "records a published release, and this workstation has no record of the candidate it runs. A "
+    "candidate's record stays on the workstation that installed it; run the upgrade there."
+)
 LEVELS = ("repository", "component", "phase", "step")
+# The lines a step's block shows for a decision, which give way to what it applied.
+DECISION_LABELS = ("Step Plan:", "Plan File:", "Decision:", "Release Notes:")
 DRIFT_TEXT = (
     "Every component's phases planned, read only and in parallel, on the code the platform runs: the "
     "checkout, or its main while an upgrade is under way on its branch; any change is drift. A "
@@ -197,6 +206,7 @@ class Run:
         """Fetch every repository's target source at once, with Git alone, before an upgrade
         runs its preflights and owners' `upgrade` phases from them; every fetch that failed stops
         the run, which `resume` fetches again."""
+        self.check_development_keys()
         block = Block("sources", "", "", "", self.footer)
         block.message = f"Fetching the target source of {len(self.repositories)} repositories at once"
         started = time.monotonic()
@@ -226,6 +236,89 @@ class Run:
         fetched = sum(new for new, _ in results)
         if fetched:
             self.timed("fetched", f"{fetched} target source{'s' if fetched != 1 else ''}", started)
+
+    def check_development_keys(self) -> None:
+        """A candidate reads each development repository only through the instance's key for
+        it: before anything is fetched, the run stops for each template whose development key
+        isn't on this workstation."""
+        if self.channel != "canary":
+            return
+        missing = [
+            repository.key
+            for repository in self.repositories
+            if not template_access.Access(
+                self.instance.key, repository.key + gitops.DEVELOPMENT_SUFFIX
+            ).private.is_file()
+        ]
+        if not missing:
+            return
+        raise Stop(
+            "failed",
+            "A candidate reads each development repository only through its key, and this workstation "
+            f"has none for {', '.join(missing)}; nothing has changed.",
+            reason="development-keys",
+            missing=missing,
+            next=(
+                *(
+                    Next(
+                        f"dp-instance template-access setup {key} --development",
+                        f"sets up the key for {key}'s development repository",
+                    )
+                    for key in missing
+                ),
+                Next("dp-instance resume", "fetches the target sources and carries on"),
+            ),
+        )
+
+    def copy_notes(self) -> None:
+        """Copy the release notes of each template whose commit the upgrade changes into the
+        run's `notes/<template>/`: `docs/releases/<Platform Version>.md` at its target commit,
+        for every published Platform Version after the instance's, up to the target, in version
+        order; the target's alone when the instance's isn't known."""
+        target = self.manifest.platform_version
+        start = self.running_version()
+        versions = [
+            version
+            for version in self.session.releases.published()
+            if start is not None and version_key(start) < version_key(version) < version_key(target)
+        ] + [target]
+        changed = [
+            repository.key
+            for repository in self.repositories
+            if self.applied_record(repository.key).commit != self.manifest.sources[repository.key]
+        ]
+        copied = []
+        for version in versions:
+            for repository in changed:
+                source = self.source(repository) / "docs" / "releases" / f"{version}.md"
+                if source.is_file():
+                    destination = self.record.file("notes", repository, f"{version}.md")
+                    shutil.copyfile(source, destination)
+                    copied.append(self.relative(destination))
+        self.record.data["notes"] = copied
+        self.record.save()
+
+    def notes_line(self) -> str | None:
+        """The release notes the run copied, on one line: each file, in version order, and their
+        folder."""
+        notes = self.record.data.get("notes") or []
+        if not notes:
+            return None
+        folder = self.relative(self.record.folder / "notes")
+        files = ", ".join(item.removeprefix(folder + "/") for item in notes)
+        return f"{files} · notes/"
+
+    def notes_detail(self) -> dict:
+        """The release notes the run copied, for --json: each file's path in the instance folder."""
+        return {"notes": self.record.data.get("notes") or []} if self.upgrading else {}
+
+    def show_notes(self) -> None:
+        """Name the release notes as the code part starts."""
+        line = self.notes_line()
+        if line is None:
+            return
+        self.screen.labelled("Release Notes:", line)
+        self.screen.emit({"event": "notes", "run": self.record.id, **self.notes_detail()})
 
     def earlier_runs(self) -> None:
         """As an upgrade starts, the open pull requests and branches each earlier upgrade run
@@ -398,15 +491,11 @@ class Run:
             self.earlier_runs()
             self.fetch_sources()
             self.record.data["unchanged"] = self.find_unchanged()
+            self.copy_notes()
         plan = self.plan(declarations)
         entries = plan.preflights()
         if self.upgrading:
             self.record.data["platform_estimate"] = plan.estimate()
-            # The owners whose target is still at 2026.3's schema 1, which take `upgrade
-            # --channel`. Goes at the next stop.
-            self.record.data["schema_1_targets"] = [
-                repository.key for repository in self.repositories if self.schema_1_target(repository.key)
-            ]
             for entry in entries:
                 entry.fetched = True
             entries.append(Entry(id="drift-check", kind="drift", description=DRIFT_TEXT))
@@ -418,7 +507,7 @@ class Run:
             entries += plan.platform(upgrade=False)
             self.record.data["platform"] = True
             if self.record.kind == "apply":
-                self.record.data["configuration_changes"] = self.configuration_changes(plan.declarations)
+                self.record.data["configuration_changes"] = self.configuration_changes()
                 read += " and the instance's published outputs"
             self.timed("read", read, started)
         self.record.entries = entries
@@ -453,7 +542,7 @@ class Run:
             self.record.save()
         return declarations
 
-    def configuration_changes(self, declarations) -> list[str]:
+    def configuration_changes(self) -> list[str]:
         """The components whose configuration on `main` isn't the one they last published: what
         a configuration change applies, which titles its pull requests."""
         if self.instance.infrastructure is None:
@@ -461,24 +550,8 @@ class Run:
         block = Block("sequence", "", "", "", self.footer)
         block.message = "Reading the instance's published outputs"
         places = {repository.key: self.checkout(repository.key) for repository in self.repositories}
-        return configuration.unapplied(places, declarations, self.aggregate(block, places))
-
-    def schema_1_target(self, repository: str) -> bool:
-        """Whether the target's fetched source bundles an engine from before 2026.4's, read
-        from its own `pyproject.toml`, so its `steps --json` is 2026.3's schema 1. A target
-        whose engine version doesn't read stops the run, since the upgrade can't tell how to
-        call it."""
-        engine = self.source(repository) / "tools" / "dp-template-engine" / "pyproject.toml"
-        try:
-            found = re.search(r'(?m)^version\s*=\s*"(\d+)\.(\d+)\.', engine.read_text(encoding="utf-8"))
-        except OSError:
-            found = None
-        if found is None:
-            raise failed(
-                f"{repository}'s target bundles no engine version dp-instance reads: {engine} is "
-                "missing or names none. Nothing has changed."
-            )
-        return (int(found.group(1)), int(found.group(2))) < FIRST_SCHEMA_2_ENGINE
+        mapped = [self.instance.components[repository.key] for repository in self.repositories]
+        return configuration.unapplied(mapped, self.aggregate(block, places))
 
     def build_platform(self) -> None:
         """An upgrade's platform steps, read from the code its `upgrade` phases synced, once
@@ -547,6 +620,8 @@ class Run:
         if self._shown is None or self._shown[0] != part:
             self.screen.stage(PARTS[part])
             self._shown = (part, None, None, None)
+            if part == "code":
+                self.show_notes()
 
     def close_part(self, part: str | None = None, seconds: float | None = None) -> None:
         """End a part, by default the one being walked, with a line of its count and time: by
@@ -723,6 +798,7 @@ class Run:
             block.seconds = took
         if outcome == "applied":
             self.applied_change(entry, block)
+        self.decision_resumed(entry, block, outcome)
         self.screen.show(block, compact=compact and not block.lines)
         if entry.repository in self.instance.components:
             self.record.data["commits"][entry.repository] = gitops.head(self.checkout(entry.repository))
@@ -765,13 +841,15 @@ class Run:
             return self.stopped(stop)
         self.record.complete()
         self.screen.complete(self.run_seconds())
-        self.recommend()
+        recommended = self.recommend()
         left = self.left()
         if left:
             self.screen.next_block(left, self.relative(self.record.folder) + "/")
         else:
             self.screen.run_record(self.relative(self.record.folder) + "/")
-        return Result(self.record.kind, "done", "Complete.", left, {"run": self.record.id})
+        return Result(
+            self.record.kind, "done", "Complete.", left, {"run": self.record.id, "handoffs": recommended}
+        )
 
     def left(self) -> tuple[Next, ...]:
         """What's left once an upgrade on `stable` completes: the next stop when one is
@@ -846,17 +924,32 @@ class Run:
         `preflight`, `upgrade`, `plan`, `apply` and `verify` take."""
         return ["--platform-version", cli_platform_version(self.manifest.platform_version)]
 
-    @property
-    def applied_version(self) -> list[str]:
-        """The Platform Version the platform runs, which the drift check plans its code with:
-        the published release each repository's `main` records, or the candidate this
-        workstation upgraded to. The target's, when neither is known, such as on a workstation
-        that didn't run the candidate."""
+    def running_version(self) -> str | None:
+        """The Platform Version the platform runs: the published release each repository's
+        `main` records, or the candidate this workstation upgraded to; None when neither is
+        known, such as on a workstation that didn't install the candidate."""
         instance, releases = self.session.instance, self.session.releases
-        version = targets.current(instance, releases, applied=True).version or targets.candidate_of(
+        return targets.current(instance, releases, applied=True).version or targets.candidate_of(
             instance, applied=True
         )
-        return ["--platform-version", cli_platform_version(version or self.manifest.platform_version)]
+
+    @property
+    def applied_version(self) -> list[str]:
+        """The Platform Version the platform runs, which the drift check plans its code with;
+        when it isn't known, the drift check stops before any plan."""
+        version = self.running_version()
+        if version is None:
+            raise Stop(
+                "failed",
+                UNKNOWN_VERSION,
+                reason="unknown-platform-version",
+                next=(
+                    Next(
+                        self.restart(), "on the workstation that installed the candidate this instance runs"
+                    ),
+                ),
+            )
+        return ["--platform-version", cli_platform_version(version)]
 
     def again(self) -> tuple[Next, ...]:
         """A new run in place of resuming this one, when every repository is on `main`, the only
@@ -968,6 +1061,8 @@ class Run:
         return f"{entry.component}'s preflight failed."
 
     def drift_check(self, entry: Entry, block: Block) -> None:
+        # Only this drift check's plans count: an earlier attempt's, before a stop, never do.
+        self.record.data.pop("drift_plans", None)
         with self.applied_code(self.repositories, block) as places:
             declarations = self.declarations(places)
             aggregate = None
@@ -980,7 +1075,7 @@ class Run:
             checked = {key: value for key, value in declarations.items() if key[0] not in unfinished}
             if aggregate is not None:
                 self.check_mapped(block, aggregate)
-                self.check_applied(block, places, checked, aggregate)
+                self.check_applied(block, finished, aggregate)
             self.plan_drift(entry, block, finished, places, checked)
 
     def unfinished(self, block: Block, aggregate: dict | None, declarations) -> set[str]:
@@ -1110,15 +1205,19 @@ class Run:
             ),
         )
 
-    def check_applied(self, block: Block, places: dict[str, Path], declarations, aggregate: dict) -> None:
+    def check_applied(self, block: Block, repositories, aggregate: dict) -> None:
         """An upgrade never carries a configuration change. A component whose configuration in
         the code the platform runs isn't the one it last published holds a change merged to
         `main` that no run has applied: the upgrade stops before planning, naming those
         components and the configuration change that applies them; real drift keeps its own
         stop. A repository with an upgrade under way is left out: the steps it applied from its
         branch published the branch's configuration."""
-        settled = {key: place for key, place in places.items() if not self.in_progress(key)}
-        found = configuration.unapplied(settled, declarations, aggregate)
+        settled = [
+            self.instance.components[repository.key]
+            for repository in repositories
+            if not self.in_progress(repository.key)
+        ]
+        found = configuration.unapplied(settled, aggregate)
         if not found:
             return
         for name in found:
@@ -1145,7 +1244,8 @@ class Run:
         """Plan every phase the drift check covers, as each repository's applied code declares
         them, where that code is."""
         phases = Plan(self.manifest, repositories, declarations).drift_targets()
-        version = self.applied_version
+        # A first deployment has no phase to plan, so it never needs the Platform Version.
+        version = self.applied_version if phases else []
 
         def plan_one(target_phase):
             repository, component, phase = target_phase
@@ -1192,7 +1292,7 @@ class Run:
         # Each step's plan, by its entry: its status and, for a Terraform step, the hash of its
         # inputs, so a later walk can tell when the drift check already planned exactly what it
         # would plan.
-        planned = self.record.data.setdefault("drift_plans", {})
+        planned = self.record.data["drift_plans"] = {}
         for repository, component, phase, file, call in results:
             for event in call.finished():
                 planned[f"{repository}/{component}/{phase}/{event['step']}"] = {
@@ -1279,12 +1379,17 @@ class Run:
         block.outcome = "change"
         block.add("Step Plan:", summary)
         block.add("Decision:", identifier)
+        notes = self.notes_line()
+        if notes:
+            block.add("Release Notes:", notes)
         if self.session.interactive:
             key = self.screen.ask(
                 block, [("y", "go on"), ("n", "stop the run here")], "Go on without checking them?"
             )
             if key == "y":
-                block.lines = [line for line in block.lines if line.label != "Decision:"]
+                block.lines = [
+                    line for line in block.lines if line.label not in ("Decision:", "Release Notes:")
+                ]
                 block.lines[-1].text.append("   approved", style="green")
                 return
         command = f"dp-instance resume --approve {identifier}"
@@ -1309,6 +1414,7 @@ class Run:
                     "say it fixes them, and otherwise send this list to Data Methods",
                 ),
             ),
+            **self.notes_detail(),
         )
 
     def migrate(self, entry: Entry, block: Block) -> None:
@@ -1358,9 +1464,7 @@ class Run:
         file = self.record.file("plans", f"{self._position:03d}-{entry.component}-migrate.txt")
         file.write_text("\n".join(call.stderr) + "\n", encoding="utf-8")
         summary = f"applied {', '.join(units)}" if units else "configuration migrated"
-        block.lines = [
-            line for line in block.lines if line.label not in ("Step Plan:", "Plan File:", "Decision:")
-        ]
+        block.lines = [line for line in block.lines if line.label not in DECISION_LABELS]
         block.add(
             "Step Plan:",
             summary + (f", committed as {commit[:12]}" if commit else ", which changed no tracked file"),
@@ -1423,9 +1527,11 @@ class Run:
     # The walk's plan skip ---------------------------------------------------------------
 
     def skipping(self) -> bool:
-        """Whether rule C holds: in an upgrade, since its drift check, nothing but
-        repository-only steps has applied, a `migrate` counting as one when every unit it
-        applied is a configuration unit, and the run hasn't waited on outside work or resumed."""
+        """Whether rule C holds: in an upgrade, since its drift check, nothing has applied but
+        steps declared to write only their repositories or to change nothing a Terraform root
+        reads, a `migrate` counting as one when every unit it applied is a configuration unit,
+        and the run hasn't waited on outside work or resumed after any stop but a decision, nor
+        found a decision's step with nothing left to apply on resuming."""
         data = self.record.data
         return self.upgrading and "drift_plans" in data and not data.get("plan_skip_off")
 
@@ -1442,11 +1548,21 @@ class Run:
             self.screen.labelled("Plan Skip:", line)
 
     def applied_change(self, entry: Entry, block: Block) -> None:
-        """An applied step ends rule C unless it writes only its repositories, as its
-        declaration says. A `migrate` is judged once the target's declarations, which name
-        each unit's kind, read: `migrated`."""
-        if entry.kind != "migrate" and not entry.repository_only:
+        """An applied step ends rule C unless it writes only its repositories or changes nothing
+        a Terraform root reads, as its declaration says. A `migrate` is judged once the target's
+        declarations, which name each unit's kind, read: `migrated`."""
+        if entry.kind != "migrate" and not (entry.repository_only or entry.affects_no_root):
             self.end_plan_skip(block, f"{entry.where} applied a change")
+
+    def decision_resumed(self, entry: Entry, block: Block, outcome: str) -> None:
+        """A decision's resume carries on at the step the run stopped at. Should it finish
+        without applying, its plan changed while the run stood still, as when a person applied
+        it alone, so rule C ends, whether or not the step is declared."""
+        if entry.id != self.record.data.get("decision_resumed") or outcome not in FINISHED:
+            return
+        del self.record.data["decision_resumed"]
+        if outcome != "applied":
+            self.end_plan_skip(block, f"{entry.where}'s plan changed while the run stood still")
 
     def migrated(self, declarations: dict[tuple[str, str], Declaration]) -> None:
         """Each `migrate` that applied only configuration units, as its component's target
@@ -1554,18 +1670,13 @@ class Run:
 
     def target_arguments(self, repository: str) -> list[str]:
         """The owner's `upgrade` target: on `stable`, the Template Version tagged on the
-        manifest's commit; on `canary`, the commit itself. 2026.4's engine works out the
-        channel from the target's form. A target on 2026.3's engine takes the channel too,
-        since that engine otherwise takes the channel the repository records and resolves a
-        commit only on `canary`; that goes at the next stop."""
+        manifest's commit; on `canary`, the commit itself. The engine works out the channel from
+        the target's form."""
         targets = self.record.data.setdefault("targets", {})
         if repository not in targets:
             commit = self.manifest.sources[repository]
             target = self.template_version(repository, commit) if self.channel == "stable" else commit
-            arguments = ["--to", target]
-            if repository in self.record.data.get("schema_1_targets", []):
-                arguments = ["--channel", self.channel, *arguments]
-            targets[repository] = arguments
+            targets[repository] = ["--to", target]
             self.record.save()
         return list(targets[repository])
 
@@ -1645,18 +1756,20 @@ class Run:
             seen.append(identifier)
             self.record.save()
         block.outcome = "change"
-        block.lines = [
-            line for line in block.lines if line.label not in ("Step Plan:", "Plan File:", "Decision:")
-        ]
+        block.lines = [line for line in block.lines if line.label not in DECISION_LABELS]
         block.add("Step Plan:", decision.get("summary") or "a change")
         shown_plan = plan_file is not None and plan_file.exists() and plan_file.stat().st_size > 0
         if shown_plan:
             block.add("Plan File:", self.relative(plan_file))
         block.add("Decision:", identifier)
+        notes = self.notes_line()
+        if notes:
+            block.add("Release Notes:", notes)
         if self.session.interactive:
             key = self.screen.ask(block, [("y", "apply"), ("n", "stop the run here")], "Apply this step?")
             if key == "y":
                 approvals.append(identifier)
+                block.lines = [line for line in block.lines if line.label != "Release Notes:"]
                 block.outcome = "applying"
                 return
             raise Stop(
@@ -1668,6 +1781,7 @@ class Run:
                     Next("dp-instance resume", f"shows {entry.where}'s plan for review again"),
                     *self.again(),
                 ),
+                **self.notes_detail(),
             )
         # The steps before this one have finished, so a resume needs only the decisions this
         # entry has asked for.
@@ -1692,6 +1806,7 @@ class Run:
                 ),
                 Next("dp-instance resume", "at a terminal, shows the plan and asks"),
             ),
+            **self.notes_detail(),
         )
 
     def handoff(self, entry: Entry, block: Block, call: Call, cli: Cli) -> None:
@@ -1846,9 +1961,7 @@ class Run:
         for event in call.finished():
             self.optional(event)
         # A decision's lines give way to what each step did.
-        block.lines = [
-            line for line in block.lines if line.label not in ("Step Plan:", "Plan File:", "Decision:")
-        ]
+        block.lines = [line for line in block.lines if line.label not in DECISION_LABELS]
         for step in steps:
             said = (step["summary"] or "applied") if step["status"] == "applied" else "no change"
             block.add("Step Plan:", f"{step['step']}: {said}")
@@ -2029,12 +2142,14 @@ class Run:
         block.add("Log:", self.relative(self.record.log_path))
 
     def failure(self, entry: Entry, block: Block, call: Call) -> None:
+        """A step's failure stops the run: a read that looked temporary for a resume once the
+        service answers."""
         block.add("Failure:", call.message)
         self.excerpt(block, call)
         raise Stop(
             "failed",
             f"{entry.where} failed: {call.message}",
-            reason="failed",
+            reason="transient" if call.temporary is not None else "failed",
             next=(
                 Next("dp-instance resume", f"carries on from {entry.where} once the failure is fixed"),
                 *self.again(),
@@ -2049,18 +2164,32 @@ class Run:
             if isinstance(item, dict) and not item.get("required"):
                 seen[item.get("id", item.get("title"))] = item
 
-    def recommend(self) -> None:
+    def recommend(self) -> list[dict]:
         """The optional outside work a completed run recorded, on one line: each system with
-        how many pieces it holds, and the folder of their pages, which say what and why."""
+        how many pieces it holds, and the folder of their pages, which say what and why. For
+        --json, the same systems, each with its page and its pieces."""
         optional = list(self.record.data.get("optional", {}).values())
         if not optional:
-            return
-        self.pages([])
-        systems = ", ".join(
-            f"{handoffs.system_name(system)} ({count})" for system, count in by_system(optional).items()
-        )
+            return []
+        pages = self.pages([])
+        counted = by_system(optional)
+        systems = ", ".join(f"{handoffs.system_name(system)} ({count})" for system, count in counted.items())
         self.screen.blank()
         self.screen.labelled("Recommended optional handoff:", f"{systems} · handoffs/")
+        return [
+            {
+                "system": system,
+                "name": handoffs.system_name(system),
+                "required": False,
+                "page": self.relative(pages[system]),
+                "items": [
+                    {"id": item.get("id"), "title": item.get("title")}
+                    for item in sorted(optional, key=lambda item: item.get("id", ""))
+                    if item.get("system", "other") == system
+                ],
+            }
+            for system in counted
+        ]
 
     def pages(self, sections: list[dict]) -> dict[str, Path]:
         if self._asked_by is None:
@@ -2095,6 +2224,20 @@ class Run:
             )
         return found
 
+    def step_alone(self, entry: Entry | None, reason: str) -> tuple[Next, ...]:
+        """A run's failed step, by its own command in its repository, which a person applies
+        alone only once its plan has been reviewed."""
+        if reason != "failed" or entry is None or entry.kind != "step" or not self.change:
+            return ()
+        return (
+            Next(
+                f"uv run --locked {entry.command} apply --phase {entry.phase} --step {entry.step} "
+                f'{" ".join(self.version)} --change "{self.change}"',
+                f"in {self.checkout(entry.repository)}: only once the accountable person has reviewed its "
+                "plan; then dp-instance resume",
+            ),
+        )
+
     def stopped(self, stop: Stop) -> Result:
         entry, block = self._entry, self._block
         reason = stop.detail.get("reason", stop.status)
@@ -2118,7 +2261,7 @@ class Run:
         if reason == "sign-in" and not any(item.command == "dp-instance resume" for item in next_steps):
             # A read that waits for a sign-in inside a run: the run goes on from here once signed in.
             next_steps = (*next_steps, Next("dp-instance resume", "carries on from here once signed in"))
-        steps = (*next_steps, *self.hold_lines())
+        steps = (*next_steps, *self.hold_lines(), *self.step_alone(entry, reason))
         detail = {key: value for key, value in stop.detail.items() if key != "reason"}
         self.record.stop(
             stop.status,

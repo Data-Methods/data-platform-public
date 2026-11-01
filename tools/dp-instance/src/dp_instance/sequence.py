@@ -23,9 +23,8 @@ MERGE = "merge"
 # The output an owner's `merge` publishes once a run has applied every other phase of its
 # repository: the commit it landed on `main`.
 MERGED_COMMIT = "merged_commit"
-# The `steps --json` schemas this dp-instance reads: 2026.4's, and 2026.3's during the upgrade
-# to 2026.4. Schema 1 goes at the next stop.
-SCHEMAS = (1, 2)
+# The `steps --json` schemas this dp-instance reads.
+SCHEMAS = (2,)
 
 
 @dataclass(frozen=True)
@@ -33,7 +32,7 @@ class Step:
     name: str
     description: str
     enabled: bool | None
-    # Whether the step writes only its repositories. Schema 1 declares none.
+    # Whether the step writes only its repositories.
     repository_only: bool = False
     # The later step of the same component its effect lasts until, such as `hold`'s `release`.
     holds_until: str | None = None
@@ -41,6 +40,8 @@ class Step:
     kind: str = "native"
     # The names of the Component Outputs it publishes.
     outputs: tuple[str, ...] = ()
+    # Whether the step changes nothing a Terraform root reads: engine 0.19.0 on.
+    affects_no_root: bool = False
 
 
 @dataclass(frozen=True)
@@ -78,9 +79,7 @@ class Declaration:
     upgrade: Phase | None
     migrate: str | None
     phases: tuple[Phase, ...]
-    # Its `steps --json` schema: 2, or 2026.3's 1.
-    schema: int
-    # The `migrate` units. Schema 1 lists none.
+    # The `migrate` units.
     units: tuple[Unit, ...] = ()
     # Whether its `apply` takes the walk's plan skip, `--planned` and
     # `--unchanged-since-planned`: engine 0.16.0 on.
@@ -128,6 +127,7 @@ def _phase(data: dict) -> Phase:
                 step.get("holds_until"),
                 step.get("kind") or "native",
                 tuple(step.get("outputs") or ()),
+                bool(step.get("affects_no_root", False)),
             )
             for step in data.get("steps", [])
         ),
@@ -136,7 +136,7 @@ def _phase(data: dict) -> Phase:
 
 
 def declaration(document: dict, command: str) -> Declaration:
-    """Read a component's `steps --json`, at schema 2 or 1."""
+    """Read a component's `steps --json`."""
     try:
         if document.get("schema_version") not in SCHEMAS:
             raise ValueError
@@ -151,7 +151,6 @@ def declaration(document: dict, command: str) -> Declaration:
             _phase(upgrade) if upgrade else None,
             migrate["description"] if migrate else None,
             tuple(_phase(phase) for phase in document.get("phases", [])),
-            document["schema_version"],
             tuple(
                 Unit(unit["name"], unit["kind"], unit.get("versions"))
                 for unit in (migrate or {}).get("units") or []
@@ -193,6 +192,8 @@ class Entry:
     holds_until_phase: str = ""
     # Whether the step writes only its repositories, as its declaration says.
     repository_only: bool = False
+    # Whether the step changes nothing a Terraform root reads, as its declaration says.
+    affects_no_root: bool = False
     # A Terraform step whose component's `apply` takes the walk's plan skip.
     plan_skip: bool = False
     # A native step whose component's `apply` takes `--unchanged`.
@@ -291,6 +292,7 @@ class Plan:
                 holds_until=step.holds_until or "",
                 holds_until_phase=declared.phase_of(step.holds_until) if step.holds_until else "",
                 repository_only=step.repository_only,
+                affects_no_root=step.affects_no_root,
                 plan_skip=declared.plan_skip and step.kind == "terraform",
                 unchanged_native=declared.unchanged_natives and step.kind == "native",
                 **self._base(repository, component, kind, upgrade),

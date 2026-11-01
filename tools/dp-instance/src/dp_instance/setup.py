@@ -1,14 +1,17 @@
 """`dp-instance setup`: map the instance's repositories.
 
-It scans the current folder and any paths already in `dp-instance.json`, recognising each
-Component Repository by its template source record; reads the instance's published Component
-Outputs through the Client Infrastructure Repository, whose registrations name every
-repository the instance has, each component's own and the Managed Repositories it lists, and
-checks each registered repository alike; shows what it found, what's missing, duplicated or on
-another remote; and on approval writes the map. It refuses while a repository the instance has
-is missing or on another remote, naming the `git clone` for each, and in a folder with no
-Component Repository it names the one to clone first: the Client Infrastructure Repository. It
-never moves, clones or deletes anything, and refuses a folder a sync client manages.
+It scans the current folder and any paths already in the repository map, recognising each
+Component Repository by its template source record. Like every command that finds an
+instance, it first refuses one older than this dp-instance upgrades from, as the checkouts it
+found record it, and then moves a map from before Platform 2026.5.0 into `.dp-instance/`. It
+reads the instance's published Component Outputs through the Client Infrastructure
+Repository, whose registrations name every repository the instance has, each component's own
+and the Managed Repositories it lists, and checks each registered repository alike; shows what
+it found, what's missing, duplicated or on another remote; and on approval writes the map,
+`.dp-instance/repositories.json`. It refuses while a repository the instance has is missing or
+on another remote, naming the `git clone` for each, and in a folder with no Component
+Repository it names the one to clone first: the Client Infrastructure Repository. It never
+moves, clones or deletes a repository, and refuses a folder a sync client manages.
 """
 
 from __future__ import annotations
@@ -20,7 +23,7 @@ from pathlib import Path
 
 from rich.text import Text
 
-from . import gitops, synced
+from . import gitops, synced, targets
 from .components import Cli, Log
 from .instance import (
     INFRASTRUCTURE,
@@ -30,11 +33,13 @@ from .instance import (
     Mapped,
     SourceRecord,
     managed_registrations,
+    map_path,
     registrations,
     stored_path,
 )
 from .outcome import Next, Result, Stop, failed
 from .screen import Screen
+from .session import move_map, releases_of
 
 START = (
     Next(
@@ -176,7 +181,7 @@ def setup(start: Path, screen: Screen, approvals: tuple[str, ...]) -> Result:
         )
     screen.begin("the checkouts")
     existing = None
-    if (root / MAP_FILE).is_file():
+    if map_path(root) is not None:
         try:
             existing = Instance.load(root)
         except Stop:
@@ -191,6 +196,10 @@ def setup(start: Path, screen: Screen, approvals: tuple[str, ...]) -> Result:
             next=START,
             folder=str(root),
         )
+    targets.refuse_older(
+        {template: paths[0] for template, paths in found.components.items()}, releases_of(root)
+    )
+    move_map(root, screen)
     problems: list[str] = []
     for path in [*(p for paths in found.components.values() for p in paths), *found.others]:
         provider = synced.provider(path)
@@ -292,19 +301,20 @@ def setup(start: Path, screen: Screen, approvals: tuple[str, ...]) -> Result:
             raise Stop(
                 "decision",
                 "Review what setup found, then approve it to write the map.",
-                next=(Next(command, f"writes {MAP_FILE} as shown"),),
-                decision={"id": identifier, "summary": f"write {MAP_FILE}", "resume": command},
+                next=(Next(command, f"writes {MAP_FILE.as_posix()} as shown"),),
+                decision={"id": identifier, "summary": f"write {MAP_FILE.as_posix()}", "resume": command},
                 **detail,
             )
-        if screen.choose([("y", f"write {MAP_FILE}"), ("n", "stop")], "Look good?") != "y":
+        if screen.choose([("y", f"write {MAP_FILE.as_posix()}"), ("n", "stop")], "Look good?") != "y":
             raise Stop("decision", "Nothing was written.", **detail)
     path = proposed.save()
-    proposed.prepare()
     screen.blank()
     screen.labelled("Written:", str(path))
     steps = (
-        Next("dp-instance status", "shows where the instance stands"),
-        Next("dp-instance template-access check", "checks the template access each repository uses"),
+        Next(
+            "dp-instance template-access setup",
+            "restores each mapped template's key from the vault and sets up its access",
+        ),
     )
     screen.next_block(steps)
-    return Result("setup", "done", f"Wrote {MAP_FILE}.", steps, detail)
+    return Result("setup", "done", f"Wrote {MAP_FILE.as_posix()}.", steps, detail)

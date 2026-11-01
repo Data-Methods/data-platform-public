@@ -59,17 +59,24 @@ def holders(session: Session, operation: str) -> tuple[list[Holder], record.Reco
     return found, run
 
 
-def _listing(session: Session, found: list[Holder]) -> list[tuple[Holder, dict]]:
+def _listing(session: Session, found: list[Holder], doing: str) -> list[tuple[Holder, dict]]:
+    """Every component's secrets, one component at a time. At a terminal a spinner says which,
+    after ``doing``: "Reading data-engineering's secrets (4 of 8)"."""
+    screen = session.screen
     secrets = []
-    for holder in found:
-        call = holder.cli.run("secret", "list", "--json")
-        if call.status == "usage":
-            continue  # the component keeps no secrets, so it has no `secret` commands
-        if call.status in WAITS:
-            raise _waiting(call)
-        if call.status != "done":
-            raise failed(f"{holder.component} couldn't list its secrets: {call.message}")
-        secrets += [(holder, event) for event in call.events if event.get("event") == "secret"]
+    reading = f"{doing} every component's secrets"
+    with screen.console.status(reading) if screen.interactive else nullcontext() as status:
+        for number, holder in enumerate(found, 1):
+            if status is not None:
+                status.update(f"{doing} {holder.component}'s secrets ({number} of {len(found)})")
+            call = holder.cli.run("secret", "list", "--json")
+            if call.status == "usage":
+                continue  # the component keeps no secrets, so it has no `secret` commands
+            if call.status in WAITS:
+                raise _waiting(call)
+            if call.status != "done":
+                raise failed(f"{holder.component} couldn't list its secrets: {call.message}")
+            secrets += [(holder, event) for event in call.events if event.get("event") == "secret"]
     return secrets
 
 
@@ -81,7 +88,8 @@ def _unknown(name: str) -> Stop:
 
 
 def _owner(session: Session, found: list[Holder], name: str) -> Holder:
-    owners = [holder for holder, event in _listing(session, found) if event.get("name") == name]
+    listed = _listing(session, found, f"Finding {name}: reading")
+    owners = [holder for holder, event in listed if event.get("name") == name]
     if not owners:
         raise _unknown(name)
     return owners[0]
@@ -93,8 +101,7 @@ def list_secrets(session: Session, name: str | None) -> Result:
     rows = [("instance", session.instance.key), *([("secret", name)] if name else [])]
     screen.header("secret list", *rows)
     screen.begin("the secrets")
-    with screen.console.status("Reading every component's secrets") if screen.interactive else nullcontext():
-        secrets = _listing(session, found)
+    secrets = _listing(session, found, "Reading")
     if name:
         secrets = [(holder, event) for holder, event in secrets if event.get("name") == name]
         if not secrets:
@@ -261,7 +268,9 @@ def set_secret(session: Session, name: str) -> Result:
     screen.begin(holder.component)
     screen.blank()
     screen.labelled("Component Name:", Text(holder.component, style="bold"))
-    asked = holder.cli.run("secret", "set", name, "--json")
+    asking = f"Asking {holder.component} which values {name} takes"
+    with screen.console.status(asking) if screen.interactive else nullcontext():
+        asked = holder.cli.run("secret", "set", name, "--json")
     if asked.status == "usage":
         raise failed(
             f"{holder.component}'s engine predates secret set, so it can't set {name}; "

@@ -11,7 +11,7 @@ the instance is mapped, as at a first deployment, that of the checkout the comma
 whose record and instance key it reads as a map's, refusing an `--instance` that differs.
 Before the configuration names a vault, or before Azure has it, the key stays on the
 workstation alone. With no template named, `setup`
-restores and sets up every template in `dp-instance.json` whose key the vault holds, and names
+restores and sets up every template in the repository map whose key the vault holds, and names
 any the instance has no access to yet. `check` confirms the key, the vault match, the SSH
 configuration and, with `git ls-remote`, every mapped template's reach through its alias, naming
 each repository by its GitHub HTTPS URL.
@@ -23,8 +23,7 @@ For a template whose source record names plain or HTTPS github.com, the rule sen
 that URL through the alias, Git's `url.<alias URL>.insteadOf`, reaches only the Git commands
 and component CLIs dp-instance starts, through Git's environment configuration: a checkout of
 the template's own repository, such as its development repository's on a workstation that
-also develops it, keeps its own access. `setup` removes the global rules earlier versions
-added.
+also develops it, keeps its own access.
 
 The SSH configuration names its files in `~/.ssh`, the `Include` relative to it and each key
 under `~`, which every OpenSSH resolves in its own home alike, Git for Windows' bundled one
@@ -59,7 +58,7 @@ from pathlib import Path
 from rich.text import Text
 
 from . import gitops, processes
-from .instance import INFRASTRUCTURE, Instance, SourceRecord
+from .instance import INFRASTRUCTURE, Instance, SourceRecord, unmapped_infrastructure
 from .outcome import Next, Result, Stop, failed
 from .screen import Screen
 
@@ -70,9 +69,6 @@ SETUP = Path("config/infrastructure/component_setup.json")
 DEVELOPMENT = gitops.DEVELOPMENT_SUFFIX
 # A source record naming GitHub itself rather than the instance's alias, and its path.
 GITHUB_URL = re.compile(r"(?:git@github\.com:|https://github\.com/)(.+)")
-# A global Git rule earlier setups wrote, as Git lists it: through an alias, `dm-<instance>-
-# <template>`, and the path its GitHub URL names.
-EARLIER_RULE = re.compile(r"url\.git@(dm-[a-z0-9]+(?:-[a-z0-9]+)*):(.+)\.insteadof")
 UNMAPPED = "not checked: no mapped repository uses this template"
 # What Azure answers, reading a secret, for a vault name it may have no vault for: a name that
 # doesn't resolve, named in the error with the vault's host, or a vault it reports not found. A
@@ -570,27 +566,6 @@ def _pass_rules(key: str, start: Path) -> None:
     gitops.pass_configuration(_rules(key, _checkouts(start)))
 
 
-def remove_global_rules() -> list[str]:
-    """Remove every global Git rule of the shape earlier setups wrote, whichever instance's and
-    whatever keys remain here, since one left there would outrank the instance's own: what was
-    removed. No other rule is touched."""
-    listed = gitops.git("config", "--global", "--get-regexp", r"^url\..*\.insteadof$", check=False)
-    found = []
-    for line in listed.stdout.splitlines():
-        rule, _, url = line.partition(" ")
-        match = EARLIER_RULE.fullmatch(rule)
-        source = GITHUB_URL.fullmatch(url)
-        if match and source and source.group(1) == match.group(2):
-            found.append((rule, match.group(1), url))
-    if found:
-        gitops.require_configuration_environment()
-    removed = []
-    for rule, alias, url in dict.fromkeys(found):
-        gitops.git("config", "--global", "--fixed-value", "--unset-all", rule, url)
-        removed.append(f"Removed the global Git rule fetching {url} through {alias}.")
-    return removed
-
-
 def _reads_through_alias(start: Path, access: Access) -> bool:
     """Whether a mapped repository's source record reads the template through the instance's
     alias."""
@@ -665,11 +640,7 @@ def _infrastructure(start: Path) -> Path | None:
     try:
         mapped = Instance.find(start).infrastructure
     except Stop:
-        folder = next((item for item in (start, *start.parents) if (item / ".git").exists()), None)
-        if folder is None:
-            return None
-        record = SourceRecord.read(folder)
-        return folder if record is not None and record.template == INFRASTRUCTURE else None
+        return unmapped_infrastructure(start)
     return mapped.path if mapped is not None else None
 
 
@@ -720,7 +691,8 @@ def _refuse_a_second_key(
         "Platform Infrastructure Key Vault; a new one would need registering again. Nothing was created.",
         Next(
             command,
-            "restores the instance's key and its SSH host alias, once dp-instance.json maps the Client "
+            "restores the instance's key and its SSH host alias, once .dp-instance/repositories.json maps "
+            "the Client "
             f"Infrastructure Repository, whose {FOUNDATION.as_posix()} names the vault",
         ),
     )
@@ -793,7 +765,7 @@ def setup(
     instance: str | None,
     development: bool,
 ) -> Result:
-    """One template's access, or, with none named, every template's in `dp-instance.json` whose
+    """One template's access, or, with none named, every template's in the repository map whose
     key the vault holds, with each development repository's key the vault holds. The vault is
     the one the Client Infrastructure Repository's configuration names, the mapped one's or,
     before the instance is mapped, the checkout's setup runs in; without one, or before the vault
@@ -816,7 +788,6 @@ def setup(
         *(("az",) if key_vault else ()),
     ):
         processes.executable(tool)
-    removed = remove_global_rules()
     if every is None:
         started = time.monotonic()
         access = Access(key, template + (DEVELOPMENT if development else ""))
@@ -835,7 +806,7 @@ def setup(
         reports = [report]
     else:
         reports = [report for name in every for report in _restore(start, key, name, key_vault)]
-    _show(screen, key, reports, removed, single=every is None, key_vault=key_vault)
+    _show(screen, key, reports, single=every is None, key_vault=key_vault)
 
     detail = (
         reports[0].describe(key_vault)
@@ -854,27 +825,51 @@ def setup(
             steps,
             {"instance": key, **detail},
         )
+    steps = (
+        (
+            Next(
+                "dp-instance template-access check",
+                "checks the new key's access once Data Methods registers it",
+            ),
+        )
+        if any(report.created for report in reports)
+        else _status_next(start)
+    )
+    if steps:
+        screen.next_block(steps)
     return Result(
         "template-access setup",
         "done",
         "Template access is set up locally.",
-        detail={"instance": key, **detail},
+        steps,
+        {"instance": key, **detail},
     )
 
 
+def _status_next(start: Path) -> tuple[Next, ...]:
+    """What comes after template access with no problems, in a mapped instance folder."""
+    if not _mapped_templates(start):
+        return ()
+    return (Next("dp-instance status", "shows where the instance stands and names what comes next"),)
+
+
 def _every_template(start: Path, key: str, key_vault: str | None) -> list[str]:
-    """With no template named: every template `dp-instance.json` maps, restored from the vault,
+    """With no template named: every template the repository map holds, restored from the vault,
     which must exist."""
     if not key_vault:
         raise failed(
-            "Name a template, or run this in the instance folder once dp-instance.json maps the Client "
+            "Name a template, or run this in the instance folder once .dp-instance/repositories.json maps "
+            "the Client "
             f"Infrastructure Repository, whose {FOUNDATION.as_posix()} names the Platform Infrastructure "
             "Key Vault to restore every template's key from.",
             Next("dp-instance template-access setup <template>", "sets up one template's access"),
         )
     templates = _mapped_templates(start)
     if not templates:
-        raise failed("Name a template, or run this in a mapped instance folder: dp-instance.json names them.")
+        raise failed(
+            "Name a template, or run this in a mapped instance folder: .dp-instance/repositories.json names "
+            "them."
+        )
     if existing_vault(key_vault, Access(key, templates[0]).secret, _subscription(start)) is None:
         raise failed(
             f"Key Vault {key_vault}, which {FOUNDATION.as_posix()} names, doesn't exist yet, so there are "
@@ -1000,19 +995,13 @@ def _show(
     screen: Screen,
     instance: str,
     reports: list[Report],
-    removed: list[str],
     *,
     single: bool,
     key_vault: str | None,
 ) -> None:
-    """The global rules removed, then each template's setup; the request to register a key
-    only for one setup just created."""
+    """Each template's setup; the request to register a key only for one setup just created."""
     rows = [("instance", instance)] + ([("template", reports[0].access.template)] if single else [])
     screen.header("template-access setup", *rows)
-    if removed:
-        screen.blank()
-    for line in removed:
-        screen.note(line)
     for report in reports:
         screen.blank()
         if not single:
@@ -1053,7 +1042,7 @@ def _checkouts(start: Path) -> dict[str, Path]:
     try:
         instance = Instance.find(start)
     except Stop:
-        infrastructure = _infrastructure(start.resolve())
+        infrastructure = unmapped_infrastructure(start.resolve())
         return {INFRASTRUCTURE: infrastructure} if infrastructure is not None else {}
     return {template: mapped.path for template, mapped in instance.components.items()}
 
@@ -1070,7 +1059,7 @@ def _clone_urls(start: Path, template: str) -> list[str]:
 
 
 def _mapped_templates(start: Path) -> list[str]:
-    """The templates of the Component Repositories `dp-instance.json` maps, when it's there."""
+    """The templates of the Component Repositories the repository map holds, when it's there."""
     try:
         return list(Instance.find(start).components)
     except Stop:
@@ -1247,6 +1236,9 @@ def check(
         )
     screen.blank()
     screen.note("Template access is in order.", "bold green")
+    steps = _status_next(start)
+    if steps:
+        screen.next_block(steps)
     return Result(
-        "template-access check", "done", "Template access is in order.", detail={"templates": report}
+        "template-access check", "done", "Template access is in order.", steps, {"templates": report}
     )

@@ -26,7 +26,7 @@ from pathlib import Path
 from . import runs, secrets, setup, status, template_access, update, views
 from .outcome import USAGE, Result, Stop
 from .screen import Screen
-from .session import Options, Session, terminal
+from .session import Options, Session, ready_for_template_access, terminal
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -104,7 +104,7 @@ def _parser() -> argparse.ArgumentParser:
         (
             "setup",
             "Set up template access: each key, its vault copy and SSH alias.",
-            "every template in dp-instance.json whose key the Platform Infrastructure Key Vault holds",
+            "every template in the repository map whose key the Platform Infrastructure Key Vault holds",
         ),
         ("check", "Check template access.", "every template set up here or mapped"),
     ):
@@ -150,6 +150,7 @@ def _dispatch(arguments, screen: Screen) -> Result:
     if arguments.command == "setup":
         return setup.setup(start, screen, tuple(arguments.approve))
     if arguments.command == "template-access":
+        ready_for_template_access(start, screen)
         if arguments.access == "setup":
             return template_access.setup(
                 screen,

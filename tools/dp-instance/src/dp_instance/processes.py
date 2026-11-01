@@ -71,6 +71,22 @@ def environment() -> dict[str, str]:
     return values
 
 
+def output(name: str, *arguments: str, cwd: Path | None = None) -> bytes | None:
+    """Run one tool to completion and return what it wrote to stdout as bytes, exactly; None
+    when it fails."""
+    try:
+        process = subprocess.run(
+            [executable(name), *arguments],
+            cwd=cwd,
+            capture_output=True,
+            env=environment(),
+            stdin=subprocess.DEVNULL,
+        )
+    except OSError as error:
+        raise failed(f"{name} could not start: {error.strerror or error}.") from None
+    return process.stdout if process.returncode == 0 else None
+
+
 def run(
     name: str,
     *arguments: str,

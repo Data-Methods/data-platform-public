@@ -5,9 +5,13 @@ manifest whose sources name those commits is the release the instance runs. A re
 `canary` runs unpublished commits, which only canary's own candidate manifests name, kept in
 its completed runs' records on the workstation that ran them; there, the candidate's Platform
 Version is where the instance stands, and its published release is the one it takes. A release
-this dp-instance doesn't run, such as 2026.3's, which names its dp-instance by commit, is taken
+this dp-instance doesn't run, such as one that needs a newer dp-instance, is taken
 with the dp-instance its manifest names. Versions compare whole, so 2026.3.1 is newer than
 2026.3.
+
+Each dp-instance upgrades from one oldest Platform Version on, which rises with its major
+version as a stop's bridges go. Every command that finds an older instance refuses it before
+anything else, writing only the release cache, and names the dp-instance its next stop runs.
 """
 
 from __future__ import annotations
@@ -17,9 +21,21 @@ from pathlib import Path
 
 from . import installed
 from . import record as records
-from .instance import SETUP, Instance, SourceRecord
-from .manifest import Manifest, Releases, family, read_file, version_key
+from .instance import SETUP, Instance, SourceRecord, applied_record
+from .manifest import (
+    Manifest,
+    Releases,
+    family,
+    install_command,
+    minimum_of,
+    read_file,
+    tool_tag,
+    version_key,
+)
 from .outcome import Next, Stop, failed
+
+# The oldest Platform Version this dp-instance upgrades from.
+OLDEST = "2026.4"
 
 
 def records_of(instance: Instance, *, applied: bool = False) -> dict[str, SourceRecord]:
@@ -241,6 +257,89 @@ def check_may_take(instance: Instance, releases: Releases, target: Manifest) -> 
             *upgrade_steps(releases, stop, "takes the next required stop"),
         )
     return found
+
+
+def _sources(document: dict) -> dict:
+    found = document.get("sources")
+    return found if isinstance(found, dict) else {}
+
+
+def older_release(recorded: dict[str, SourceRecord], documents: list[tuple[str, dict]]) -> str | None:
+    """The release before OLDEST that the records say the instance runs, or None. It's the
+    release the stable records match; when they match none, as a run from such a release that
+    stopped part way leaves them, the newest that names every commit only releases before
+    OLDEST name, or else the newest that names one."""
+    oldest = version_key(OLDEST)
+    stable = {key: value for key, value in recorded.items() if value.channel == "stable"}
+    runs = next((version for version, document in documents if stable and matches(document, stable)), None)
+    if runs is not None:
+        return runs if version_key(runs) < oldest else None
+    before = [(version, document) for version, document in documents if version_key(version) < oldest]
+    since = {
+        (template, commit)
+        for version, document in documents
+        if version_key(version) >= oldest
+        for template, commit in _sources(document).items()
+    }
+    left = {
+        template: found
+        for template, found in recorded.items()
+        if (template, found.commit) not in since
+        and any(_sources(document).get(template) == found.commit for _, document in before)
+    }
+    if not left:
+        return None
+    return next((version for version, document in before if matches(document, left)), None) or next(
+        version
+        for version, document in before
+        if any(_sources(document).get(template) == found.commit for template, found in left.items())
+    )
+
+
+def refuse_older(checkouts: dict[str, Path], releases: Releases) -> None:
+    """Stop when the instance runs a release before OLDEST, as each Component Repository's `main`
+    records it, naming the dp-instance its next stop runs. A record that can't be read says
+    nothing. Only the release cache is written."""
+    if all(version_key(version) >= version_key(OLDEST) for version in releases.published()):
+        return
+    recorded = {}
+    for template, checkout in checkouts.items():
+        try:
+            found = applied_record(checkout)
+        except Stop:
+            continue
+        if found is not None:
+            recorded[template] = found
+    documents = releases.documents()
+    version = older_release(recorded, documents)
+    if version is None:
+        return
+    own = installed.version()
+    shown = f"dp-instance {own}" if own else "a local copy of dp-instance"
+    message = (
+        f"This instance runs Platform {version}, and {shown} upgrades from Platform {OLDEST} on; "
+        "nothing has changed."
+    )
+    stop = next_release(releases, version)
+    minimum = minimum_of(dict(documents).get(stop) or {}) if stop else None
+    steps: tuple[Next, ...] = ()
+    if minimum is not None:
+        message += (
+            f" Use dp-instance {minimum} until the instance runs Platform {stop}; dp-instance update "
+            "installs this version again."
+        )
+        steps = (
+            Next(install_command(tool_tag(minimum)), f"installs the dp-instance Platform {stop} runs"),
+            Next("dp-instance upgrade", f"takes Platform {stop}, the next required stop"),
+        )
+    raise Stop(
+        "failed",
+        message,
+        next=steps,
+        reason="older-than-supported",
+        platform_version=version,
+        oldest_platform_version=OLDEST,
+    )
 
 
 def target(releases: Releases, version: str | None, file: str | None) -> tuple[Manifest, str]:

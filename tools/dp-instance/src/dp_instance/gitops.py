@@ -11,6 +11,7 @@ import re
 import shutil
 import stat
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -19,6 +20,8 @@ from .outcome import Stop, failed
 
 COMMIT = re.compile(r"^[0-9a-f]{40}$")
 DEVELOPMENT_SUFFIX = "-dev"
+# GitHub's answer, over HTTPS and SSH alike, for a repository it doesn't have.
+NOT_FOUND = "repository not found"
 # The first Git that reads configuration from its environment, `GIT_CONFIG_COUNT`.
 CONFIGURATION_ENVIRONMENT = (2, 31)
 
@@ -27,14 +30,19 @@ def git(*arguments: str, cwd: Path | None = None, check: bool = True) -> process
     return processes.run("git", *arguments, cwd=cwd, check=check)
 
 
-def remote_git(*arguments: str, cwd: Path | None = None) -> processes.Completed:
-    """A Git command that reaches a remote. A failure that looks temporary, such as a dropped
-    connection, is retried after a wait, up to three times; the last failure stops, saying
-    whether it looked temporary."""
+def remote_git(
+    *arguments: str,
+    cwd: Path | None = None,
+    answer: Callable[[processes.Completed], bool] | None = None,
+) -> processes.Completed:
+    """A Git command that reaches a remote. A failure ``answer`` accepts is the remote's answer,
+    returned as it is. Any other that looks temporary, such as a dropped connection, is retried
+    after a wait, up to three times; the last failure stops, saying whether it looked
+    temporary."""
     retried = 0
     while True:
         found = git(*arguments, cwd=cwd, check=False)
-        if found.ok:
+        if found.ok or (answer is not None and answer(found)):
             return found
         temporary = transient.classify(found.stderr)
         if not transient.retries(temporary, retried, label=f"git {arguments[0]}"):
@@ -114,9 +122,13 @@ def commit_of(path: Path) -> str | None:
     return (found.stdout.strip() or None) if found.ok else None
 
 
-def uncommitted(path: Path) -> list[str]:
-    """The tracked files in a checkout with changes not committed yet, staged or not."""
-    entries = iter(git("status", "--porcelain=v1", "-z", "--untracked-files=no", cwd=path).stdout.split("\0"))
+def uncommitted(path: Path, *, untracked: bool = False) -> list[str]:
+    """The tracked files in a checkout with changes not committed yet, staged or not, and with
+    ``untracked``, the files Git doesn't track and doesn't ignore."""
+    shown = "all" if untracked else "no"
+    entries = iter(
+        git("status", "--porcelain=v1", "-z", f"--untracked-files={shown}", cwd=path).stdout.split("\0")
+    )
     files = []
     for entry in entries:
         if not entry:
@@ -171,6 +183,26 @@ def on_origin(path: Path, name: str) -> bool:
     """Whether the checkout's origin has the branch, asked of origin itself, once: a failure
     stops, naming Git's own first line of error."""
     return bool(git("ls-remote", "--heads", "origin", f"refs/heads/{name}", cwd=path).stdout.strip())
+
+
+def origin_has_main(path: Path) -> bool:
+    """Whether the checkout's origin has a `main`, asked of origin itself: a repository a run
+    created and stopped before pushing has none. Nor does one GitHub doesn't have yet, which it
+    answers with "Repository not found", while the checkout has never fetched a `main` from it.
+    Any other failure stops, naming it, once a temporary one's retries are spent."""
+    fetched = git("rev-parse", "--verify", "--quiet", "refs/remotes/origin/main", cwd=path, check=False).ok
+
+    def absent(found: processes.Completed) -> bool:
+        return not fetched and found.code == 128 and NOT_FOUND in found.stderr.lower()
+
+    found = remote_git("ls-remote", "origin", "refs/heads/main", cwd=path, answer=absent)
+    return found.ok and bool(found.stdout.strip())
+
+
+def blob(path: Path, revision: str, file: str) -> bytes | None:
+    """A file's bytes at a revision, exactly as committed, or None when either is missing
+    locally."""
+    return processes.output("git", "cat-file", "blob", f"{revision}:{file}", cwd=path)
 
 
 def applied_checkout(source: Path, commit: str, destination: Path) -> Path:
