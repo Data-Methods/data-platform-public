@@ -1,0 +1,121 @@
+{
+  "schema_version": 2,
+  "platform_version": "2026.5.1",
+  "dp_instance": {
+    "minimum": "3.0.0"
+  },
+  "sources": {
+    "data-platform-infrastructure": "c2f4cf2e83a4c1e57c0d8313f4bb75d0b21e7b36",
+    "data-platform-application-identity": "17e3b052526a090ab7498faf585fcc0c6d88d21d",
+    "data-platform-external-ingress-storage": "b1f81b600673545b58a8b0cea8768b92a1aae913",
+    "data-platform-copilot-agent": "65ba07f00a8b8fa9e1c71a2780bf6de43f91af39",
+    "data-platform-customer-agent": "e0ee2a66f9f79f5ab8940ff4e4a32759ff8470b3",
+    "data-platform-example": "cb89fb610f964f3d2e465932de4a90f3741106b4",
+    "data-platform-iot": "3d3b2fb41e0e0a4e270ffd359fcf6070b30677e8",
+    "data-platform-snowflake-account": "6f3af5cf97b526ef91330db2ff986a5d24f1c655"
+  },
+  "order": [
+    {
+      "repository": "data-platform-infrastructure",
+      "components": [
+        {
+          "key": "infrastructure",
+          "command": "dp-infrastructure"
+        },
+        {
+          "key": "datahub",
+          "command": "dp-datahub"
+        },
+        {
+          "key": "jira",
+          "command": "dp-jira"
+        },
+        {
+          "key": "data-engineering",
+          "command": "dp-data-engineering"
+        }
+      ],
+      "after_merge": [
+        {
+          "component": "data-engineering",
+          "phase": "adoption"
+        }
+      ]
+    },
+    {
+      "repository": "data-platform-application-identity",
+      "components": [
+        {
+          "key": "application-identity",
+          "command": "dp-application-identity"
+        }
+      ]
+    },
+    {
+      "repository": "data-platform-external-ingress-storage",
+      "components": [
+        {
+          "key": "external-ingress",
+          "command": "dp-external-ingress"
+        }
+      ]
+    },
+    {
+      "repository": "data-platform-copilot-agent",
+      "components": [
+        {
+          "key": "copilot-agent",
+          "command": "dp-copilot-agent"
+        }
+      ],
+      "after_merge": [
+        {
+          "component": "copilot-agent",
+          "phase": "delivery"
+        }
+      ]
+    },
+    {
+      "repository": "data-platform-customer-agent",
+      "components": [
+        {
+          "key": "customer-agent",
+          "command": "dp-customer-agent"
+        }
+      ],
+      "after_merge": [
+        {
+          "component": "customer-agent",
+          "phase": "delivery"
+        }
+      ]
+    },
+    {
+      "repository": "data-platform-example",
+      "components": [
+        {
+          "key": "example",
+          "command": "dp-example"
+        }
+      ]
+    },
+    {
+      "repository": "data-platform-iot",
+      "components": [
+        {
+          "key": "iot",
+          "command": "dp-iot"
+        }
+      ]
+    },
+    {
+      "repository": "data-platform-snowflake-account",
+      "components": [
+        {
+          "key": "snowflake-account",
+          "command": "dp-snowflake-account"
+        }
+      ]
+    }
+  ]
+}
