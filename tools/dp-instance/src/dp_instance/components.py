@@ -4,10 +4,13 @@ Each component runs as `uv run --locked <command>` in its own checkout, so it ke
 engine version. With `--json` it writes one JSON object per line to stdout, one line as each
 step starts and finishes and a result last, and everything meant for a person to stderr,
 which goes to the run's log. Values a person supplies go to its stdin as one JSON document
-and nowhere else. The engine retries its own reads; a read that still failed the way a network
-or a busy service fails for a moment says so, and isn't run again. A command that fails because
+and nowhere else. The engine retries its own reads, and a failed result names the kind of
+temporary failure it was, when the command changed nothing, which dp-instance reads instead of
+classifying the message; the command isn't run again. A command that fails because
 the Azure CLI's token cache lost the signed-in account is a sign-in to renew, never any other
-failure: one that only reads runs once more first, and one that writes never does.
+failure: one that only reads runs once more first, and one that writes never does. While the
+command holds the run lock, each call first reads the lock's renewer's last result and stops the
+command once the lock is lost.
 """
 
 from __future__ import annotations
@@ -16,7 +19,8 @@ import json
 import subprocess
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -29,7 +33,20 @@ WINDOWS_FILE_LOCK = "os error 1224"
 # processes refreshing the cache at once can leave it: a sign-in to renew, with `az login`.
 AZURE_TOKEN_CACHE = "does not exist in msal token cache"
 # The commands that only read: one the token cache failed runs once more.
-READS = (("steps",), ("outputs", "aggregate"), ("preflight",), ("plan",), ("verify",))
+READS = (("steps",), ("outputs", "aggregate"), ("repo", "adoption"), ("preflight",), ("plan",), ("verify",))
+# What each call checks first while the command holds the run lock.
+_guard: Callable[[], None] | None = None
+
+
+@contextmanager
+def guarded(check: Callable[[], None]) -> Iterator[None]:
+    """Have every component call run ``check`` first, which stops the command by raising."""
+    global _guard
+    _guard = check
+    try:
+        yield
+    finally:
+        _guard = None
 
 
 def read_command(arguments) -> tuple[str, ...] | None:
@@ -72,8 +89,8 @@ class Log:
 
 @dataclass
 class Call:
-    """One component process: its result, the events it wrote and its human lines. A read
-    whose failure looked temporary, after the engine's own retries, holds what it looked like."""
+    """One component process: its result, the events it wrote and its human lines. One whose
+    failed result named a temporary failure, after the engine's own retries, holds its kind."""
 
     status: str
     code: int
@@ -144,6 +161,8 @@ class Cli:
         return [*uv_run(self.command, self.project), *repository, *arguments]
 
     def _once(self, arguments, stdin, on_event, on_line) -> tuple[Call, bool]:
+        if _guard is not None:
+            _guard()
         argv = self.argv(*arguments)
         self.log.command(self.checkout, argv)
         started = time.monotonic()
@@ -234,8 +253,8 @@ class Cli:
         a second failure stands. A command that only reads and that the Azure CLI's token cache
         failed runs once more, as several of its processes refreshing the cache at once can leave
         it for a moment; failing that way again, it waits for a sign-in. One that writes waits for
-        it at once. A read that failed the way a network or a busy service fails for a moment,
-        the engine's own retries spent, holds what it looked like."""
+        it at once. A failed command whose result names a temporary failure, its retries spent
+        and nothing changed, holds its kind."""
         call, retry = self._once(arguments, stdin, on_event, on_line)
         if retry:
             self.log.write("   Windows os error 1224 before the command started: retrying once.")
@@ -249,13 +268,17 @@ class Cli:
             call, _ = self._once(arguments, stdin, on_event, on_line)
         if signed_out(call):
             call.status = "sign-in"
-        if reads and call.status in ("failed", "usage"):
-            call.temporary = transient.classify("\n".join((*call.stderr, call.message)))
+        if call.status == "failed":
+            call.temporary = (call.result or {}).get("temporary") or None
         return call
 
     def document(self, *arguments: str) -> dict:
         """A command that prints one JSON document, such as `steps --json`; one that waits for a
         sign-in stops for it, naming the command that renews it."""
+        return self.document_and_warnings(*arguments)[0]
+
+    def document_and_warnings(self, *arguments: str) -> tuple[dict, list[str]]:
+        """A command's JSON document and each warning it gave a person, a `Warning: ` line."""
         call = self.run(*arguments)
         if call.status != "done":
             message = f"{self.command} {' '.join(arguments)} failed: {call.message}"
@@ -277,4 +300,5 @@ class Cli:
             raise failed(f"{self.command} {' '.join(arguments)} printed no JSON document.") from None
         if not isinstance(found, dict):
             raise failed(f"{self.command} {' '.join(arguments)} printed no JSON object.")
-        return found
+        warnings = [line.removeprefix("Warning: ") for line in call.stderr if line.startswith("Warning: ")]
+        return found, warnings

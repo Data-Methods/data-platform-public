@@ -14,6 +14,7 @@ from pathlib import Path
 
 from . import processes
 from .outcome import Stop
+from .screen import link
 
 SYSTEMS = {
     "azure": "Azure",
@@ -51,6 +52,20 @@ def asker() -> str:
         return "the operator running dp-instance"
     name = found.stdout.strip() if found.ok else ""
     return name or "the operator running dp-instance"
+
+
+def page_link(shown: str, path: Path):
+    """A handoff page's path, which opens the page where the terminal can."""
+    return link(shown, path.resolve().as_uri())
+
+
+def show_optional(screen, systems: dict[str, tuple[int, str, Path]]) -> None:
+    """The optional outside work, a system each: how many items it holds and its page."""
+    screen.stage("Optional Handoffs")
+    for system, (count, shown, path) in systems.items():
+        screen.blank()
+        screen.print(f"{system_name(system)}: {count} item{'s' if count != 1 else ''}")
+        screen.print(page_link(shown, path))
 
 
 def _section(item: dict) -> list[str]:

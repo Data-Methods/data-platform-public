@@ -1,13 +1,13 @@
 # Release Manifests
 
 Each Platform Release has one Release Manifest here, `<Platform Version>.json`, tagged
-`platform-release/<Platform Version>`. `dp-instance upgrade --to <Platform Version>` reads it.
+`platform-release/<Platform Version>`. `dp-instance prepare --to <Platform Version>` reads it.
 A published manifest and its tag never change.
 
 | Field | Meaning |
 | --- | --- |
 | `platform_version` | The Platform Version, `YYYY.N` or `YYYY.N.P`. |
-| `dp_instance` | `minimum`, the oldest `dp-instance` version this release runs; an older one stops with the exact install command. |
+| `dp_instance` | `minimum`, the oldest `dp-instance` version this release runs, read only by `dp-instance` 3.0.0 and older. |
 | `sources` | Each template the release covers and its exact release commit. The template's release notes are in that commit, `docs/releases/<Platform Version>.md`. |
 | `order` | The repositories in the order they run. An instance without a repository skips it. |
 

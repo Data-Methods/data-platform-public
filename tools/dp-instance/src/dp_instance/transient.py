@@ -1,10 +1,9 @@
 """Bounded retries of a read that failed the way a network or a busy service fails for a
 moment: a dropped or refused connection, DNS, a TLS handshake, throttling or a server error.
 
-The engine's classifier, with Git's own words for the same failures, for dp-instance's own Git
-network calls, which it retries, and the component calls that only read, which the engine
-retries itself. A write never retries: a resumed run plans it again. A sign-in to renew never
-retries either.
+Git's own words for these failures, for dp-instance's own Git network calls, which it retries;
+a component's failed result names its own kind. A write never retries: a resumed run plans it
+again. A sign-in to renew never retries either.
 """
 
 from __future__ import annotations

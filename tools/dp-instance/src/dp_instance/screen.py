@@ -1,9 +1,12 @@
 """One screen for every run: a single column with no alignment and no indents.
 
-Every command opens with one line, such as `dp-instance status · dm-canary`, ends each of its
-parts with a line of its time, and ends with its total, as its JSON events and result give
-them too. A run has up to three parts, before anything changes, the code and the platform, each
-named as it starts. Each level is named as it's entered, with its position:
+Every command opens with `dp-instance`, then a line each for its command, its instance and
+what else it knows, each as it becomes known; ends each of its parts with a line of its time,
+and ends with its total, as its JSON events and result give them too. What it reads before its
+first part shows a spinner. A prepare's parts are Preflight, Repository Changes, Platform Preview
+and Pull Requests, and an apply's Preflight and Platform Changes, each named as it starts; a
+level's lines wait for a step to show under them, so a level with nothing to show takes no line.
+Each level is named as it's entered, with its position:
 repository n of N, component n of N, phase n of N and step n of N. A level's line holds the
 level, a cyan counter, the outcome and the time, read as 4.2s, 1m 50s or 1h 2m 5s; each
 labelled item then has a line of its own, blue label first. Each step is one block, updated in
@@ -11,7 +14,9 @@ place while it plans, waits and applies, and printed once when done; under it, t
 count and what's ahead. What a resumed run finished earlier takes one line for the largest
 level wholly done. Colour
 is only for meaning: green done, yellow a change, orange an external handoff, red a failure.
-Nothing is faint. While a prompt waits for a key nothing redraws.
+Nothing is faint. While a prompt waits for a key nothing redraws. Every time is wall time, and
+the time a prompt waits for a person's answer is kept apart from it. A live block is drawn at
+the window's width as it is, so a resized window redraws it cleanly.
 
 With `--json`, stdout carries one JSON object per line and the person's lines go to stderr,
 plain; without a terminal the output is plain, and every prompt is a stop.
@@ -20,15 +25,19 @@ plain; without a terminal the output is plain, and every prompt is a stop.
 from __future__ import annotations
 
 import json
-import shutil
 import sys
 import time
 from collections.abc import Callable
+from contextlib import contextmanager
 
-from rich.console import Console, Group
+from rich.console import Console, ConsoleOptions, Group, RenderableType, RenderResult
+from rich.control import Control
 from rich.live import Live
+from rich.live_render import LiveRender
 from rich.prompt import Prompt
+from rich.segment import ControlType, Segment
 from rich.spinner import Spinner
+from rich.style import Style
 from rich.text import Text
 
 from . import keys
@@ -59,6 +68,7 @@ DONE = (
     "approved",
     "converged",
     "complete",
+    "standing by",
 )
 CHANGE = ("change", "stopped", "pending")
 WAITING = tuple(WAITING_FOR.values())
@@ -70,7 +80,7 @@ FAILURE = (
     "not verified",
     "interrupted",
 )
-UNDER_WAY = ("planning", "applying", "checking", "verifying")
+UNDER_WAY = ("planning", "applying", "checking", "verifying", "holding")
 NAME_LABELS = {
     "repository": "Repo Name:",
     "component": "Component Name:",
@@ -79,6 +89,10 @@ NAME_LABELS = {
     "preflight": "Component Name:",
     "migrate step": "Step Name:",
     "upgrade step": "Step Name:",
+    "step preview": "Step Name:",
+    "render step": "Step Name:",
+    "pull request": "Branch:",
+    "applied commit": "Component Name:",
 }
 DESC_LABELS = {
     "repository": "Repo Desc:",
@@ -88,6 +102,10 @@ DESC_LABELS = {
     "preflight": "Step Desc:",
     "migrate step": "Step Desc:",
     "upgrade step": "Step Desc:",
+    "step preview": "Step Desc:",
+    "render step": "Step Desc:",
+    "pull request": "Desc:",
+    "applied commit": "Desc:",
     "drift check": "Check Desc:",
 }
 
@@ -142,6 +160,11 @@ class Line:
         return Text.assemble((f"{self.label} " if self.label else "", self.style), self.text)
 
 
+def link(text: str, url: str) -> Text:
+    """Text a terminal that can makes clickable; any other shows it as it is."""
+    return Text(text, style=Style(link=url))
+
+
 def level_line(level: str, counter: str = "", outcome: str = "", seconds: float | None = None) -> Text:
     return Text.assemble(
         (level, "bold"),
@@ -151,9 +174,55 @@ def level_line(level: str, counter: str = "", outcome: str = "", seconds: float 
     )
 
 
+class Reflowed(LiveRender):
+    """A live block's render that knows the length of each line it drew, so once the window
+    narrows and the terminal rewraps those lines, the next frame first erases every row they now
+    take, not only as many as it drew."""
+
+    def __init__(self, renderable: RenderableType, console: Console, **options):
+        super().__init__(renderable, **options)
+        self.console = console
+        self.lengths: list[int] = []
+
+    def rows(self) -> int:
+        """The rows the last frame takes at the window's width now."""
+        width = max(self.console.size.width, 1)
+        return sum(max(1, -(-length // width)) for length in self.lengths) or 1
+
+    def position_cursor(self) -> Control:
+        if self._shape is None:
+            return Control()
+        return Control(
+            ControlType.CARRIAGE_RETURN,
+            (ControlType.ERASE_IN_LINE, 2),
+            *(((ControlType.CURSOR_UP, 1), (ControlType.ERASE_IN_LINE, 2)) * (self.rows() - 1)),
+        )
+
+    def restore_cursor(self) -> Control:
+        if self._shape is None:
+            return Control()
+        return Control(
+            ControlType.CARRIAGE_RETURN,
+            *((ControlType.CURSOR_UP, 1), (ControlType.ERASE_IN_LINE, 2)) * self.rows(),
+        )
+
+    def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
+        segments = list(super().__rich_console__(console, options))
+        self.lengths = [Segment.get_line_length(line) for line in Segment.split_lines(segments)]
+        yield from segments
+
+
+class Redrawn(Live):
+    """Rich's live display with a render that redraws cleanly after the window is resized."""
+
+    def __init__(self, renderable: RenderableType, *, console: Console, **options):
+        super().__init__(renderable, console=console, **options)
+        self._live_render = Reflowed(self.get_renderable(), console, vertical_overflow=self.vertical_overflow)
+
+
 class Block:
     """One step's block: its level line, its name, then its details, updated in place
-    until the step is done."""
+    until the step is done. Its time leaves out the time a prompt waited for an answer."""
 
     def __init__(self, level: str, counter: str, name: str, description: str, footer: Callable[[], str]):
         self.level, self.counter, self.name = level, counter, name
@@ -164,14 +233,16 @@ class Block:
         self.lines: list[Line] = []
         self.started = time.monotonic()
         self.seconds: float | None = None
+        # The time a prompt waited for a person's answer, which the step's own time leaves out.
+        self.waited = 0.0
         self.live = True
         self.spinner = Spinner("dots", style="cyan")
 
     def elapsed(self) -> float:
-        return self.seconds if self.seconds is not None else time.monotonic() - self.started
+        return self.seconds if self.seconds is not None else time.monotonic() - self.started - self.waited
 
     def finish(self, outcome: str) -> None:
-        self.outcome, self.seconds, self.live = outcome, time.monotonic() - self.started, False
+        self.outcome, self.seconds, self.live = outcome, time.monotonic() - self.started - self.waited, False
 
     def add(self, label: str, text: str | Text, style: str | None = None) -> Line:
         line = Line(text, label, style)
@@ -206,9 +277,8 @@ class Screen:
         self.json = json_mode
         self.interactive = interactive and not json_mode
         if self.interactive:
-            # The width is taken once, at the start; nothing depends on it changing later.
-            width = shutil.get_terminal_size((100, 40)).columns
-            self.console = Console(width=width, highlight=False)
+            # The width is read again at every draw, so a live block fits a resized window.
+            self.console = Console(highlight=False)
         else:
             self.console = Console(
                 file=sys.stderr if json_mode else sys.stdout,
@@ -220,30 +290,71 @@ class Screen:
             )
         self._blanks = 0
         self._done = False
-        # The command's parts, each with its time, and the one under way, with its start.
+        # The command's parts, each with its time, and the one under way, with its start and the
+        # time waited for answers by then.
         self.started = time.monotonic()
         self.parts: dict[str, float] = {}
-        self._part: tuple[str, float] | None = None
+        self._part: tuple[str, float, float, bool] | None = None
+        # The time the command's prompts waited for a person's answer.
+        self.waited = 0.0
+        # The opening lines shown, each once.
+        self._opened = False
+        self._rows: set[str] = set()
+        # The spinner while the command reads, before its first part.
+        self._status = None
+        # Each level's lines, until a step shows under them.
+        self._held: dict[str, list[tuple[str, tuple]]] = {}
+        self._holding: str | None = None
 
     # Timing -----------------------------------------------------------------------------
 
-    def begin(self, title: str) -> None:
-        """Start a part of the command, ending the one under way."""
+    def begin(self, title: str, *, shown: bool = True) -> None:
+        """Start a part of the command, ending the one under way; one not ``shown`` keeps its
+        time in the command's parts and takes no line."""
         self.end()
-        self._part = (title, time.monotonic())
+        self._part = (title, time.monotonic(), self.waited, shown)
+
+    def reading(self, title: str) -> None:
+        """What the command reads before its first part: a spinner saying so, at a terminal, until
+        it asks something, shows a step or ends."""
+        self.begin(title, shown=False)
+        if self.interactive:
+            if self._status is not None:
+                self._status.update(Text(title))
+            else:
+                self._status = self.console.status(Text(title), spinner="dots", spinner_style="cyan")
+                self._status.start()
+
+    def read(self) -> None:
+        """The reading is over: the spinner goes."""
+        if self._status is not None:
+            self._status.stop()
+            self._status = None
+        if self._part is not None and not self._part[3]:
+            self.end()
 
     def end(self, steps: int | None = None) -> None:
-        """End the part under way, if any, with a line of its time."""
+        """End the part under way, if any, with a line of its time, leaving out the time its
+        prompts waited for an answer."""
         if self._part is not None:
-            title, started = self._part
+            title, started, waited, shown = self._part
             self._part = None
-            self.ended(title, time.monotonic() - started, steps=steps)
+            self.ended(title, time.monotonic() - started - (self.waited - waited), steps=steps, shown=shown)
 
-    def ended(self, title: str, seconds: float, *, steps: int | None = None, **fields) -> None:
+    def waiting(self, started: float) -> float:
+        """Count the time since ``started`` as waiting for an answer; how long it was."""
+        seconds = time.monotonic() - started
+        self.waited += seconds
+        return seconds
+
+    def ended(
+        self, title: str, seconds: float, *, steps: int | None = None, shown: bool = True, **fields
+    ) -> None:
         """A part of the command, done: its line, its event and its place in the command's
         parts."""
         self.parts[title] = round(seconds, 1)
-        self.part(title, steps, seconds)
+        if shown:
+            self.part(title, steps, seconds)
         self.emit(
             {
                 "event": "part",
@@ -255,13 +366,25 @@ class Screen:
         )
 
     def total(self) -> dict:
-        """End the part under way and show the command's time; its parts and total, as its
-        result gives them."""
+        """End the part under way and show the command's wall time, and how much of it its
+        prompts waited for an answer; its parts and total, as its result gives them."""
+        self.read()
         self.end()
         seconds = time.monotonic() - self.started
+        waited = round(self.waited, 1)
         self.blank()
-        self.print(Text.assemble(("Took", "bold"), f" {duration(seconds)}"))
-        return {"seconds": round(seconds, 1), "parts": dict(self.parts)}
+        self.print(
+            Text.assemble(
+                ("Took", "bold"),
+                f" {duration(seconds)}",
+                f", {duration(waited)} of it waiting for answers" if waited else "",
+            )
+        )
+        return {
+            "seconds": round(seconds, 1),
+            "parts": dict(self.parts),
+            **({"waiting": waited} if waited else {}),
+        }
 
     # Output -----------------------------------------------------------------------------
 
@@ -273,6 +396,10 @@ class Screen:
     def print(self, *parts) -> None:
         """Print lines for good: unwrapped, so the terminal wraps them and nothing is cut. Only
         a live block, which is redrawn, is wrapped at the width taken at the start."""
+        if self._holding is not None:
+            self._held[self._holding].append(("print", parts))
+            return
+        self.release_held()
         for part in parts:
             self.console.print(part, soft_wrap=True)
             self._blanks = 0
@@ -280,19 +407,51 @@ class Screen:
 
     def blank(self, count: int = 1) -> None:
         """Leave ``count`` blank lines, counting any just printed, so gaps never stack."""
+        if self._holding is not None:
+            self._held[self._holding].append(("blank", (count,)))
+            return
         for _ in range(count - self._blanks):
             self.console.print()
         self._blanks = max(count, self._blanks)
+
+    @contextmanager
+    def holding(self, level: str):
+        """Keep what's printed meanwhile, a level's lines, until a step shows under them."""
+        self._holding = level
+        self._held.setdefault(level, [])
+        try:
+            yield
+        finally:
+            self._holding = None
+
+    def drop_held(self, *levels: str) -> None:
+        """Forget the lines of ``levels``, every level by default: nothing showed under them."""
+        for level in levels or tuple(self._held):
+            self._held.pop(level, None)
+
+    def release_held(self) -> None:
+        """Show what's held, the largest level first, as it was printed."""
+        held, self._held = self._held, {}
+        for lines in held.values():
+            for kind, arguments in lines:
+                getattr(self, kind)(*arguments)
 
     def labelled(self, label: str, text: str | Text, style: str | None = None) -> None:
         self.print(Line(text, label, style))
 
     def header(self, command: str, *rows: tuple[str, str]) -> None:
-        """The one line a command opens with: `dp-instance status · dm-canary`. The instance's
-        key stands alone; each other row reads as its label, then its value."""
-        parts = [value if label == "instance" else f"{label} {value}" for label, value in rows]
-        self.blank()
-        self.print(Text.assemble((f"dp-instance {command}", "bold"), *(f" · {part}" for part in parts)))
+        """The lines a command opens with: `dp-instance`, `Command: status`, then each row as its
+        label and value, each once, so what's known later follows when it's known."""
+        if not self._opened:
+            self._opened = True
+            self.blank()
+            self.print(Text("dp-instance", style="bold"))
+            self.blank()
+            self.labelled("Command:", command)
+        for label, value in rows:
+            if label not in self._rows:
+                self._rows.add(label)
+                self.labelled(f"{label[:1].upper()}{label[1:]}:", value)
 
     def stage(self, title: str) -> None:
         self.blank(2)
@@ -327,25 +486,31 @@ class Screen:
 
     def run_live(self, block: Block, work, *arguments, **keywords):
         """Run ``work(*arguments, **keywords)`` while the block shows live; at a terminal only."""
+        self.read()
         if not self.interactive:
             return work(*arguments, **keywords)
-        with Live(block, console=self.console, refresh_per_second=8, transient=True):
+        with Redrawn(block, console=self.console, refresh_per_second=8, transient=True):
             return work(*arguments, **keywords)
 
     def ask(self, block: Block, choices: list[tuple[str, str]], prompt: str = "") -> str:
         """Wait for a key with the block drawn once and nothing redrawing, so the key
-        arrives at once."""
+        arrives at once. The wait counts in neither the block's time nor the command's working
+        time."""
+        self.read()
+        self.release_held()
         block.seconds, block.live = block.elapsed(), False
         parts = []
         for key, label in choices:
             parts += [(key, "bold"), f" {label}    "]
         block.lines += [Line(""), Line(Text.assemble(prompt + ("   " if prompt else ""), *parts))]
+        started = time.monotonic()
         try:
-            with Live(block, console=self.console, auto_refresh=False, transient=True) as live:
+            with Redrawn(block, console=self.console, auto_refresh=False, transient=True) as live:
                 live.refresh()
                 key = keys.choose("".join(key for key, _ in choices))
         finally:
             del block.lines[-2:]
+            block.waited += self.waiting(started)
             block.seconds, block.live = None, True
         return key
 
@@ -357,12 +522,30 @@ class Screen:
 
     def choose(self, choices: list[tuple[str, str]], prompt: str = "") -> str:
         """A keypress outside a block, such as setup's question before it writes the map."""
+        self.read()
         parts = [prompt + "   "] if prompt else []
         for key, label in choices:
             parts += [(key, "bold"), f" {label}    "]
         self.blank()
         self.print(Text.assemble(*parts))
-        return keys.choose("".join(key for key, _ in choices))
+        started = time.monotonic()
+        try:
+            return keys.choose("".join(key for key, _ in choices))
+        finally:
+            self.waiting(started)
+
+    def menu(self, title: str, choices: list[tuple[str, str]]) -> str:
+        """A keypress among choices, one a line, under what's being asked."""
+        self.read()
+        self.blank()
+        self.print(Text(title, style="bold"))
+        for key, label in choices:
+            self.print(Text.assemble("  ", (key, "bold"), f"  {label}"))
+        started = time.monotonic()
+        try:
+            return keys.choose("".join(key for key, _ in choices))
+        finally:
+            self.waiting(started)
 
     def secret(self, label: str) -> str:
         """A hidden prompt: what's typed is never shown."""
@@ -373,19 +556,29 @@ class Screen:
         return self._ask(label, hidden=False)
 
     def _ask(self, label: str, *, hidden: bool) -> str:
-        value = Prompt.ask(Text(label, style=LABEL), console=self.console, password=hidden)
+        self.read()
+        started = time.monotonic()
+        try:
+            value = Prompt.ask(Text(label, style=LABEL), console=self.console, password=hidden)
+        finally:
+            self.waiting(started)
         self._blanks = 0
         return value
 
     # Endings ----------------------------------------------------------------------------
 
-    def next_block(self, steps, record: str | None = None) -> None:
-        self.blank(2)
-        self.print(Text("Next", style="bold"))
+    def continuing(self, steps, record: str | None = None) -> None:
+        """How to carry on from a stop, a line each."""
+        self.blank()
         for item in steps:
-            self.blank()
-            self.print(Text(item.command, style="bold"))
-            self.print(Text(item.why))
+            self.labelled("To Continue:", f"{item.command}: {item.why}")
+        if record:
+            self.run_record(record)
+
+    def then(self, sentence: str, record: str | None = None) -> None:
+        """What a person does after a run that succeeded, in a sentence."""
+        self.blank()
+        self.print(Text(sentence))
         if record:
             self.run_record(record)
 
@@ -393,12 +586,18 @@ class Screen:
         self.blank()
         self.print(Text(f"Run record: {record}", style="italic"))
 
-    def complete(self, seconds: float) -> None:
+    def complete(self, seconds: float, waited: float, said: str = "") -> None:
+        """A run's end: its wall time from its start, and how much of it the run waited, at a
+        stop until a resume or at a question, apart from the time it worked, and what it says."""
         self.blank(2)
+        took = (
+            f"in {duration(seconds)}: {duration(seconds - waited)} working and {duration(waited)} waiting"
+            if waited
+            else f"in {duration(seconds)}"
+        )
         self.print(
             Text.assemble(
                 ("Complete", "bold green"),
-                f"   in {duration(seconds)}. Every changed step passed its verify, and every other "
-                "step planned no change.",
+                f"   {took}." + (f" {said}" if said else ""),
             )
         )

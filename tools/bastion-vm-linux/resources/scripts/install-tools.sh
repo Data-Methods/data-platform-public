@@ -6,7 +6,7 @@ export DEBIAN_FRONTEND=noninteractive
 AZURE_CLI_VERSION="2.88.0"
 GH_VERSION="2.86.0"
 TERRAFORM_VERSION="1.15.0"
-UV_VERSION="0.9.15"
+UV_VERSION="0.13.5"
 PYTHON_VERSION="3.12.13"
 PYTHON_BUILD="20260728"
 POWERSHELL_VERSION="7.6.3"
@@ -158,7 +158,7 @@ install_uv() {
   local directory=/tmp/uv
   download_verified \
     "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-x86_64-unknown-linux-gnu.tar.gz" \
-    "2053df0089327569cddd6afea920c2285b482d9b123f5db9f658273e96ab792c" \
+    "f68d291c75783122dad58ab77def0e13f3233f358731db5d6d7e8715603b928f" \
     "$archive"
   rm -rf "$directory"
   mkdir -p "$directory"

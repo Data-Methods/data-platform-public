@@ -817,7 +817,7 @@ def setup(
     if failing:
         steps = tuple(dict.fromkeys(item for report in reports for item in report.next))
         if steps:
-            screen.next_block(steps)
+            screen.continuing(steps)
         return Result(
             "template-access setup",
             "failed",
@@ -826,17 +826,14 @@ def setup(
             {"instance": key, **detail},
         )
     steps = (
-        (
-            Next(
-                "dp-instance template-access check",
-                "checks the new key's access once Data Methods registers it",
-            ),
-        )
-        if any(report.created for report in reports)
-        else _status_next(start)
+        Next(
+            "dp-instance template-access check",
+            "checks the new key's access once Data Methods registers it"
+            if any(report.created for report in reports)
+            else "checks each key, its vault copy and Git reaching its template",
+        ),
     )
-    if steps:
-        screen.next_block(steps)
+    screen.continuing(steps)
     return Result(
         "template-access setup",
         "done",
@@ -1226,7 +1223,7 @@ def check(
     bad = [item for item in report if item["problems"]]
     if bad:
         steps = (*dict.fromkeys(fixes), *_repairs(start, repair, key_vault))
-        screen.next_block(steps)
+        screen.continuing(steps)
         return Result(
             "template-access check",
             "failed",
@@ -1238,7 +1235,7 @@ def check(
     screen.note("Template access is in order.", "bold green")
     steps = _status_next(start)
     if steps:
-        screen.next_block(steps)
+        screen.continuing(steps)
     return Result(
         "template-access check", "done", "Template access is in order.", steps, {"templates": report}
     )

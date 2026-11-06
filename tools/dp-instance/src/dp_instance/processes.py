@@ -2,9 +2,9 @@
 
 Every tool runs from an argument list, never a shell, with its output read as UTF-8, so the
 same call works on Windows, macOS and Linux. A tool's own TLS, proxy and credential settings
-apply, since dp-instance makes no web requests of its own. The instance's template access
-rules reach Git through its environment configuration, `GIT_CONFIG_COUNT`, in every tool
-dp-instance starts and nowhere else.
+apply; dp-instance's only web requests of its own are to the instance's shared run record, in
+`blobs`. The instance's template access rules reach Git through its environment configuration,
+`GIT_CONFIG_COUNT`, in every tool dp-instance starts and nowhere else.
 """
 
 from __future__ import annotations
@@ -20,6 +20,9 @@ from .outcome import failed
 
 # The Git configuration every tool dp-instance starts takes, as (key, value) pairs.
 _git_configuration: tuple[tuple[str, str], ...] = ()
+
+# How many component processes plan phases at once: the drift check's and `verify`'s.
+PHASES_AT_ONCE = 6
 
 
 def configure_git(entries: Iterable[tuple[str, str]]) -> None:
@@ -93,9 +96,10 @@ def run(
     cwd: Path | None = None,
     input: str | None = None,
     check: bool = True,
+    timeout: float | None = None,
 ) -> Completed:
     """Run one tool to completion and return its output; ``check`` stops on a failure,
-    naming the tool's own first line of error."""
+    naming the tool's own first line of error, and ``timeout`` on a tool that takes longer."""
     try:
         process = subprocess.run(
             [executable(name), *arguments],
@@ -107,7 +111,12 @@ def run(
             errors="replace",
             env=environment(),
             stdin=None if input is not None else subprocess.DEVNULL,
+            timeout=timeout,
         )
+    except subprocess.TimeoutExpired:
+        raise failed(
+            f"{' '.join((name, *arguments[:2]))} didn't finish within {timeout:g} seconds."
+        ) from None
     except OSError as error:
         raise failed(f"{name} could not start: {error.strerror or error}.") from None
     completed = Completed(process.returncode, process.stdout, process.stderr)

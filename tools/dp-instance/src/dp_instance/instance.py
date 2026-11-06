@@ -2,28 +2,26 @@
 
 `dp-instance setup` writes the map: the Platform Instance Key and each repository's remote
 and path. Every other command finds the map from the current folder or one above it, and
-checks it against the checkouts before doing anything else. Before Platform 2026.5.0 the map
-was `dp-instance.json`, beside `.dp-instance/`: the first command that finds it there moves it
-in, unchanged.
+checks it against the checkouts before doing anything else.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
-import os
 from dataclasses import dataclass
 from pathlib import Path
 
 from . import gitops
+from .manifest import VERSION
 from .outcome import Next, Stop, failed
-from .sequence import MERGED_COMMIT
 
 STATE_FOLDER = ".dp-instance"
 MAP_FILE = Path(STATE_FOLDER, "repositories.json")
-# The map's place before Platform 2026.5.0. Removed at the 2026.6.0 stop, with the move.
-EARLIER_MAP_FILE = "dp-instance.json"
 SOURCE_RECORD = Path(".dp-template/template-source.json")
+# The `template-source.json` and `outputs aggregate` schemas this dp-instance reads.
+SOURCE_SCHEMAS = (1,)
+AGGREGATE_SCHEMAS = (2, 3)
 # The Client Infrastructure Repository's template, and its owner's CLI, which reads the
 # instance's published Component Outputs.
 INFRASTRUCTURE = "data-platform-infrastructure"
@@ -33,7 +31,9 @@ SETUP = Next("dp-instance setup", "maps this instance's repositories again")
 
 @dataclass(frozen=True)
 class SourceRecord:
-    """A Component Repository's `.dp-template/template-source.json`."""
+    """A Component Repository's `.dp-template/template-source.json`: the template commit it
+    holds and, from the engine that records it, the Platform Version the `upgrade` or `repo
+    init` that wrote it named; None in an older engine's record."""
 
     template: str
     repository: str
@@ -41,6 +41,7 @@ class SourceRecord:
     channel: str
     version: str | None
     commit: str
+    platform_version: str | None = None
 
     @classmethod
     def read(cls, checkout: Path, revision: str | None = None) -> SourceRecord | None:
@@ -56,6 +57,20 @@ class SourceRecord:
             return None
         try:
             data = json.loads(text)
+            schema = data.get("schema_version", 1)
+            if isinstance(schema, int) and schema not in SOURCE_SCHEMAS:
+                raise Stop(
+                    "failed",
+                    f"{path} is at schema version {schema}, which this dp-instance doesn't read.",
+                    next=(
+                        Next("dp-instance self update", "installs the newest dp-instance, which reads it"),
+                    ),
+                )
+            platform_version = data.get("platform_version")
+            if platform_version is not None and (
+                not isinstance(platform_version, str) or VERSION.fullmatch(platform_version) is None
+            ):
+                raise ValueError
             return cls(
                 data["template_repository_key"],
                 data["repository"],
@@ -63,8 +78,9 @@ class SourceRecord:
                 data["channel"],
                 data.get("version"),
                 data["commit"],
+                platform_version,
             )
-        except (ValueError, KeyError, TypeError):
+        except (ValueError, KeyError, TypeError, AttributeError):
             raise failed(f"{path} isn't a template source record dp-instance reads.") from None
 
     @property
@@ -82,7 +98,8 @@ class SourceRecord:
 
     def describe(self) -> str:
         at = f"Template Version {self.version}" if self.version else f"commit {self.commit[:12]}"
-        return f"{self.repository} {at} ({self.channel})"
+        platform = f", Platform {self.platform_version}" if self.platform_version else ""
+        return f"{self.repository} {at}{platform}"
 
 
 @dataclass(frozen=True)
@@ -105,6 +122,20 @@ class Mapped:
         return {**found, "remote": self.remote, "path": self.stored}
 
 
+def check_aggregate(aggregate: dict, command: str) -> dict:
+    """An `outputs aggregate` at a schema this dp-instance reads; a newer one names the
+    dp-instance that reads it."""
+    schema = aggregate.get("schema_version")
+    if isinstance(schema, int) and schema not in AGGREGATE_SCHEMAS:
+        raise Stop(
+            "failed",
+            f"{command} outputs aggregate is at schema version {schema}, which this dp-instance "
+            "doesn't read.",
+            next=(Next("dp-instance self update", "installs the newest dp-instance, which reads it"),),
+        )
+    return aggregate
+
+
 def registrations(aggregate: dict) -> list[tuple[str, str]]:
     """Each component the instance registers in its Component Outputs, as `outputs aggregate`
     prints them: its key and the repository its registration names."""
@@ -117,24 +148,6 @@ def registrations(aggregate: dict) -> list[tuple[str, str]]:
         repository = registration.get("repository")
         if isinstance(key, str) and isinstance(repository, str) and repository:
             found.append((key, repository))
-    return found
-
-
-def merged_commits(aggregate: dict) -> dict[str, str | None]:
-    """Each registered component's `merged_commit`, as `outputs aggregate` prints its published
-    Component Outputs: the evidence status, such as `available` or `not_collected`, or None
-    when its outputs couldn't be read or name no `merged_commit`. A Repository Owner's `merge`
-    publishes it once a run has applied every other phase of its repository."""
-    found = {}
-    for item in aggregate.get("components", []):
-        if not isinstance(item, dict):
-            continue
-        key = ((item.get("registration") or {}).get("component") or {}).get("key")
-        if not isinstance(key, str):
-            continue
-        merged = ((item.get("outputs") or {}).get("exports") or {}).get(MERGED_COMMIT)
-        status = (merged.get("evidence") or {}).get("status") if isinstance(merged, dict) else None
-        found[key] = status if item.get("status") == "available" else None
     return found
 
 
@@ -181,35 +194,9 @@ def state_folder(root: Path) -> Path:
 
 
 def map_path(root: Path) -> Path | None:
-    """The folder's repository map, `.dp-instance/repositories.json`, or the earlier
-    `dp-instance.json` until a command moves it in; None when it has neither. A folder with both
-    stops every command."""
-    current, earlier = root / MAP_FILE, root / EARLIER_MAP_FILE
-    if earlier.is_file() and current.is_file():
-        raise failed(
-            f"{root} holds both {EARLIER_MAP_FILE} and {MAP_FILE.as_posix()}, so dp-instance moved "
-            f"neither: dp-instance 3.0.0 reads {MAP_FILE.as_posix()}."
-        )
-    if earlier.is_file():
-        return earlier
-    return current if current.is_file() else None
-
-
-def move_earlier_map(root: Path) -> bool:
-    """Move a map from before Platform 2026.5.0 into `.dp-instance/`, unchanged; whether there
-    was one to move. Removed at the 2026.6.0 stop."""
-    earlier = root / EARLIER_MAP_FILE
-    if not earlier.is_file():
-        return False
-    moved = state_folder(root) / MAP_FILE.name
-    try:
-        os.replace(earlier, moved)
-    except OSError as error:
-        raise failed(
-            f"Couldn't move {earlier} to {moved}: {error.strerror or error}; nothing has changed. Run "
-            "the command again once nothing holds either file open."
-        ) from None
-    return True
+    """The folder's repository map, `.dp-instance/repositories.json`; None when it has none."""
+    found = root / MAP_FILE
+    return found if found.is_file() else None
 
 
 def unmapped_infrastructure(start: Path) -> Path | None:
@@ -333,11 +320,10 @@ class Instance:
                 SETUP,
             )
 
-    def record(self, template: str, *, applied: bool = False) -> SourceRecord:
-        """A Component Repository's record, as checked out, or with ``applied`` as `main`
-        holds it: the code last merged, which the platform runs."""
+    def record(self, template: str) -> SourceRecord:
+        """A Component Repository's record, as checked out."""
         checkout = self.components[template].path
-        found = applied_record(checkout) if applied else SourceRecord.read(checkout)
+        found = SourceRecord.read(checkout)
         if found is None:
             raise failed(f"{self.components[template].stored} has no template source record.", SETUP)
         return found

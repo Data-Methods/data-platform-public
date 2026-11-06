@@ -2,11 +2,12 @@
 
 It scans the current folder and any paths already in the repository map, recognising each
 Component Repository by its template source record. Like every command that finds an
-instance, it first refuses one older than this dp-instance upgrades from, as the checkouts it
+instance, it first refuses one on a release before this dp-instance's floor, as the checkouts it
 found record it, and then moves a map from before Platform 2026.5.0 into `.dp-instance/`. It
-reads the instance's published Component Outputs through the Client Infrastructure
-Repository, whose registrations name every repository the instance has, each component's own
-and the Managed Repositories it lists, and checks each registered repository alike; shows what
+reads `config/infrastructure/components.json` in the Client Infrastructure Repository, which names
+every repository the instance has, each component's own and the Managed Repositories it lists, or,
+on an instance before Platform 2026.6.0, which has no list yet, its published Component Outputs,
+whose registrations name them. It checks each repository alike; shows what
 it found, what's missing, duplicated or on another remote; and on approval writes the map,
 `.dp-instance/repositories.json`. It refuses while a repository the instance has is missing or
 on another remote, naming the `git clone` for each, and in a folder with no Component
@@ -29,9 +30,11 @@ from .instance import (
     INFRASTRUCTURE,
     INFRASTRUCTURE_COMMAND,
     MAP_FILE,
+    STATE_FOLDER,
     Instance,
     Mapped,
     SourceRecord,
+    check_aggregate,
     managed_registrations,
     map_path,
     registrations,
@@ -39,7 +42,7 @@ from .instance import (
 )
 from .outcome import Next, Result, Stop, failed
 from .screen import Screen
-from .session import move_map, releases_of
+from .session import releases_of
 
 START = (
     Next(
@@ -101,6 +104,57 @@ def scan(root: Path, existing: Instance | None) -> Found:
     return found
 
 
+COMPONENTS = "config/infrastructure/components.json"
+
+
+@dataclass
+class Named:
+    """The repositories the instance has, as its list or its registrations name them."""
+
+    components: list[str]
+    # Each Managed Repository's URL and the component that lists it.
+    managed: dict[str, str]
+    # How a line says the instance names one.
+    verb: str
+    said: str
+
+
+def _listed(found: Found) -> Named | None:
+    """The repositories `components.json` in the Client Infrastructure Repository names, or None
+    on an instance before Platform 2026.6.0, which has no list yet."""
+    paths = found.components.get(INFRASTRUCTURE) or []
+    if len(paths) != 1 or not (paths[0] / COMPONENTS).is_file():
+        return None
+    document = _json(paths[0] / COMPONENTS)
+    members = document.get("components") if isinstance(document, dict) else None
+    if not isinstance(members, dict):
+        raise failed(f"{paths[0] / COMPONENTS} can't be read; nothing was written.")
+    return Named(
+        sorted({member["repository"] for member in members.values()}),
+        dict(
+            sorted(
+                {
+                    item["url"]: key
+                    for key, member in members.items()
+                    for item in member.get("managed_repositories", ())
+                }.items()
+            )
+        ),
+        "lists",
+        f"{len(members)} components listed in {COMPONENTS}",
+    )
+
+
+def _registered(outputs: dict) -> Named:
+    """The repositories the instance's published registrations name."""
+    return Named(
+        sorted({url for _, url in registrations(outputs)}),
+        dict(sorted({url: key for key, url in managed_registrations(outputs)}.items())),
+        "registers",
+        f"{len(outputs.get('components', []))} registered components compared",
+    )
+
+
 def _outputs(root: Path, found: Found, screen: Screen) -> tuple[dict | None, str | None]:
     """The published Component Outputs, read by the Client Infrastructure Repository's own
     CLI, or why they couldn't be read."""
@@ -111,25 +165,27 @@ def _outputs(root: Path, found: Found, screen: Screen) -> tuple[dict | None, str
     try:
         if screen.interactive:
             with screen.console.status("Reading the published Component Outputs"):
-                return cli.document("outputs", "aggregate"), None
-        return cli.document("outputs", "aggregate"), None
+                found = cli.document("outputs", "aggregate")
+        else:
+            found = cli.document("outputs", "aggregate")
+        return check_aggregate(found, INFRASTRUCTURE_COMMAND), None
     except Stop as stop:
         return None, stop.message
 
 
 def _check(
-    registered: list[str], checkouts: list[Mapped], compared: Compared
+    named: list[str], checkouts: list[Mapped], compared: Compared, verb: str
 ) -> tuple[dict[str, Mapped], list[Mapped]]:
-    """Each registered repository's checkout, by its URL, and the checkouts no registration
-    names. One that isn't checked out is missing, and a checkout on another remote of the same
-    name is on the wrong one."""
+    """Each named repository's checkout, by its URL, and the checkouts nothing names. One that
+    isn't checked out is missing, and a checkout on another remote of the same name is on the
+    wrong one."""
     found = {}
-    for url in registered:
+    for url in named:
         match = next((item for item in checkouts if gitops.same_repository(url, item.remote)), None)
         if match is not None:
             found[url] = match
     loose = [item for item in checkouts if item not in found.values()]
-    for url in registered:
+    for url in named:
         if url in found:
             continue
         namesake = next(
@@ -144,27 +200,24 @@ def _check(
             compared.missing.append(url)
             continue
         loose.remove(namesake)
-        compared.wrong.append(
-            f"{namesake.stored}'s origin is {namesake.remote}; the instance registers {url}"
-        )
+        compared.wrong.append(f"{namesake.stored}'s origin is {namesake.remote}; the instance {verb} {url}")
     return found, loose
 
 
-def compare(outputs: dict, components: list[Mapped], others: list[Mapped]) -> tuple[Compared, list[Mapped]]:
-    """Every repository the instance registers, each component's own and each Managed
-    Repository a component's registration lists, must be checked out, on that remote. A checkout
-    no registration names is only noted, since a component registers once it first publishes,
-    and a registration from before 2026.4 lists no Managed Repository. Returns the comparison and
-    each Managed Repository's checkout, mapped to the component that lists it."""
+def compare(named: Named, components: list[Mapped], others: list[Mapped]) -> tuple[Compared, list[Mapped]]:
+    """Every repository the instance names, each component's own and each Managed Repository a
+    component lists, must be checked out, on that remote. A checkout nothing names is only noted,
+    since on an instance before Platform 2026.6.0 a component registers once it first publishes.
+    Returns the comparison and each Managed Repository's checkout, mapped to the component that
+    lists it."""
     compared = Compared()
-    _, unnamed = _check(sorted({url for _, url in registrations(outputs)}), components, compared)
-    listed = dict(sorted({url: key for key, url in managed_registrations(outputs)}.items()))
-    managed, others_unnamed = _check(list(listed), others, compared)
+    _, unnamed = _check(named.components, components, compared, named.verb)
+    managed, others_unnamed = _check(list(named.managed), others, compared, named.verb)
     compared.unregistered = [
-        f"{item.stored}: {item.remote} isn't a repository the instance registers yet"
+        f"{item.stored}: {item.remote} isn't a repository the instance {named.verb} yet"
         for item in (*unnamed, *others_unnamed)
     ]
-    return compared, [replace(item, managed_by=listed[url]) for url, item in managed.items()]
+    return compared, [replace(item, managed_by=named.managed[url]) for url, item in managed.items()]
 
 
 def setup(start: Path, screen: Screen, approvals: tuple[str, ...]) -> Result:
@@ -196,10 +249,10 @@ def setup(start: Path, screen: Screen, approvals: tuple[str, ...]) -> Result:
             next=START,
             folder=str(root),
         )
-    targets.refuse_older(
+    targets.check_floor(
         {template: paths[0] for template, paths in found.components.items()}, releases_of(root)
     )
-    move_map(root, screen)
+    targets.check_earlier_run(root / STATE_FOLDER)
     problems: list[str] = []
     for path in [*(p for paths in found.components.values() for p in paths), *found.others]:
         provider = synced.provider(path)
@@ -241,13 +294,16 @@ def setup(start: Path, screen: Screen, approvals: tuple[str, ...]) -> Result:
     screen.header(
         "setup: map this instance's repositories", ("instance", key or "unknown"), ("folder", str(root))
     )
-    screen.begin("the published outputs")
-    outputs, unread = _outputs(root, found, screen)
+    named, unread = _listed(found), None
+    if named is None:
+        screen.begin("the published outputs")
+        outputs, unread = _outputs(root, found, screen)
+        named = _registered(outputs) if outputs is not None else None
+        screen.end()
     compared = Compared()
-    if outputs is not None:
-        compared, managed = compare(outputs, repositories, others)
+    if named is not None:
+        compared, managed = compare(named, repositories, others)
         repositories += managed
-    screen.end()
     screen.stage("what setup found")
     for item in repositories:
         what = (
@@ -265,10 +321,8 @@ def setup(start: Path, screen: Screen, approvals: tuple[str, ...]) -> Result:
     for line in problems:
         screen.labelled("Problem:", line, "bold red")
     screen.labelled(
-        "Component Outputs:",
-        f"{len(outputs.get('components', []))} registered components compared"
-        if outputs is not None
-        else f"not compared: {unread}",
+        "Compared With:",
+        named.said if named is not None else f"nothing: {unread}",
     )
     detail = {
         "instance": key,
@@ -277,7 +331,7 @@ def setup(start: Path, screen: Screen, approvals: tuple[str, ...]) -> Result:
         "wrong_remote": compared.wrong,
         "not_registered": compared.unregistered,
         "problems": problems,
-        "outputs": None if outputs is not None else unread,
+        "outputs": None if named is not None else unread,
     }
     if problems or compared.missing or compared.wrong:
         clones = tuple(
@@ -316,5 +370,5 @@ def setup(start: Path, screen: Screen, approvals: tuple[str, ...]) -> Result:
             "restores each mapped template's key from the vault and sets up its access",
         ),
     )
-    screen.next_block(steps)
+    screen.continuing(steps)
     return Result("setup", "done", f"Wrote {MAP_FILE.as_posix()}.", steps, detail)

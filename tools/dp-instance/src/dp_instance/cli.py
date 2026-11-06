@@ -2,14 +2,20 @@
 
     dp-instance [status]                    where the instance stands, planning nothing
     dp-instance setup                       map the instance's repositories
-    dp-instance upgrade [--to VERSION]      one run, from the code into the platform
-    dp-instance plan [--step NAME]          preview the next change, or one step; starts no run
-    dp-instance apply                       a new run on main's code: a configuration change
-    dp-instance resume                      carry on from where the active run stopped
+    dp-instance prepare [--to VERSION]      turn your edits, or a Platform Version, into pull requests
+    dp-instance plan [--step NAME]          preview main, the open change and your branch; starts no run
+    dp-instance apply                       bring the platform to main, once its pull requests merge
+    dp-instance resume                      carry on the instance's stopped run, a prepare or an apply
     dp-instance verify [--step NAME]        the completion check, or one step's verify
+    dp-instance unlock RUN                  clear the run lock the named run holds
     dp-instance template-access setup|check
     dp-instance secret list|set|reload|rotate
-    dp-instance update                      install the newest published dp-instance
+    dp-instance self update [--to VERSION]  install the newest published dp-instance, or VERSION
+    dp-instance --version                   this dp-instance's version
+
+prepare, apply, resume, plan, verify and the secret commands hold the instance's run lock while
+they run, and refuse while another command holds it. An upgrade is `prepare --to`, the merge of
+its pull requests, `apply`, each Adoption PR's merge and release, then `verify`.
 
 Every command takes --json: one JSON object per line on stdout, ending with the result, and
 no question asked. Exit codes: 0 done, 1 failed, 2 a usage error, 3 an external handoff,
@@ -23,8 +29,8 @@ import argparse
 import sys
 from pathlib import Path
 
-from . import runs, secrets, setup, status, template_access, update, views
-from .outcome import USAGE, Result, Stop
+from . import installed, lock, runs, secrets, self_update, setup, status, template_access, views
+from .outcome import USAGE, Next, Result, Stop
 from .screen import Screen
 from .session import Options, Session, ready_for_template_access, terminal
 
@@ -43,7 +49,9 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Approve each step's plan, and the restarts of secret commands, without stopping.",
     )
-    # A decision's ID, which only a stop names: resume and the secret commands take it.
+    # A decision's ID, which only a stop names: resume and the secret commands take it, prepare for
+    # the upgrade's restore and remove questions, and prepare and apply for their question about
+    # replacing a stopped run.
     approving = argparse.ArgumentParser(add_help=False, parents=[automatic])
     approving.add_argument(
         "--approve",
@@ -58,36 +66,47 @@ def _parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         parents=[common],
     )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"dp-instance {installed.version() or '(a local copy, not a published version)'}",
+        help="Show this dp-instance's version.",
+    )
     commands = parser.add_subparsers(dest="command", metavar="COMMAND")
     commands.add_parser("status", parents=[common], help="Show where the instance stands, planning nothing.")
     setup_parser = commands.add_parser("setup", parents=[common], help="Map the instance's repositories.")
     setup_parser.add_argument(
         "--approve", action="append", default=[], metavar="ID", help="Write the map setup showed."
     )
-    upgrade = commands.add_parser(
-        "upgrade", parents=[common, automatic], help="Upgrade to the next release, or the one --to names."
+    preparing = commands.add_parser(
+        "prepare",
+        parents=[common, approving],
+        help="Turn your edits, or with --to a Platform Version, into pull requests to review and merge.",
     )
-    target = upgrade.add_mutually_exclusive_group()
+    target = preparing.add_mutually_exclusive_group()
     target.add_argument(
         "--to",
         metavar="VERSION",
-        help="The published Platform Version, such as 2026.3. By default, the next stop: the next "
-        "Platform Version, else a newer fix of the one the instance runs.",
+        help="The published Platform Version to upgrade to, the next required stop, such as 2026.6.0.",
     )
     target.add_argument(
-        "--manifest",
+        "--candidate",
         metavar="FILE",
         # Data Methods' own pre-release instance only: an unpublished candidate manifest.
         help=argparse.SUPPRESS,
     )
-    preview = commands.add_parser("plan", parents=[common], help="Preview the next change; starts no run.")
-    commands.add_parser(
-        "apply",
-        parents=[common, automatic],
-        help="Apply main's configuration: a new run on main's code, once your change is merged.",
+    preview = commands.add_parser(
+        "plan", parents=[common], help="Preview main, the open change and your branch; starts no run."
     )
     commands.add_parser(
-        "resume", parents=[common, approving], help="Carry on from where the active run stopped."
+        "apply",
+        parents=[common, approving],
+        help="Bring the platform to main, as merged on GitHub, once the open change's pull requests merge.",
+    )
+    commands.add_parser(
+        "resume",
+        parents=[common, approving],
+        help="Carry on the instance's stopped run, from any workstation.",
     )
     check = commands.add_parser("verify", parents=[common], help="Run every step's read-only verify.")
     for sub, what in ((preview, "Plan"), (check, "Verify")):
@@ -96,7 +115,22 @@ def _parser() -> argparse.ArgumentParser:
             metavar="NAME",
             help=f"{what} one step alone, by its full name: repository/component/phase/step.",
         )
-    commands.add_parser("update", parents=[common], help="Install the newest published dp-instance.")
+    unlocking = commands.add_parser(
+        "unlock",
+        parents=[common],
+        help="Clear the run lock the named run holds, when its command hangs while its process is alive.",
+    )
+    unlocking.add_argument("run", metavar="RUN", help="The run that holds the lock, as status names it.")
+    itself = commands.add_parser("self", parents=[common], help="Install another dp-instance.")
+    itself_commands = itself.add_subparsers(dest="itself", metavar="ACTION", required=True)
+    updating = itself_commands.add_parser(
+        "update", parents=[common], help="Install the newest published dp-instance, or the one --to names."
+    )
+    updating.add_argument(
+        "--to",
+        metavar="VERSION",
+        help="An exact published dp-instance version, such as 4.0.0, to pin or roll back to.",
+    )
 
     access = commands.add_parser("template-access", parents=[common], help="Set up or check template access.")
     access_commands = access.add_subparsers(dest="access", metavar="ACTION", required=True)
@@ -150,7 +184,7 @@ def _dispatch(arguments, screen: Screen) -> Result:
     if arguments.command == "setup":
         return setup.setup(start, screen, tuple(arguments.approve))
     if arguments.command == "template-access":
-        ready_for_template_access(start, screen)
+        ready_for_template_access(start)
         if arguments.access == "setup":
             return template_access.setup(
                 screen,
@@ -160,8 +194,8 @@ def _dispatch(arguments, screen: Screen) -> Result:
                 development=arguments.development,
             )
         return template_access.check(screen, start, arguments.template, instance=arguments.instance)
-    if arguments.command == "update":
-        return update.update(screen)
+    if arguments.command == "self":
+        return self_update.self_update(screen, start, arguments.to)
     options = Options(
         json=arguments.json,
         auto_approve=getattr(arguments, "auto_approve", False),
@@ -171,23 +205,26 @@ def _dispatch(arguments, screen: Screen) -> Result:
     command = arguments.command or "status"
     if command == "status":
         return status.status(session)
-    if command == "upgrade":
-        return runs.upgrade(session, arguments.to, arguments.manifest)
-    if command == "apply":
-        return runs.apply(session)
-    if command == "resume":
-        return runs.resume(session)
-    if command == "plan":
-        return views.plan(session, arguments.step)
-    if command == "verify":
-        return views.verify(session, arguments.step)
-    if arguments.secret == "list":
-        return secrets.list_secrets(session, arguments.name)
-    if arguments.secret == "set":
-        return secrets.set_secret(session, arguments.name)
-    if arguments.secret == "reload":
-        return secrets.reload(session, arguments.name)
-    return secrets.rotate(session, arguments.name)
+    if command == "unlock":
+        return lock.unlock(session, arguments.run)
+    with session.locked(" ".join(part for part in (command, getattr(arguments, "secret", None)) if part)):
+        if command == "prepare":
+            return runs.prepare(session, arguments.to, arguments.candidate)
+        if command == "apply":
+            return runs.apply(session)
+        if command == "resume":
+            return runs.resume(session)
+        if command == "plan":
+            return views.plan(session, arguments.step)
+        if command == "verify":
+            return views.verify(session, arguments.step)
+        if arguments.secret == "list":
+            return secrets.list_secrets(session, arguments.name)
+        if arguments.secret == "set":
+            return secrets.set_secret(session, arguments.name)
+        if arguments.secret == "reload":
+            return secrets.reload(session, arguments.name)
+        return secrets.rotate(session, arguments.name)
 
 
 def utf8_output() -> None:
@@ -199,8 +236,30 @@ def utf8_output() -> None:
             stream.reconfigure(encoding="utf-8", errors="replace")
 
 
+# A command a person may still type, and the one that does its work.
+RETIRED = {
+    "upgrade": (
+        "dp-instance has no upgrade command: an upgrade is prepared as pull requests, then applied once "
+        "they merge.",
+        Next(
+            "dp-instance prepare --to <version>",
+            "prepares the upgrade to the next required stop, which dp-instance status names",
+        ),
+    ),
+}
+
+
 def main(argv: list[str] | None = None) -> int:
     utf8_output()
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] and argv[0] in RETIRED:
+        message, step = RETIRED[argv[0]]
+        screen = Screen(json_mode="--json" in argv, interactive=terminal())
+        screen.note(message, "bold red")
+        screen.continuing((step,))
+        result = Result(argv[0], "failed", message, (step,))
+        screen.emit(result.describe())
+        return USAGE
     parser = _parser()
     try:
         arguments = parser.parse_args(argv)
@@ -215,6 +274,7 @@ def main(argv: list[str] | None = None) -> int:
                 arguments.command,
                 getattr(arguments, "access", None),
                 getattr(arguments, "secret", None),
+                getattr(arguments, "itself", None),
             )
             if part
         )
@@ -229,7 +289,7 @@ def main(argv: list[str] | None = None) -> int:
             stop.message, {"failed": "bold red", "decision": "bold yellow"}.get(stop.status, "bold orange1")
         )
         if stop.next:
-            screen.next_block(stop.next)
+            screen.continuing(stop.next)
     except KeyboardInterrupt:
         result = Result(command, "failed", "Interrupted.")
     # Every command's total, the time it took, and its parts' times.

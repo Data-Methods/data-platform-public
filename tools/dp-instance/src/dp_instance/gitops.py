@@ -1,7 +1,7 @@
-"""Reading Git: checkouts, remotes and tags. dp-instance commits, pushes and merges nothing in a
-checkout; the components do. It observes, fetches a Managed Repository's tags to read its
-release, and fetches release manifests and template sources into its own folder. A read from
-a remote that fails for a moment is retried."""
+"""Git: checkouts, remotes and tags. dp-instance commits and pushes only in its own copies, and
+merges nothing; in your checkout it commits only what you say to. It fetches a Managed
+Repository's tags to read its release, and release manifests and template sources into its own
+folder. A read from a remote that fails for a moment is retried."""
 
 from __future__ import annotations
 
@@ -20,8 +20,6 @@ from .outcome import Stop, failed
 
 COMMIT = re.compile(r"^[0-9a-f]{40}$")
 DEVELOPMENT_SUFFIX = "-dev"
-# GitHub's answer, over HTTPS and SSH alike, for a repository it doesn't have.
-NOT_FOUND = "repository not found"
 # The first Git that reads configuration from its environment, `GIT_CONFIG_COUNT`.
 CONFIGURATION_ENVIRONMENT = (2, 31)
 
@@ -39,16 +37,18 @@ def remote_git(
     returned as it is. Any other that looks temporary, such as a dropped connection, is retried
     after a wait, up to three times; the last failure stops, saying whether it looked
     temporary."""
+    # What the messages name: the command, after any `-c` setting.
+    command = arguments[2:] if arguments[:1] == ("-c",) else arguments
     retried = 0
     while True:
         found = git(*arguments, cwd=cwd, check=False)
         if found.ok or (answer is not None and answer(found)):
             return found
         temporary = transient.classify(found.stderr)
-        if not transient.retries(temporary, retried, label=f"git {arguments[0]}"):
+        if not transient.retries(temporary, retried, label=f"git {command[0]}"):
             break
         retried += 1
-    words = " ".join(("git", *arguments[:2]))
+    words = " ".join(("git", *command[:2]))
     message = transient.exhausted(f"{words} failed: {found.first_error_line()}", temporary, retried)
     if temporary is not None:
         raise Stop("failed", message, reason="transient")
@@ -140,6 +140,12 @@ def uncommitted(path: Path, *, untracked: bool = False) -> list[str]:
     return files
 
 
+def untracked(path: Path) -> list[str]:
+    """The files in a checkout Git doesn't track and doesn't ignore."""
+    found = git("ls-files", "--others", "--exclude-standard", "-z", cwd=path).stdout
+    return [name for name in found.split("\0") if name]
+
+
 def branch(path: Path) -> str | None:
     """The checked-out branch, or None when detached."""
     found = git("symbolic-ref", "--quiet", "--short", "HEAD", cwd=path, check=False)
@@ -168,56 +174,63 @@ def main_commit(path: Path) -> str | None:
     return None
 
 
+def unmerged(path: Path, upstream: str, head: str, merged: tuple[str, ...] = ()) -> list[str]:
+    """The commits of ``head`` that ``upstream`` hasn't, oldest first, merges left out. Dropped:
+    those reachable from a commit ``merged`` names, as a merged change's prepare took them; every
+    commit up to the newest at which all of ``head``'s work since its merge base with ``upstream``
+    holds there, as a squash merge of several commits leaves it; one whose change ``upstream``
+    holds by its patch, as a rebase merge leaves it; and one every file of which ``upstream``
+    already holds as the commit leaves it."""
+    found = git("merge-base", upstream, head, cwd=path, check=False)
+    base = found.stdout.strip() if found.ok else None
+    excluded = [f"^{commit}" for commit in merged]
+    listed = git(
+        "rev-list", "--reverse", "--no-merges", f"{base}..{head}" if base else head, *excluded, cwd=path
+    ).stdout.split()
+    cut = 0
+    if base is not None:
+        for index, commit in enumerate(listed):
+            if holds_since(path, upstream, base, commit):
+                cut = index + 1
+    patched = {
+        line[2:]
+        for line in git("cherry", upstream, head, cwd=path).stdout.splitlines()
+        if line.startswith("+ ")
+    }
+    return [commit for commit in listed[cut:] if commit in patched and not holds(path, upstream, commit)]
+
+
+def changed_files(path: Path, *revisions: str) -> set[str]:
+    return set(git("diff", "--name-only", "-z", *revisions, cwd=path).stdout.split("\0")) - {""}
+
+
+def holds_since(path: Path, upstream: str, base: str, commit: str) -> bool:
+    """Whether ``upstream`` holds every file changed from ``base`` to ``commit`` as ``commit``
+    leaves it."""
+    return not changed_files(path, base, commit) & changed_files(path, commit, upstream)
+
+
+def holds(path: Path, upstream: str, commit: str) -> bool:
+    """Whether ``upstream`` holds every file ``commit`` changes as the commit leaves it, so
+    adding the commit to it changes nothing."""
+    changed = set(
+        git(
+            "diff-tree", "--no-commit-id", "--name-only", "-r", "-z", "--root", commit, cwd=path
+        ).stdout.split("\0")
+    ) - {""}
+    return not changed & changed_files(path, commit, upstream)
+
+
 def run_branch(change: str) -> str:
     """The branch a run's change names, as the components name it: `Platform 2026.3` is
     `platform-2026.3`."""
     return re.sub(r"[^a-z0-9.]+", "-", change.lower()).strip("-.")
 
 
-def has_branch(path: Path, name: str) -> bool:
-    """Whether the checkout has the local branch."""
-    return git("rev-parse", "--verify", "--quiet", f"refs/heads/{name}", cwd=path, check=False).ok
-
-
-def on_origin(path: Path, name: str) -> bool:
-    """Whether the checkout's origin has the branch, asked of origin itself, once: a failure
-    stops, naming Git's own first line of error."""
-    return bool(git("ls-remote", "--heads", "origin", f"refs/heads/{name}", cwd=path).stdout.strip())
-
-
-def origin_has_main(path: Path) -> bool:
-    """Whether the checkout's origin has a `main`, asked of origin itself: a repository a run
-    created and stopped before pushing has none. Nor does one GitHub doesn't have yet, which it
-    answers with "Repository not found", while the checkout has never fetched a `main` from it.
-    Any other failure stops, naming it, once a temporary one's retries are spent."""
-    fetched = git("rev-parse", "--verify", "--quiet", "refs/remotes/origin/main", cwd=path, check=False).ok
-
-    def absent(found: processes.Completed) -> bool:
-        return not fetched and found.code == 128 and NOT_FOUND in found.stderr.lower()
-
-    found = remote_git("ls-remote", "origin", "refs/heads/main", cwd=path, answer=absent)
-    return found.ok and bool(found.stdout.strip())
-
-
 def blob(path: Path, revision: str, file: str) -> bytes | None:
     """A file's bytes at a revision, exactly as committed, or None when either is missing
     locally."""
     return processes.output("git", "cat-file", "blob", f"{revision}:{file}", cwd=path)
-
-
-def applied_checkout(source: Path, commit: str, destination: Path) -> Path:
-    """A throwaway checkout of one commit of a local repository, sharing its objects, with the
-    same origin URL, so a component reads it as that repository. Nothing is fetched."""
-    git("clone", "--quiet", "--shared", "--no-checkout", str(source), str(destination))
-    git("checkout", "--quiet", "-B", "main", commit, cwd=destination)
-    remote = origin(source)
-    if remote:
-        git("remote", "set-url", "origin", remote, cwd=destination)
-    return destination
-
-
-def contains(path: Path, ancestor: str, descendant: str) -> bool:
-    return git("merge-base", "--is-ancestor", ancestor, descendant, cwd=path, check=False).ok
 
 
 def remote_refs(url: str, *patterns: str) -> dict[str, str]:
@@ -255,6 +268,16 @@ def parse_repository_url(url: str) -> tuple[str, str]:
 
 def repository_name(url: str) -> str:
     return parse_repository_url(url)[1].rsplit("/", 1)[-1]
+
+
+def pull_request_repository(url: str) -> str | None:
+    """The repository a GitHub pull request's URL, `https://<host>/<owner>/<name>/pull/<number>`,
+    is in, as its HTTPS URL; None for any other URL."""
+    parsed = urlsplit(url)
+    parts = parsed.path.strip("/").split("/")
+    if parsed.scheme != "https" or not parsed.hostname or len(parts) != 4 or parts[2] != "pull":
+        return None
+    return f"https://{parsed.hostname}/{parts[0]}/{parts[1]}"
 
 
 def same_repository(first: str, second: str) -> bool:

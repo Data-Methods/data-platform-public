@@ -1,13 +1,18 @@
 """The read-only commands over the sequence: `plan` and `verify`.
 
-`plan` is an optional preview of the checked-out code: it starts no run and changes
-nothing, walks the steps in order, ends at the first step with a change and lists the steps
-after it unplanned. `verify` is the completion check: every step's read-only verify, by phase,
-six phases at a time, each step shown with its own time; a step that isn't converged says
-what's left in its own words, and a phase that waits for a sign-in stops it for the sign-in,
-since its steps verified nothing. Either takes one step by its full name,
-`repository/component/phase/step`, and plans or verifies that step alone. Each writes only its
-own record in `.dp-instance/runs/`.
+`plan` previews what `apply` would do once the change merges: `origin/main`, the open change and
+your branch's commits, built in copies of its own as `prepare` builds them, edits that aren't
+committed left out and named; it pushes nothing and opens no pull request. It plans every
+platform step, read only, each with its outcome and whether it's
+provisional, and with `--step`, one step alone. `verify` is the Completion Check, from
+`origin/main`: when `main` is ahead of what each component's walk last applied, it says `apply`
+is pending and runs the drift check, against the commits the walks applied; otherwise every
+step's read-only verify, by phase, six phases at a time, each step shown with its own time; a
+step that isn't converged says what's left in its own words, and a phase that waits for a
+sign-in stops it for the sign-in, since its steps verified nothing. Either takes one step by its
+full name, `repository/component/phase/step`. Each writes only its own record in
+`.dp-instance/runs/`, which stays on this workstation. While a run is stopped, `plan` names it,
+and `verify` refuses: the platform is part way through that run.
 """
 
 from __future__ import annotations
@@ -15,34 +20,36 @@ from __future__ import annotations
 import json
 import time
 from concurrent.futures import ThreadPoolExecutor
-from itertools import groupby
 
 from rich.text import Text
 
-from . import targets
+from . import gitops, places, targets
 from .components import StepReports
-from .manifest import Manifest
-from .outcome import WAITING_FOR, WAITS, Next, Result, Stop, failed
+from .manifest import Manifest, read_file
+from .outcome import WAITING_FOR, Next, Result, Stop, failed
+from .processes import PHASES_AT_ONCE
 from .record import Record, runs_folder
 from .screen import Block
 from .sequence import Entry, parse_step
 from .session import Session
-from .walk import Run
+from .walk import APPLY, Prepare, Run
+from .walk.common import DRIFT_TEXT
+from .walk.reading import refuse_earlier_release, walks
 
-# How many phases `verify` reads at once.
-PHASES_AT_ONCE = 6
 
-
-def _record(session: Session, kind: str, goal: str, manifest: Manifest) -> Record:
-    found = Record.new(runs_folder(session.instance.state), kind, None, goal, manifest_origin=manifest.origin)
+def _record(session: Session, kind: str, goal: str, manifest: Manifest, **extra) -> Record:
+    found = Record.new(
+        runs_folder(session.instance.state), kind, None, goal, manifest_origin=manifest.origin, **extra
+    )
     found.manifest_path.write_text(manifest.text, encoding="utf-8")
+    session.name(found.id)
     return found
 
 
 class View(Run):
     """A read-only walk over the sequence, or one step of it."""
 
-    def single(self, name: str) -> Entry:
+    def single(self, name: str, kind: str = "step") -> Entry:
         """The step a full name, `repository/component/phase/step`, names, from its component's
         declaration alone, which the record holds as its only entry."""
         found = parse_step(name)
@@ -54,7 +61,7 @@ class View(Run):
         entry = None
         if found in known:
             started = time.monotonic()
-            entry = self.plan(self.declarations(only=found)).step(name)
+            entry = self.plan(self.declarations(only=found)).step(name, kind)
             self.timed("read", f"the steps of {found[1]}", started)
         if entry is None:
             raise failed(
@@ -74,190 +81,92 @@ class View(Run):
         return self.pull_requests(block, event)
 
 
-class Preview(View):
-    """`plan`: the run's steps planned in order, read only, up to the first change."""
+class Preview(Prepare):
+    """`plan`: the change as `prepare` builds it, planned read only."""
+
+    previewing_only = True
+
+    def header(self) -> None:
+        super().header()
+        self.session.show_stopped()
 
     def walk(self, step: str | None = None) -> Result:
         self.header()
         try:
-            return self._one(step) if step else self._walk()
+            if step:
+                self.show_part("before")
+                self.build()
+                self.record.entries = []
+                self.show_part("preview")
+                entry = View.single(self, step, "preview")
+                self.preview_group(entry)
+            else:
+                self.go()
         except KeyboardInterrupt:
             return self.stopped(Stop("failed", "Interrupted.", reason="interrupted"))
         except Stop as stop:
             return self.stopped(stop)
+        return self.done(step)
 
-    def _walk(self) -> Result:
-        self.show_part("before")
-        self.build()
-        entries = self.record.entries
-        self.preflights([entry for entry in entries if entry.kind == "preflight"])
-        self.close_part("before")
-        self._entry = self._block = None
-        groups = [
-            (key, list(group))
-            for key, group in groupby(
-                [entry for entry in entries if entry.kind == "step"],
-                key=lambda entry: (entry.repository, entry.component, entry.command, entry.phase),
-            )
-        ]
-        sections: list[dict] = []
-        for (repository, component, command, phase), members in groups:
-            plan_file = self.record.file(
-                "plans", f"{entries.index(members[0]) + 1:03d}-{component}-{phase}.txt"
-            )
-            change = self.planned(members, plan_file, sections, self.cli(repository, command))
-            if change is not None:
-                self.later(entries[entries.index(change) + 1 :])
-                return self.done(change, sections)
-        return self.done(None, sections)
-
-    def _one(self, name: str) -> Result:
-        self.show_part("platform")
-        entry = self.single(name)
-        plan_file = self.record.file("plans", f"001-{entry.component}-{entry.step}.txt")
-        sections: list[dict] = []
-        change = self.planned(
-            [entry], plan_file, sections, self.cli(entry.repository, entry.command), step=True
+    def done(self, step: str | None) -> Result:
+        """The preview's record and result: each step's outcome, and the first change."""
+        self.close_part()
+        preview = self.record.data.get("preview") or {}
+        entries = [entry for entry in self.record.entries if entry.kind == "preview"]
+        change = next(
+            (entry for entry in entries if (preview.get(entry.id) or {}).get("outcome") == "change"), None
         )
-        return self.done(change, sections, single=entry)
-
-    def planned(
-        self, members: list[Entry], plan_file, sections: list[dict], cli, *, step: bool = False
-    ) -> Entry | None:
-        """Plan one phase's steps, or one step, in one process, and show each with its own time;
-        the first with a change, if any."""
-        first = members[0]
-        block = Block("phase", "", first.phase, "", self.footer)
-        block.message = (
-            f"Planning {first.component}'s {first.phase} {'step ' + first.step if step else 'phase'}"
-        )
-        self.count(first)
-        reports = StepReports()
-        arguments = ["plan", "--phase", first.phase, *(["--step", first.step] if step else [])]
-        call = self.screen.run_live(
-            block,
-            cli.run,
-            *arguments,
-            "--json",
-            "--plan-file",
-            str(plan_file),
-            *self.version,
-            on_event=reports,
-        )
-        if call.status != "done":
-            self.enter(first)
-            self._pulls = {}
-            failing = self.block(first)
-            self._entry, self._block = first, failing
-            if call.status in WAITS:
-                self.wait(first, failing, call)
-            self.failure(first, failing, call)
-        events = {event["step"]: event for event in call.finished() if event.get("phase") == first.phase}
-        for entry in members:
-            self._position = self.record.entries.index(entry) + 1
-            event = events.get(entry.step)
-            self.enter(entry)
-            block = self.block(entry)
-            took = reports.seconds.get((entry.phase, entry.step))
-            pulls = self.reported(entry, block, reports, event)
-            if event is None:
-                self.finish(entry, block, "skipped", compact=True, took=took)
-                continue
-            for item in event.get("handoffs") or []:
-                sections.append(item)
-            self.optional(event)
-            status = event.get("status")
-            if status == "change":
-                block.add("Step Plan:", event.get("summary") or "a change")
-                if plan_file.exists() and plan_file.stat().st_size:
-                    block.add("Plan File:", self.relative(plan_file))
-                self.finish(
-                    entry, block, "change", took=took, summary=event.get("summary"), pull_requests=pulls
-                )
-                return entry
-            if status == "pending":
-                for item in event.get("handoffs") or []:
-                    if item.get("required"):
-                        block.add("Step Handoff:", item.get("title", item.get("id")))
-                self.finish(entry, block, "pending", took=took, pull_requests=pulls)
-                continue
-            self.finish(entry, block, "no change", compact=True, took=took, pull_requests=pulls)
-        return None
-
-    def later(self, rest) -> None:
-        for entry in rest:
-            self.enter(entry)
-            block = self.block(entry)
-            block.finish("planned later")
-            block.seconds = None
-            self.screen.show(block, compact=True)
-
-    def done(self, change, sections: list[dict], *, single: Entry | None = None) -> Result:
-        """The preview's record and result; its platform part ends with the steps it planned."""
-        self.close_part("platform")
-        pages = self.pages([item for item in sections if item.get("required")]) if sections else {}
-        entries = self.record.entries
         summary = {
             "change": change.id if change is not None else None,
             "steps": [
-                {"entry": entry.id, **(self.record.outcome(entry.id) or {"outcome": "planned later"})}
+                {"entry": entry.id, **(preview.get(entry.id) or {"outcome": "not planned"})}
                 for entry in entries
             ],
-            "handoffs": sections,
-            "pages": [self.relative(path) for path in pages.values()],
-            "merges": [entry.id for entry in entries if entry.phase == "merge"],
+            "left_out": self.record.data.get("left_out") or {},
         }
         self.record.file("plan.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
-        lines = [f"# {self.record.data['goal']}", "", f"Instance `{self.instance.key}`.", ""]
-        for entry in entries:
-            noted = self.record.outcome(entry.id) or {"outcome": "planned later"}
-            line = f"- {entry.where}: {noted['outcome']}"
-            if noted.get("summary"):
-                line += f" ({noted['summary']})"
-            lines.append(line)
-        if sections:
-            lines += ["", "## Handoffs", ""]
-            for item in sections:
-                need = "required" if item.get("required") else "optional"
-                lines.append(f"- {item.get('title')} ({item.get('system')}, {need})")
-        self.record.file("plan.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
         self.record.complete()
+        self.screen.blank(2)
+        left_out = self.record.data.get("left_out") or {}
         if change is None:
-            self.screen.blank(2)
-            if single is not None:
-                message = f"No change at {single.where}."
-                self.screen.print(Text(message, style="bold green"))
-            else:
-                message = "No changes."
-                self.screen.print(
-                    Text.assemble(
-                        ("No changes.", "bold green"), " The platform matches the code and configuration."
-                    )
-                )
-            return Result("plan", "done", message, detail={"run": self.record.id, "change": None})
-        steps = (
-            Next(
-                "dp-instance apply",
-                "once the change is merged to main, starts a run, which reviews each step with a change "
-                "before applying it",
-            ),
+            message = f"No change at {entries[0].where}." if step and entries else "No changes."
+            self.screen.print(Text(message, style="bold green"))
+            return Result(
+                "plan", "done", message, detail={"run": self.record.id, "change": None, "left_out": left_out}
+            )
+        steps = (Next("dp-instance prepare", "turns the change into pull requests to review and merge"),)
+        self.screen.then(
+            "Run dp-instance prepare to turn it into pull requests.", self.relative(self.record.folder) + "/"
         )
-        self.screen.next_block(steps, self.relative(self.record.folder) + "/")
+        message = f"{change.where} has a change." if step else f"The first change is at {change.where}."
         return Result(
-            "plan",
-            "done",
-            f"The first change is at {change.where}." if single is None else f"{change.where} has a change.",
-            steps,
-            {"run": self.record.id, "change": change.id},
+            "plan", "done", message, steps, {"run": self.record.id, "change": change.id, "left_out": left_out}
         )
 
 
 def plan(session: Session, step: str | None = None) -> Result:
-    manifest = targets.running(session.instance, session.releases)
-    manifest.check_install(session.own_version())
-    what = f"the step {step}" if step else "the checked-out code"
+    instance = session.instance
+    open_change = session.shared.change() if session.shared is not None else None
+    prepared = session.prepared((open_change or {}).get("run"))
+    if prepared is not None and prepared.manifest_path.is_file():
+        manifest = read_file(prepared.manifest_path)
+    else:
+        _, copies = places.mains(instance)
+        manifest = targets.manifest_of(
+            instance, session.releases, places.records(copies), given=tuple(session.candidates())
+        )
+    what = f"the step {step}" if step else "main, the open change and your branch"
     goal = f"plan: a preview of Platform {manifest.platform_version}, {what}; starts no run"
-    return Preview(session, _record(session, "plan", goal, manifest), manifest).walk(step)
+    change = (open_change or {}).get("change") or "Platform change"
+    record = _record(
+        session, "plan", goal, manifest, change=change, branch=gitops.run_branch(change), title="Preview"
+    )
+    copies = {
+        item.key: places.clone(instance, places.PLAN, instance.components[item.key])
+        for item in manifest.order
+        if item.key in instance.components
+    }
+    return Preview(session, record, manifest, copies).walk(step)
 
 
 class Verification(View):
@@ -265,19 +174,28 @@ class Verification(View):
 
     def walk(self, step: str | None = None) -> Result:
         self.header()
-        started = time.monotonic()
         self.show_part("platform")
         again = f"dp-instance verify --step {step}" if step else "dp-instance verify"
         try:
             if step:
                 entries = [self.single(step)]
             else:
-                self.build()
-                entries = [entry for entry in self.record.entries if entry.kind == "step"]
+                declarations = self.declarations()
+                if not walks(declarations):
+                    raise refuse_earlier_release("The templates on main")
+                pending = self.pending()
+                if pending:
+                    return self.apply_pending(pending)
+                entries = self.plan(declarations).platform()
+                self.record.entries = entries
         except Stop as stop:
             steps = stop.next
             if stop.status == "sign-in":
                 steps = (*steps, Next(again, "checks again once signed in"))
+            self.record.complete()
+            self.screen.blank(2)
+            self.screen.note(stop.message, "bold orange1")
+            self.screen.continuing(steps, self.relative(self.record.folder) + "/")
             return Result("verify", stop.status, stop.message, steps, {"run": self.record.id})
         results = self.verify_phases(entries, step is not None)
         problems = []
@@ -287,16 +205,19 @@ class Verification(View):
             found = self.verified(entry, call, reports, failed_phases)
             if found is not None:
                 problems.append(found)
-        self.record.complete()
-        self.close_part("platform", time.monotonic() - started)
-        self.screen.blank(2)
         signed_out = next((call for call, _ in results.values() if call.status == "sign-in"), None)
+        # The Completion Check passed: what `status` reads to stop naming the Adoption PRs a run
+        # left open.
+        self.record.data["converged"] = step is None and signed_out is None and not problems
+        self.record.complete()
+        self.close_part("platform")
+        self.screen.blank(2)
         if signed_out is not None:
             # A phase that couldn't sign in verified nothing: what's left can't be told yet.
             message = f"Not every step could be verified; a sign-in to renew: {signed_out.message}"
             self.screen.print(Text.assemble(("Not verified.", "bold orange1"), f" {message}"))
             steps = (*self.sign_in_next(signed_out), Next(again, "checks again once signed in"))
-            self.screen.next_block(steps, self.relative(self.record.folder) + "/")
+            self.screen.continuing(steps, self.relative(self.record.folder) + "/")
             return Result(
                 "verify",
                 "sign-in",
@@ -331,7 +252,7 @@ class Verification(View):
             ),
             Next(again, "checks again once each is done"),
         )
-        self.screen.next_block(steps, self.relative(self.record.folder) + "/")
+        self.screen.continuing(steps, self.relative(self.record.folder) + "/")
         return Result(
             "verify",
             "failed",
@@ -344,6 +265,44 @@ class Verification(View):
                     for entry, messages in problems
                 ],
             },
+        )
+
+    def pending(self) -> list[str]:
+        """The components whose walk last applied another commit than `main`'s: `apply` is
+        pending for them."""
+        block = Block("verify", "", "", "", self.footer)
+        _, applied = self.read_applied(block)
+        main = self.record.data.get("main") or {}
+        return [
+            component.key
+            for repository in self.repositories
+            for component in repository.components
+            if applied.get(component.key) != main.get(repository.key)
+        ]
+
+    def apply_pending(self, pending: list[str]) -> Result:
+        """`main` is ahead of what's applied: the drift check, against the commits the walks last
+        applied, and `apply`, which brings the platform to `main`."""
+        entry = Entry(id="drift-check", kind="drift", description=DRIFT_TEXT)
+        self.record.entries = [entry]
+        self.show_part("before")
+        block = self.block(entry)
+        self._entry, self._block = entry, block
+        self.enter(entry)
+        self.drift_check(entry, block)
+        self._entry = self._block = None
+        self.record.data["converged"] = False
+        self.record.complete()
+        self.close_part("before")
+        message = f"Apply pending: main is ahead of what {', '.join(pending)} last applied; nothing drifts."
+        self.screen.blank(2)
+        self.screen.print(
+            Text.assemble(("Apply pending.", "bold orange1"), message.removeprefix("Apply pending."))
+        )
+        steps = (APPLY,)
+        self.screen.then("Run dp-instance apply.", self.relative(self.record.folder) + "/")
+        return Result(
+            "verify", "done", message, steps, {"run": self.record.id, "pending": pending, "drift": False}
         )
 
     @staticmethod
@@ -444,8 +403,12 @@ class Verification(View):
 
 
 def verify(session: Session, step: str | None = None) -> Result:
-    manifest = targets.running(session.instance, session.releases)
-    manifest.check_install(session.own_version())
+    session.refuse_while_stopped("verify")
+    commits, copies = places.mains(session.instance)
+    manifest = targets.manifest_of(
+        session.instance, session.releases, places.records(copies), given=tuple(session.candidates())
+    )
     what = f"the step {step}" if step else "every step"
     goal = f"verify: {what} of Platform {manifest.platform_version}, read only"
-    return Verification(session, _record(session, "verify", goal, manifest), manifest).walk(step)
+    record = _record(session, "verify", goal, manifest, main=commits)
+    return Verification(session, record, manifest, copies).walk(step)

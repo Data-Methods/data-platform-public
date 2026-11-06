@@ -1,16 +1,17 @@
 [project]
 name = "dp-instance"
-version = "3.0.0"
+version = "4.0.0"
 description = "Runs a Platform Instance's upgrades and configuration changes through each component's own CLI."
 license = "MIT"
 requires-python = ">=3.12"
-# Rich and its three dependencies, each pinned exactly: `uv tool install` resolves these
-# requirements, not the lock file.
+# Rich and its three dependencies, and truststore, which has none, each pinned exactly: `uv tool
+# install` resolves these requirements, not the lock file.
 dependencies = [
     "rich==14.1.0",
     "markdown-it-py==4.2.0",
     "mdurl==0.1.2",
     "pygments==2.21.0",
+    "truststore==0.10.5",
 ]
 
 [project.scripts]

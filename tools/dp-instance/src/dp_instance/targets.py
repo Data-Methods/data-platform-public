@@ -1,45 +1,61 @@
 """Which release an instance is on, and whether it may take a target, from its records.
 
-Each Component Repository records the template commit it holds. On `stable`, a published
-manifest whose sources name those commits is the release the instance runs. A repository on
-`canary` runs unpublished commits, which only canary's own candidate manifests name, kept in
-its completed runs' records on the workstation that ran them; there, the candidate's Platform
-Version is where the instance stands, and its published release is the one it takes. A release
-this dp-instance doesn't run, such as one that needs a newer dp-instance, is taken
-with the dp-instance its manifest names. Versions compare whole, so 2026.3.1 is newer than
-2026.3.
+Each Component Repository records the template commit it holds and, from the engine that records
+it, the Platform Version its upgrade named. On `stable`, the release the instance runs is the
+newest published one whose manifest names each repository's commit, for every repository it
+lists, so a repository a release leaves unchanged counts as that release, and a hand-edited
+version never counts. When the records name a version, it's checked against its manifest, and
+only the manifests published after it are read; records that name none, as at the contract
+floor, or whose version doesn't hold, are matched against every published manifest. A
+repository on `canary` runs unpublished commits, a candidate's, and its published release is the
+one it takes. The candidate's Platform Version is the one a manifest this workstation's runs ran
+names, when its sources are the records' commits; else the one the records name, which counts
+once that version is published only where its manifest names the commits, and otherwise is taken
+as it is, except where it decides whether the instance may take a target. A release this
+dp-instance can't read is taken once `dp-instance self update` installs the newest. Versions
+compare whole, so 2026.3.1 is newer than 2026.3.
 
-Each dp-instance upgrades from one oldest Platform Version on, which rises with its major
-version as a stop's bridges go. Every command that finds an older instance refuses it before
-anything else, writing only the release cache, and names the dp-instance its next stop runs.
+Each dp-instance knows only its own floor, the oldest Platform Version whose contracts it reads.
+Every command that finds an instance on a published release before it, as each repository's
+`main` records it, refuses it first, and names the dp-instance that reads it; it fetches `main`
+only to make sure before it refuses. So does every command that finds a run under way or
+stopped that an earlier walk started, which only the dp-instance before this walk carries on.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import installed
+from . import gitops, installed
 from . import record as records
-from .instance import SETUP, Instance, SourceRecord, applied_record
-from .manifest import (
-    Manifest,
-    Releases,
-    family,
-    install_command,
-    minimum_of,
-    read_file,
-    tool_tag,
-    version_key,
-)
+from .instance import Instance, SourceRecord, applied_record
+from .manifest import Manifest, Releases, family, read_file, version_key
 from .outcome import Next, Stop, failed
 
-# The oldest Platform Version this dp-instance upgrades from.
-OLDEST = "2026.4"
+# The oldest Platform Version whose contracts this dp-instance reads, and the dp-instance that
+# reads the releases before it, from the oldest it reads.
+FLOOR = "2026.5.1"
+BELOW_FLOOR = "3.0.0"
+BELOW_FLOOR_READS = "Platform 2026.4 to 2026.5.1"
 
 
-def records_of(instance: Instance, *, applied: bool = False) -> dict[str, SourceRecord]:
-    return {template: instance.record(template, applied=applied) for template in instance.components}
+def apply_steps(recorded: dict[str, SourceRecord], why: str) -> tuple[Next, ...]:
+    """What brings `main` to what the platform runs: `apply`, under the dp-instance that walks
+    the release these records name, which is an older one for a release below the floor."""
+    apply = Next("dp-instance apply", why)
+    older = any(
+        item.platform_version and version_key(item.platform_version) <= version_key(FLOOR)
+        for item in recorded.values()
+    )
+    return (below_floor(", which walks this release"), apply) if older else (apply,)
+
+
+def records_of(instance: Instance) -> dict[str, SourceRecord]:
+    """Each Component Repository's record, as checked out."""
+    return {template: instance.record(template) for template in instance.components}
 
 
 def matches(document: dict, recorded: dict[str, SourceRecord]) -> bool:
@@ -57,47 +73,50 @@ def matches(document: dict, recorded: dict[str, SourceRecord]) -> bool:
     return True
 
 
-def named_before(releases: Releases, version: str) -> dict[str, set[str]]:
-    """Each template's commits that the releases published before ``version`` name. A
-    release reuses the commit of a template that didn't change, so one that names such a
-    commit leaves that template as it was."""
-    found: dict[str, set[str]] = {}
-    for published, document in releases.documents():
-        sources = document.get("sources")
-        if version_key(published) >= version_key(version) or not isinstance(sources, dict):
-            continue
-        for template, commit in sources.items():
-            found.setdefault(template, set()).add(commit)
-    return found
+def _holds(releases: Releases, version: str, recorded: dict[str, SourceRecord]) -> bool:
+    """Whether a published version's manifest names each record's commit, for every repository
+    it lists, read as published, as every published manifest is matched; a tag that moved stops."""
+    try:
+        document = json.loads(releases.text(version))
+    except ValueError:
+        return False
+    return isinstance(document, dict) and matches(document, recorded)
+
+
+def release_of(recorded: dict[str, SourceRecord], releases: Releases) -> str | None:
+    """The newest published release whose manifest names each record's commit, for every
+    repository it lists; None when none does. When the newest version a stable record names
+    holds, only the manifests published after it are read, newest first."""
+    named = [
+        item.platform_version
+        for item in recorded.values()
+        if item.channel == "stable" and item.platform_version
+    ]
+    published = releases.published()
+    newest = max(named, key=version_key) if named else None
+    if newest in published and _holds(releases, newest, recorded):
+        later = [version for version in published if version_key(version) > version_key(newest)]
+        return next((version for version in reversed(later) if _holds(releases, version, recorded)), newest)
+    return next((version for version, document in releases.documents() if matches(document, recorded)), None)
 
 
 @dataclass(frozen=True)
 class Current:
-    """What the instance's records say it runs."""
+    """What the instance's records say it runs: the published release, or, on candidate
+    commits, the canary repositories and the candidate's version, when one is known."""
 
     version: str | None
     canary: tuple[str, ...]
+    candidate: str | None = None
+    # The records it was read from.
+    recorded: dict[str, SourceRecord] = field(default_factory=dict, compare=False)
 
     def describe(self) -> str:
         if self.version:
             return f"Platform {self.version}"
         if self.canary:
-            return "canary candidate commits"
+            return "canary candidate commits" + (f" of Platform {self.candidate}" if self.candidate else "")
         return "no published release"
-
-
-def current(instance: Instance, releases: Releases, *, applied: bool = False) -> Current:
-    """The release the repositories record, as checked out, or with ``applied`` as each
-    one's `main` holds it."""
-    recorded = records_of(instance, applied=applied)
-    stable = {key: value for key, value in recorded.items() if value.channel == "stable"}
-    canary = tuple(sorted(key for key, value in recorded.items() if value.channel != "stable"))
-    if not stable:
-        return Current(None, canary)
-    for version, document in releases.documents():
-        if matches(document, stable):
-            return Current(version, canary)
-    return Current(None, canary)
 
 
 def saved_candidates(instance: Instance) -> list[Manifest]:
@@ -114,79 +133,116 @@ def saved_candidates(instance: Instance) -> list[Manifest]:
     return found
 
 
-def _saved_candidate(instance: Instance, recorded: dict[str, SourceRecord]) -> Manifest | None:
-    """The newest manifest this workstation's completed runs ran whose sources the records
-    name."""
-    return next(
-        (found for found in saved_candidates(instance) if matches({"sources": found.sources}, recorded)),
+def _candidate(recorded: dict[str, SourceRecord], given: tuple[Manifest, ...]) -> Manifest | None:
+    """The newest of ``given`` candidate manifests whose sources the records name."""
+    return next((found for found in given if matches({"sources": found.sources}, recorded)), None)
+
+
+def candidate_version(
+    instance: Instance,
+    releases: Releases,
+    recorded: dict[str, SourceRecord],
+    *,
+    given: tuple[Manifest, ...] = (),
+    verified: bool = False,
+) -> str | None:
+    """The Platform Version whose candidate the records hold: the one a manifest this
+    workstation's completed runs ran names, or one of ``given``, when its sources are the
+    records' commits; else the newest the canary records name, which counts once it's published
+    only where its manifest names their commits, and while it isn't, unless ``verified`` asks for
+    a checked version or this workstation's runs ran a manifest of it that names other commits.
+    None when nothing names one."""
+    found = _candidate(recorded, (*saved_candidates(instance), *given))
+    if found is not None:
+        return found.platform_version
+    named = [
+        item.platform_version
+        for item in recorded.values()
+        if item.channel != "stable" and item.platform_version
+    ]
+    if not named:
+        return None
+    newest = max(named, key=version_key)
+    if newest in releases.published():
+        return newest if _holds(releases, newest, recorded) else None
+    if verified or any(item.platform_version == newest for item in saved_candidates(instance)):
+        return None
+    return newest
+
+
+def standing(
+    instance: Instance,
+    releases: Releases,
+    recorded: dict[str, SourceRecord],
+    *,
+    given: tuple[Manifest, ...] = (),
+    verified: bool = False,
+) -> Current:
+    """Where the records say the instance stands: the published release, when every record is
+    on `stable`, or else the candidate's version."""
+    canary = tuple(sorted(key for key, value in recorded.items() if value.channel != "stable"))
+    if not canary:
+        return Current(release_of(recorded, releases) if recorded else None, (), recorded=recorded)
+    return Current(
         None,
+        canary,
+        candidate_version(instance, releases, recorded, given=given, verified=verified),
+        recorded=recorded,
     )
 
 
-def under_way(
-    instance: Instance, recorded: dict[str, SourceRecord]
-) -> tuple[records.Record, Manifest] | None:
-    """The run under way or stopped, and the manifest it runs, when the records name its
-    sources, as a candidate upgrade that hasn't finished leaves them."""
-    run = records.active(instance.state)
-    if run is None or not run.manifest_path.is_file():
-        return None
-    try:
-        found = read_file(run.manifest_path)
-    except Stop:
-        return None
-    return (run, found) if matches({"sources": found.sources}, recorded) else None
+def mixed(recorded: dict[str, SourceRecord]) -> str:
+    """Each repository's record, for a stop that names them."""
+    return "; ".join(f"{key} records {value.describe()}" for key, value in sorted(recorded.items()))
 
 
-def candidate_of(instance: Instance, *, applied: bool = False) -> str | None:
-    """The Platform Version whose candidate the repositories record, as checked out, or with
-    ``applied`` as each one's `main` holds it: a completed run's, or else the run under way's.
-    Only the workstation that ran the candidate keeps its manifest, so on any other it's None."""
-    recorded = records_of(instance, applied=applied)
-    found = _saved_candidate(instance, recorded)
-    if found is None:
-        unfinished = under_way(instance, recorded)
-        found = unfinished[1] if unfinished else None
-    return found.platform_version if found else None
+def manifest_of(
+    instance: Instance,
+    releases: Releases,
+    recorded: dict[str, SourceRecord],
+    *,
+    given: tuple[Manifest, ...] = (),
+) -> Manifest:
+    """The manifest of the release the records hold, which a walk runs in its order: the
+    published release every repository records, or the candidate manifest this workstation's
+    runs ran, or one of ``given``, whose sources they name. Repositories that record different
+    Platform Versions, or commits no release or candidate here names, stop, naming each."""
+    version = release_of(recorded, releases) if recorded else None
+    if version is not None:
+        return releases.manifest(version)
+    found = _candidate(recorded, (*saved_candidates(instance), *given))
+    if found is not None:
+        return found
+    raise Stop(
+        "failed",
+        "The repositories' records match no published release and no candidate this workstation "
+        f"ran: {mixed(recorded)}. Nothing has changed.",
+        reason="mixed",
+        next=(Next("dp-instance status", "shows what each repository records"),),
+    )
 
 
 def running(instance: Instance, releases: Releases) -> Manifest:
-    """The manifest of the release the checked-out code is: what `plan`, `apply` and `verify`
-    run, in its order. A candidate run that hasn't finished is resumed, never run anew."""
-    recorded = records_of(instance)
-    for version, document in releases.documents():
-        if matches(document, recorded):
-            return releases.manifest(version)
-    candidate = _saved_candidate(instance, recorded)
-    if candidate is not None:
-        return candidate
-    unfinished = under_way(instance, recorded)
-    if unfinished is not None:
-        run, found = unfinished
-        raise failed(
-            f"The repositories record candidate commits of Platform {found.platform_version} from run "
-            f"{run.id}, which hasn't finished.",
-            Next("dp-instance resume", "carries on that run"),
-        )
-    listing = ", ".join(f"{key} at {value.describe()}" for key, value in sorted(recorded.items()))
-    raise failed(
-        "The repositories' recorded template commits match no published release and no "
-        f"candidate this workstation upgraded to: {listing}.",
-        Next("dp-instance resume", "finishes an upgrade under way, if this workstation started it"),
-        Next("dp-instance upgrade --to <version>", "upgrades the instance to a published Platform Version"),
-        SETUP,
-    )
+    """The manifest of the release the checked-out code is, in its order."""
+    return manifest_of(instance, releases, records_of(instance))
 
 
-def upgrade_steps(releases: Releases, version: str, why: str) -> tuple[Next, ...]:
-    """The commands that take a release: first, when this dp-instance doesn't run it, the install
-    of the one its manifest names, as a manifest newer than this dp-instance reads names it."""
-    upgrade = Next(f"dp-instance upgrade --to {version}", why)
+SELF_UPDATE = Next("dp-instance self update", "installs the newest dp-instance")
+
+
+def upgrade_steps(releases: Releases, version: str, why: str, *, pinned: bool = False) -> tuple[Next, ...]:
+    """The commands that take a release: first, when a newer dp-instance is published and this
+    one isn't pinned, or when this one can't read the release's manifest, `self update`, which
+    installs the newest."""
+    upgrade = Next(f"dp-instance prepare --to {version}", why)
+    newest = next(reversed(releases.tools()), None)
+    if not pinned and newest is not None and not installed.at_least(installed.version(), newest):
+        return (SELF_UPDATE, upgrade)
     try:
-        found = releases.manifest(version)
-    except Stop as stop:
-        return (*stop.next, upgrade)
-    return (upgrade,) if found.runs_on(installed.version()) else (found.install(), upgrade)
+        releases.manifest(version)
+    except Stop:
+        return (SELF_UPDATE, upgrade)
+    return (upgrade,)
 
 
 def next_release(releases: Releases, version: str) -> str | None:
@@ -199,6 +255,46 @@ def next_release(releases: Releases, version: str) -> str | None:
     return newer if newer is not None and version_key(newer) > version_key(version) else None
 
 
+def upgrades(releases: Releases, found: Current) -> tuple[list[tuple[str, str]], list[str]]:
+    """The published releases an instance may upgrade to, as `check_next_stop` allows them: first
+    the latest of the next Platform Version and the newest fix of its own, each saying which, then
+    any other it allows, newest first. A candidate may take its own release once published."""
+    start = found.version or found.candidate
+    if start is None:
+        return [], []
+    own = family(start)
+    later = [item for item in releases.families() if item > own]
+    allowed = [
+        version
+        for version in releases.published()
+        if (family(version) == own or (later and family(version) == later[0]))
+        and (
+            version_key(version) > version_key(start)
+            or (found.version is None and version_key(version) == version_key(start))
+        )
+    ]
+    first = []
+    if later and releases.latest_of(later[0]) in allowed:
+        first.append((releases.latest_of(later[0]), "latest next Platform Version"))
+    newest = releases.latest_of(own)
+    if newest in allowed:
+        first.append((newest, "newest fix"))
+    named = {version for version, _ in first}
+    return first, [version for version in reversed(allowed) if version not in named]
+
+
+def current_version(found: Current, releases: Releases) -> str:
+    """The Platform Version the records hold, as a line says it."""
+    if found.version:
+        return found.version
+    if not found.canary:
+        return "no published release"
+    if found.candidate is None:
+        return "unknown: the commits match no candidate this workstation upgraded to"
+    state = "candidate" if found.candidate in releases.published() else "candidate, not published"
+    return f"{found.candidate} ({state})"
+
+
 def describe_next(version: str, upcoming: str) -> str:
     """What ``upcoming``, the next release, is to an instance on ``version``."""
     if family(upcoming) > family(version):
@@ -206,144 +302,136 @@ def describe_next(version: str, upcoming: str) -> str:
     return "the newest fix of Platform " + ".".join(str(part) for part in family(version))
 
 
-def next_stop(instance: Instance, releases: Releases) -> tuple[str, str | None]:
-    """With no target named, the release the instance runs, as each repository's `main`
-    records it, and the next one it takes, or None on the newest release. Candidate commits
-    take none: only a candidate manifest keeps canary on the canary channel."""
-    found = current(instance, releases, applied=True)
-    if found.canary:
-        raise failed(
-            "This instance runs canary candidate commits, so dp-instance doesn't choose the release it "
-            "takes: a candidate manifest keeps it on the canary channel.",
-            Next("dp-instance upgrade --manifest <candidate manifest>", "upgrades to that candidate"),
-        )
-    if found.version is None:
-        raise failed(
-            "This instance's recorded template commits match no published release, so dp-instance "
-            "can't tell which release it takes next.",
-            Next("dp-instance status", "shows what each repository records"),
-        )
-    return found.version, next_release(releases, found.version)
-
-
-def check_may_take(instance: Instance, releases: Releases, target: Manifest) -> Current:
-    """Every Platform Version is a required stop: an instance moves to a release of its own
-    family or of the next one, from any release of its current one, and never back to an older
-    release, an older fix included. On candidate commits, its own is the Platform Version
-    they're the candidate of, when this workstation ran it. What it runs is what each
-    repository's `main` records, so an upgrade under way on its branch still counts as the
-    release it started from."""
-    found = current(instance, releases, applied=True)
+def check_next_stop(found: Current, releases: Releases, target: Manifest, *, pinned: bool = False) -> None:
+    """Every Platform Version is a required stop: an instance moves to a newer release of its
+    own family or to one of the next, and never back to an older release, an older fix
+    included, nor to the release it runs. On candidate commits, its own is the version
+    they're a checked candidate of; with none, nothing is compared, as before records named
+    one."""
+    start = found.version or found.candidate
     if found.version is None and not found.canary:
         raise failed(
             "This instance's recorded template commits match no published release, so dp-instance "
             f"can't tell whether it may take Platform {target.platform_version}.",
             Next("dp-instance status", "shows what each repository records"),
         )
-    start = found.version or candidate_of(instance, applied=True)
     if start is None:
-        return found
+        # Candidate commits no manifest names: the newest Platform Version their records name
+        # bounds them, and with none named, nothing tells a downgrade apart.
+        named = [item.platform_version for item in found.recorded.values() if item.platform_version]
+        if not named:
+            raise failed(
+                "This instance's canary candidate commits name no Platform Version, so dp-instance can't "
+                f"tell whether Platform {target.platform_version} would take it back.",
+                Next("dp-instance status", "shows what each repository records"),
+            )
+        newest = max(named, key=version_key)
+        if version_key(target.platform_version) < version_key(newest):
+            raise failed(
+                f"This instance runs canary candidate commits of Platform {newest} or later; it can't go "
+                f"back to {target.platform_version}."
+            )
+        return
     runs = f"Platform {start}" if found.version else f"canary candidate commits of Platform {start}"
+    if found.version is not None and target.platform_version == start:
+        raise failed(f"This instance runs {runs} already; nothing to prepare.")
     if version_key(target.platform_version) < version_key(start):
         raise failed(f"This instance runs {runs}; it can't go back to {target.platform_version}.")
     # A candidate's Platform Version may not be published yet.
-    families = sorted({*releases.families(), family(start)})
+    families = sorted({*releases.families(), family(start), family(target.platform_version)})
     distance = families.index(family(target.platform_version)) - families.index(family(start))
     if distance > 1:
         stop = releases.latest_of(families[families.index(family(start)) + 1])
         raise failed(
             f"This instance runs {runs}. Every Platform Version is a required stop, "
             f"so it upgrades to {stop} before {target.platform_version}.",
-            *upgrade_steps(releases, stop, "takes the next required stop"),
+            *upgrade_steps(releases, stop, "takes the next required stop", pinned=pinned),
         )
-    return found
 
 
-def _sources(document: dict) -> dict:
-    found = document.get("sources")
-    return found if isinstance(found, dict) else {}
+def below_floor(why: str) -> Next:
+    return installed.install(BELOW_FLOOR, f", which reads {BELOW_FLOOR_READS}{why}")
 
 
-def older_release(recorded: dict[str, SourceRecord], documents: list[tuple[str, dict]]) -> str | None:
-    """The release before OLDEST that the records say the instance runs, or None. It's the
-    release the stable records match; when they match none, as a run from such a release that
-    stopped part way leaves them, the newest that names every commit only releases before
-    OLDEST name, or else the newest that names one."""
-    oldest = version_key(OLDEST)
-    stable = {key: value for key, value in recorded.items() if value.channel == "stable"}
-    runs = next((version for version, document in documents if stable and matches(document, stable)), None)
-    if runs is not None:
-        return runs if version_key(runs) < oldest else None
-    before = [(version, document) for version, document in documents if version_key(version) < oldest]
-    since = {
-        (template, commit)
-        for version, document in documents
-        if version_key(version) >= oldest
-        for template, commit in _sources(document).items()
-    }
-    left = {
-        template: found
-        for template, found in recorded.items()
-        if (template, found.commit) not in since
-        and any(_sources(document).get(template) == found.commit for _, document in before)
-    }
-    if not left:
-        return None
-    return next((version for version, document in before if matches(document, left)), None) or next(
-        version
-        for version, document in before
-        if any(_sources(document).get(template) == found.commit for template, found in left.items())
-    )
+def fetch_main(checkout: Path) -> None:
+    """Fetch the checkout's `main` from GitHub, as `origin/main`; a fetch that fails leaves the
+    one last fetched."""
+    try:
+        gitops.remote_git("fetch", "--quiet", "origin", "main", cwd=checkout)
+    except Stop:
+        pass
 
 
-def refuse_older(checkouts: dict[str, Path], releases: Releases) -> None:
-    """Stop when the instance runs a release before OLDEST, as each Component Repository's `main`
-    records it, naming the dp-instance its next stop runs. A record that can't be read says
-    nothing. Only the release cache is written."""
-    if all(version_key(version) >= version_key(OLDEST) for version in releases.published()):
-        return
+def applied_release(checkouts: dict[str, Path], releases: Releases) -> str | None:
+    """The published release each Component Repository's `main`, as last fetched, records; None
+    when the records that can be read match none."""
     recorded = {}
     for template, checkout in checkouts.items():
         try:
             found = applied_record(checkout)
         except Stop:
             continue
-        if found is not None:
+        if found is not None and found.channel == "stable":
             recorded[template] = found
-    documents = releases.documents()
-    version = older_release(recorded, documents)
-    if version is None:
+    return release_of(recorded, releases) if recorded else None
+
+
+def check_floor(checkouts: dict[str, Path], releases: Releases) -> None:
+    """Stop when the instance runs a published release before FLOOR, as each Component
+    Repository's `main` records it, naming the dp-instance that reads it. `main` as last fetched
+    decides, and only when it would refuse is each `main` fetched from GitHub to decide again, so a
+    current instance fetches nothing and a workstation that fetched long ago isn't refused for it.
+    Records that can't be read, or that match no published release, say nothing. Only the release
+    cache, and when it would refuse each checkout's `origin/main`, are written."""
+    if all(version_key(version) >= version_key(FLOOR) for version in releases.published()):
         return
-    own = installed.version()
-    shown = f"dp-instance {own}" if own else "a local copy of dp-instance"
-    message = (
-        f"This instance runs Platform {version}, and {shown} upgrades from Platform {OLDEST} on; "
-        "nothing has changed."
-    )
-    stop = next_release(releases, version)
-    minimum = minimum_of(dict(documents).get(stop) or {}) if stop else None
-    steps: tuple[Next, ...] = ()
-    if minimum is not None:
-        message += (
-            f" Use dp-instance {minimum} until the instance runs Platform {stop}; dp-instance update "
-            "installs this version again."
-        )
-        steps = (
-            Next(install_command(tool_tag(minimum)), f"installs the dp-instance Platform {stop} runs"),
-            Next("dp-instance upgrade", f"takes Platform {stop}, the next required stop"),
-        )
+    version = applied_release(checkouts, releases)
+    if version is None or version_key(version) >= version_key(FLOOR):
+        return
+    with ThreadPoolExecutor(max_workers=max(len(checkouts), 1)) as pool:
+        list(pool.map(fetch_main, checkouts.values()))
+    version = applied_release(checkouts, releases)
+    if version is None or version_key(version) >= version_key(FLOOR):
+        return
     raise Stop(
         "failed",
-        message,
-        next=steps,
-        reason="older-than-supported",
+        f"This instance runs Platform {version}, and {installed.shown(installed.version())} reads "
+        f"Platform {FLOOR} and later; nothing has changed." + installed.before_self_update(BELOW_FLOOR),
+        next=(below_floor(""),),
+        reason="below-floor",
         platform_version=version,
-        oldest_platform_version=OLDEST,
+        floor=FLOOR,
     )
+
+
+def refuse_earlier_walk(run: records.Record) -> None:
+    """Stop at a run a dp-instance before this walk started, one before `self update` among
+    them, whose record this one doesn't walk: only such a dp-instance carries it on. Nothing is
+    written."""
+    if run.data.get("schema_version") == records.SCHEMA_VERSION and "dp_instance" in run.data:
+        return
+    found = run.data.get("dp_instance")
+    started = f"dp-instance {found}" if found else f"a dp-instance before {installed.SELF_UPDATE}"
+    raise Stop(
+        "failed",
+        f"Run {run.id}, which {started} started, hasn't finished, and {installed.shown(installed.version())} "
+        "walks prepare then apply, so it can't carry it on; nothing has changed."
+        + installed.before_self_update(BELOW_FLOOR),
+        next=(below_floor(", and finishes the run with dp-instance resume"),),
+        reason="earlier-run",
+        run=run.id,
+    )
+
+
+def check_earlier_run(state: Path) -> None:
+    """Stop when this workstation's run under way or stopped is one an earlier walk started."""
+    run = records.active(state, kinds=records.EARLIER_KINDS + records.KINDS)
+    if run is not None:
+        refuse_earlier_walk(run)
 
 
 def target(releases: Releases, version: str | None, file: str | None) -> tuple[Manifest, str]:
-    """An upgrade's target and its channel: a published Platform Version on `stable`, or
+    """A prepared upgrade's target and its channel: a published Platform Version on `stable`, or
     canary's unpublished candidate manifest on `canary`."""
     if file is not None:
         return read_file(Path(file)), "canary"

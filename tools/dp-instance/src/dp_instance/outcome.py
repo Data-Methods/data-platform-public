@@ -19,6 +19,7 @@ EXIT_CODES = {
     "sign-in": 6,
     "runs": 7,
     "pending": 8,
+    "not-mine": 9,
 }
 USAGE = 2
 # The stops for what a run waits on besides a decision or an external handoff.
