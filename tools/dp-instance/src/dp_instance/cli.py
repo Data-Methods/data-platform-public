@@ -58,14 +58,17 @@ def _parser() -> argparse.ArgumentParser:
     # A decision's ID, which only a stop names: resume and the secret commands take it, prepare for
     # the upgrade's restore and remove questions, and prepare and apply for their question about
     # replacing a stopped run.
-    approving = argparse.ArgumentParser(add_help=False, parents=[automatic])
-    approving.add_argument(
+    deciding = argparse.ArgumentParser(add_help=False)
+    deciding.add_argument(
         "--approve",
         action="append",
         default=[],
         metavar="ID",
         help="Approve the decision with this ID, as a review showed it. Repeatable.",
     )
+    # Prepare takes no --auto-approve: its code steps approve what they can on their own, and its
+    # renders take only what a person approved.
+    approving = argparse.ArgumentParser(add_help=False, parents=[automatic, deciding])
     parser = argparse.ArgumentParser(
         prog="dp-instance",
         description=__doc__,
@@ -101,7 +104,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     preparing = commands.add_parser(
         "prepare",
-        parents=[common, approving],
+        parents=[common, deciding],
         help="Turn your edits, or with --to a Platform Version, into pull requests to review and merge.",
     )
     for sub, what in (
@@ -124,8 +127,8 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Open the pull requests without planning the platform's steps, so apply asks about each change "
-            "unless --auto-approve. The preview apply reads is the last prepare's: prepare again without "
-            "it to preview the change."
+            "unless apply --auto-approve. The preview apply reads is the last prepare's: prepare again "
+            "without it to preview the change."
         ),
     )
     preview = commands.add_parser(
