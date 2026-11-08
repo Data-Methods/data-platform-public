@@ -10,9 +10,10 @@ Terraform never manages it.
     runs/<run>/unlocked.json  who cleared the run lock the run held, and when
 
 `.dp-instance/runs/` stays the working copy. While its command holds the run lock, a run uploads
-its record at every step boundary: each other file once for each content it has, then what's new
-in `log.txt`, an append blob, which the state account's blob versioning keeps as one version
-however often it's appended to, then `run.json`. `run.json` is written only while the shared
+its record at every step boundary: each other file once for each content it has, and the
+removal of each handoff document a step deleted, then what's new in `log.txt`, an append blob,
+which the state account's blob versioning keeps as one version however often it's appended to,
+then `run.json`. `run.json` is written only while the shared
 copy is still the one this workstation last wrote or read, and `log.txt` appended only where the
 shared copy ends; the other files are written as they are, so after `unlock` of a command that's
 still alive, they can mix. `status` and `resume` fetch the instance's unfinished run into the
@@ -38,6 +39,7 @@ from .blobs import BlobError
 from .instance import Instance
 from .outcome import Next, Stop, failed
 from .record import ACTIVE, Record, records, remove, replace
+from .sequence import parse_step
 
 CONTAINER = "platform-runs"
 LOCK = "lock"
@@ -47,6 +49,9 @@ UNFINISHED = "unfinished.json"
 # Each step's inputs hash as an apply last left it, by entry.
 STEP_HASHES = "step-hashes.json"
 RUNS = "runs/"
+# A run's handoff documents and pages, and the end of each document's name there.
+HANDOFFS = "handoffs/"
+HANDOFF = "-handoff.json"
 UNLOCKED = "unlocked.json"
 LOG = "log.txt"
 # Which shared copy of a run this workstation's working copy last matched: its `run.json`'s
@@ -167,6 +172,20 @@ def _parts(name: str) -> list[str]:
     if any(part in ("", ".", "..") or "\\" in part or ":" in part for part in parts):
         raise failed(f"The shared run record holds a file dp-instance doesn't write: {name}.")
     return parts
+
+
+def _reached(run: dict) -> set[str]:
+    """The components a run's record says its walk reached: each with a step it finished or
+    stopped at."""
+    stopped = (run.get("stop") or {}).get("entry") or ""
+    return {found[1] for found in map(parse_step, [*(run.get("steps") or {}), stopped]) if found}
+
+
+def _owner(document: str, run: dict) -> str | None:
+    """The component of the run whose handoff document this is, `<component>-<authority>-handoff.json`:
+    the longest key that names it, as one key can start another."""
+    keys = {item.get("component") for item in run.get("entries") or [] if item.get("component")}
+    return max((key for key in keys if document.startswith(f"{key}-")), key=len, default=None)
 
 
 class Shared:
@@ -374,27 +393,43 @@ class Shared:
         return change if isinstance(change, dict) else None
 
     def handoffs(self, before: str) -> dict[str, bytes]:
-        """The handoff documents of the newest completed apply before run ``before``, by name."""
+        """The handoff documents each component's walk last left, by name: a component's from the
+        newest apply before run ``before`` that reached it, whether or not that apply completed,
+        so an apply that rewrote one and stopped is never seeded over by an older one. A completed
+        apply reached every component, and any other each component with a step it finished or
+        stopped at; each of its documents is `<component>-<authority>-handoff.json`."""
+        documents: dict[str, bytes] = {}
+        settled: set[str] = set()
         try:
-            names = [name for name in self.container.names(RUNS) if name.endswith("-handoff.json")]
-            runs = sorted({name[len(RUNS) :].split("/", 1)[0] for name in names}, reverse=True)
+            names = self.container.names(RUNS)
+            runs = sorted(
+                {name[len(RUNS) :].split("/", 1)[0] for name in names if name.endswith("/run.json")},
+                reverse=True,
+            )
             for run in (item for item in runs if item < before and "-apply" in item):
                 found = self.container.get(f"{RUNS}{run}/run.json")
-                if found is None or json.loads(found.body).get("status") != "complete":
-                    continue
-                prefix = f"{RUNS}{run}/handoffs/"
-                documents = {}
+                data = json.loads(found.body) if found is not None else {}
+                complete = data.get("status") == "complete"
+                reached = _reached(data)
+                prefix = f"{RUNS}{run}/{HANDOFFS}"
                 for name in names:
-                    if name.startswith(prefix) and "/" not in name[len(prefix) :]:
-                        blob = self.container.get(name)
-                        if blob is not None:
-                            documents[name[len(prefix) :]] = blob.body
-                return documents
+                    document = name[len(prefix) :]
+                    if not name.startswith(prefix) or "/" in document or not document.endswith(HANDOFF):
+                        continue
+                    owner = _owner(document, data)
+                    if owner in settled or not (complete or owner in reached):
+                        continue
+                    blob = self.container.get(name)
+                    if blob is not None:
+                        documents[document] = blob.body
+                if complete:
+                    break
+                settled |= reached
         except BlobError as error:
             raise self.unavailable(error, "read") from None
         except ValueError:
             return {}
-        return {}
+        return documents
 
     def optional_handoffs(self) -> tuple[str, dict, dict[str, bytes]]:
         """The newest completed apply: its run, the optional outside work it recorded and each of
@@ -566,15 +601,26 @@ class Shared:
 
     def publish(self, record: Record) -> None:
         """Upload the run's record, while this command holds the run lock: each other file whose
-        content changed since the working copy last matched the shared copy, then what's new in
-        `log.txt`, then `run.json`, only while the shared copy is still that one."""
+        content changed since the working copy last matched the shared copy, with each handoff
+        document deleted here deleted there, then what's new in `log.txt`, then `run.json`, only
+        while the shared copy is still that one."""
         folder = record.folder
         if not (folder / SYNCED).exists():
             _save_synced(folder, {"etag": None, "files": {}, "log": 0})
         synced = _synced(folder)
         prefix = f"{RUNS}{record.id}/"
         try:
-            for inside, path in _local_files(folder).items():
+            local = _local_files(folder)
+            # A handoff document the run's steps deleted, as a step's last action went, goes from
+            # the shared copy too, so no later apply's seed brings it back.
+            for inside in [
+                name for name in synced["files"] if name.startswith(HANDOFFS) and name not in local
+            ]:
+                self._checked()
+                self.container.delete(prefix + inside)
+                del synced["files"][inside]
+                _save_synced(folder, synced)
+            for inside, path in local.items():
                 if inside in ("run.json", LOG, UNLOCKED):
                     continue
                 data = path.read_bytes()

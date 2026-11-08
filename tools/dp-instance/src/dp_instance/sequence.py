@@ -1,9 +1,9 @@
 """The run's sequence: every step in the manifest's order, read from each component's
 `steps --json`.
 
-Repositories contain components, components contain phases and phases contain steps.
-Before anything changes, every component's `preflight` step runs and, in an apply, the drift
-check. A prepare's code is the engine's `code` phase, repository by repository: the owner's
+Repositories contain components, components contain phases and phases contain steps. Every
+component's `preflight` runs in `dp-instance preflight` alone; before anything changes, an apply
+runs the drift check. A prepare's code is the engine's `code` phase, repository by repository: the owner's
 `upgrade` to the target, then every component's `migrate`, which run while the configuration is
 at the schemas of the code before them, so the platform's steps are read only once they've run.
 Then, per repository, each component's phases, then the phases that
@@ -19,7 +19,7 @@ repository, so it's never one of the platform's phases.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 
 from .manifest import Manifest, Repository
 from .outcome import Next, Stop, failed
@@ -69,6 +69,9 @@ class Step:
     # Whether it needn't plan again while its inputs and code are the same: every Terraform
     # step, and a native step that declares it.
     skips: bool = False
+    # Whether, within a run, its drift check's plan with no change stands for it: every Terraform
+    # step, and a native step that declares it, which a template before engine 0.25.0 never does.
+    reuses: bool = False
 
 
 @dataclass(frozen=True)
@@ -143,6 +146,7 @@ def _phase(data: dict) -> Phase:
                 tuple(item["source"] for item in step.get("inputs") or ()),
                 bool(step.get("renders", False)),
                 bool(step.get("skips", (step.get("kind") or "native") == "terraform")),
+                bool(step.get("reuses", (step.get("kind") or "native") == "terraform")),
             )
             for step in data.get("steps", [])
         ),
@@ -207,8 +211,8 @@ class Entry:
     preflight_counter: str = ""
     repository_description: str = ""
     component_description: str = ""
-    # An entry run from the owner's CLI fetched at the target: an upgrade's preflights and its
-    # owners' `upgrade` steps.
+    # An entry run from the owner's CLI fetched at the target: an upgrade's owners' `upgrade`
+    # steps, and `preflight --to`'s preflights.
     fetched: bool = False
     # The later step of the component that lifts this step's hold, and its phase; empty for a
     # step that holds nothing.
@@ -220,7 +224,7 @@ class Entry:
     affects_no_root: bool = False
     # Whether `render` writes the files the step keeps committed, as its declaration says.
     renders: bool = False
-    # A Terraform step whose component's `apply` takes the walk's plan skip.
+    # A step that skips across runs: every Terraform step, and a native step that declares it.
     plan_skip: bool = False
     # A Terraform step, whose real change reaches only the steps that read from it.
     terraform: bool = False
@@ -230,7 +234,10 @@ class Entry:
 
     @classmethod
     def load(cls, data: dict) -> Entry:
-        return cls(**data)
+        """An entry as a record holds it; a field this dp-instance doesn't know, as a newer one
+        writes, is left out."""
+        known = {item.name for item in fields(cls)}
+        return cls(**{key: value for key, value in data.items() if key in known})
 
     @property
     def where(self) -> str:
@@ -419,6 +426,17 @@ class Plan:
                     raise failed(f"{item.component} declares no phase {item.phase}.")
                 entries.extend(self._phase_entries(repository, component, phase, kind))
         return entries
+
+    def reusing(self, entries: list[Entry]) -> list[str]:
+        """The steps among ``entries`` that reuse their drift check within a run, by entry: a run
+        record keeps them beside its entries, so a dp-instance that knows no such entry field
+        still reads it."""
+        found = []
+        for entry in entries:
+            phase = self.declared(entry.repository, entry.component).phase(entry.phase)
+            if phase is not None and any(step.name == entry.step and step.reuses for step in phase.steps):
+                found.append(entry.id)
+        return found
 
     def step(self, name: str, kind: str = "step") -> Entry | None:
         """The platform step a full name, `repository/component/phase/step`, names, as a run's

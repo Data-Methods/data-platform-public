@@ -16,26 +16,34 @@ again from them. An upgrade starts from what the platform applied: its first bui
 branch's commits and leaves your edits out, and a plain `prepare` adds them afterwards.
 
 Then each repository's code: the owner's upgrade to the target and every component's `migrate`,
-which commit on the branch; what they push stays in the copy's outbox. Then the preview: every
-platform step, planned, read only, with its outcome; a step is
-provisional when a step it reads from, directly or through other steps, plans a change, or
-when it reads the commit the merge lands. A step whose plan fails is provisional only when the
-engine names the output it couldn't read and that output's step plans a change; any other
-failure stops. A step that would write a committed file the engine can't render stops the
-prepare. Then one pull request per changed repository: its branch pushed with a lease on the
-commit fetched, so GitHub's branch is replaced only while it's as fetched, and the pull request
-linking the others and showing its part of the preview, recorded as it opens. Its review is the
-pull request: a prepare asks nothing about plans, only whether to restore a file you edited or
-remove one, as the owner's upgrade asks. The change, its pull requests and the prepare run
-whose preview `apply` reads are recorded in the instance's shared run record."""
+which commit on the branch, then each component's render; what they push stays in the copy's
+outbox. A prepare whose branches then hold no commit `origin/main` hasn't previews nothing and
+opens nothing: it only starts again from `main` any branch GitHub kept. Then the preview: every
+platform step, planned, read only, with its outcome; a step is provisional when a step it reads
+from, directly or through other steps, plans a change, or when it reads the commit the merge
+lands. A step whose plan fails is provisional only when the engine names the output it couldn't
+read and that output's step plans a change; any other failure stops. A step that would write a
+committed file the engine can't render stops the prepare. With `--no-preview`, the preview's
+steps are read and checked against the manifest, and none is planned, so `apply` asks about
+each change. Then one pull request per changed repository: its branch pushed with a lease on
+the commit fetched, so GitHub's branch is replaced only while it's as fetched, and the pull
+request linking the others and showing its part of the preview, or that it has none, recorded
+as it opens. Its review is the pull request: a prepare asks nothing about plans, only whether to
+restore a file you edited or remove one, as the owner's upgrade asks. The change, its pull
+requests and the prepare run whose preview `apply` reads are recorded in the instance's shared
+run record."""
 
 from __future__ import annotations
 
 import re
+import shutil
 import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .. import github, gitops, installed, places, processes
+from ..components import Call, Cli, built
 from ..instance import SourceRecord
 from ..outcome import Next, Result, Stop, failed
 from ..record import Record
@@ -57,9 +65,98 @@ PREVIEW_LABELS = {
 }
 
 
+def reaches(entry: Entry, graph: dict[str, list[str]], reached: list[str] | bool) -> list[str] | bool:
+    """What the preview reaches once a change or a provisional step at ``entry`` adds what it
+    reaches: a Terraform step's, the steps that read from it; any other step's, every later step."""
+    if reached is True or not entry.terraform:
+        return True
+    return sorted({*reached, *downstream(graph, entry.id)})
+
+
+@dataclass
+class Answer:
+    """What a plan said of one step: its finished event, the plan that failed at it, or both, and
+    the plan text written for it."""
+
+    event: dict | None = None
+    failure: Call | None = None
+    text: str = ""
+
+    @property
+    def skipped(self) -> bool:
+        """Whether it skipped its plan, as `--planned` let it: rule C."""
+        return bool(self.event and self.event.get("skip_rule"))
+
+    @property
+    def changes(self) -> bool:
+        """Whether its plan has a change, which the preview records as one, but for a hold."""
+        return self.failure is None and (self.event or {}).get("status") == "change"
+
+    @property
+    def stops(self) -> bool:
+        """Whether a phase's plan stops at it: at its change, or its failure."""
+        return self.failure is not None or self.changes
+
+
+@dataclass
+class PhasePlan:
+    """One phase of the preview, from its first step not yet previewed, planned at once with the
+    others: what its plans may skip, each step that skips that no change the preview had found
+    reached as they started, and what they said of each step. `reached` is what the phase's own
+    plan answered, `lead` the plan text it wrote ahead of every step, `failed_after` its failure
+    once every step had reported and `error` what its planning raised. Each plan writes its text
+    into `scratch`, a folder of its own, which the shared run record leaves out."""
+
+    members: list[Entry]
+    cli: Cli
+    plan_file: Path
+    skips: list[tuple[str, str]]
+    scratch: Path
+    answers: dict[str, Answer] = field(default_factory=dict)
+    call: Call | None = None
+    reached: set[str] = field(default_factory=set)
+    lead: str = ""
+    failed_after: Call | None = None
+    error: Exception | None = None
+    plans: int = 0
+
+    @property
+    def phase(self) -> str:
+        return self.members[0].phase
+
+    def took(self, call: Call, text: str) -> None:
+        """The phase's own plan: each step's finished event and, when it failed, its failure at
+        the first step without one. Its plan text goes with the last step it answered, or ahead
+        of every step when it answered none, as when it stopped at a step previewed earlier, or
+        failed once every step had reported, which stops the preview."""
+        events = {event["step"]: event for event in call.finished() if event.get("phase") == self.phase}
+        found = {member.step: Answer(events[member.step]) for member in self.members if member.step in events}
+        failed_at = None
+        if call.status != "done":
+            failed_at = next((member for member in self.members if member.step not in events), None)
+            if failed_at is not None:
+                found[failed_at.step] = Answer(failure=call)
+        self.failed_after = call if call.status != "done" and failed_at is None else None
+        last = next((member.step for member in reversed(self.members) if member.step in found), None)
+        if last is None or self.failed_after is not None:
+            self.lead = text
+        else:
+            self.lead, found[last].text = "", text
+        self.answers.update(found)
+        self.call, self.reached = call, set(found)
+
+    def took_alone(self, step: str, call: Call, text: str) -> Answer:
+        """One step's plan alone: its last finished event and, when the plan failed, its failure."""
+        events = [event for event in call.finished(step) if event.get("phase") == self.phase]
+        answer = Answer(events[-1] if events else None, call if call.status != "done" else None, text)
+        self.answers[step] = answer
+        return answer
+
+
 class Prepare(Run):
     """Record data: `target` (a Platform Version, or None for a Configuration Change), `change`,
-    `branch`, `title`, `start`, `upgrading`, `taken`, `left_out`, `preview` and `requests`. A
+    `branch`, `title`, `start`, `no_preview`, `upgrading`, `taken`, `left_out`, `preview` and
+    `requests`. A
     preview of the change, `plan`, builds it the same way and walks only its preview: it pushes
     nothing, asks nothing and opens no pull request."""
 
@@ -83,6 +180,7 @@ class Prepare(Run):
         "title",
         "start",
         "command",
+        "no_preview",
         "manifest_origin",
         "change_kind",
         "change_target",
@@ -104,18 +202,20 @@ class Prepare(Run):
 
     def go(self) -> None:
         if not self.record.entries:
-            self.show_part("before")
+            self.show_part("code")
             self.build()
         self.walk_entries()
         if not self.record.data.get("previewing"):
-            self.build_preview()
+            declarations = self.build_renders()
+            self.walk_entries()
+            self.build_preview(declarations)
             self.walk_entries()
 
     # The change's branch -----------------------------------------------------------------
 
     def build(self) -> None:
         """Bring up each repository's branch, read its steps and, for an upgrade, the target's,
-        then the run's entries: the preflights and each repository's code."""
+        then the run's entries: each repository's code."""
         self._progress = None
         started = time.monotonic()
         self.read_change()
@@ -144,15 +244,11 @@ class Prepare(Run):
                     upgrades[repository.key] = jump
             self.record.data["upgrading"] = list(upgrades)
             self.copy_notes()
+            self.show_notes()
         elif not walks(declarations):
             raise refuse_earlier_release("This instance's templates")
         self.timed("read", f"the steps of {len(declarations)} components", started)
-        plan = self.plan(declarations)
-        entries = plan.preflights()
-        for entry in entries:
-            entry.fetched = bool(self.record.data.get("target"))
-        code = [] if self.previewing_only else plan.code(upgrades)
-        self.record.entries = entries + code
+        self.record.entries = [] if self.previewing_only else self.plan(declarations).code(upgrades)
         self.record.save()
 
     def read_change(self) -> None:
@@ -424,20 +520,31 @@ class Prepare(Run):
 
     # The preview -------------------------------------------------------------------------
 
-    def build_preview(self) -> None:
+    def build_renders(self) -> dict:
         """Read the steps the change's code declares, its configuration migrated, then each
-        platform step's preview, and each repository's pull request."""
-        self.show_part("preview")
+        component's render; the declarations, which the preview reads."""
         started = time.monotonic()
         declarations = self.declarations()
         if not walks(declarations):
             raise refuse_earlier_release(f"Platform {self.manifest.platform_version}'s templates")
         self.timed("read", f"the steps of {len(declarations)} components", started)
+        self.record.entries = self.record.entries + self.plan(declarations).renders()
+        self.record.save()
+        return declarations
+
+    def build_preview(self, declarations: dict) -> None:
+        """Each platform step's preview, then each repository's pull request. The preview's
+        entries are always built, which checks the manifest against the steps declared; `plan`
+        always walks them, and a prepare only without `--no-preview` and while some branch holds
+        a commit `origin/main` hasn't. With none, a prepare walks only its pull request entries,
+        which start again from `main` any branch GitHub kept."""
         plan = self.plan(declarations)
-        renders = plan.renders()
         entries = plan.platform("preview")
         self.record.data["reads"] = reads(entries, declarations)
         self.record.data["producers"] = producers(entries, declarations)
+        previewing = self.previewing_only or (
+            not self.record.data.get("no_preview") and any(self.ahead(item.key) for item in self.repositories)
+        )
         requests = [
             Entry(
                 id=f"{repository.key}/pull-request",
@@ -451,73 +558,185 @@ class Prepare(Run):
             if not self.previewing_only
         ]
         self.record.data["previewing"] = True
-        self.record.entries = self.record.entries + renders + entries + requests
+        self.record.entries = self.record.entries + (entries if previewing else []) + requests
         self.record.save()
 
     def preview_group(self, entry: Entry) -> None:
-        """Plan one phase's steps, read only, up to its first change, then each step after it
-        alone, each shown with its outcome and whether it's provisional. A provisional step whose
-        plan fails, as one that reads an output an earlier step of the change will publish first,
-        is shown as provisional, with why its plan failed; any other failure stops."""
+        """Plan every phase of the preview from this one on, read only, `PHASES_AT_ONCE` at a
+        time, then show and judge each step in order, with its outcome and whether it's
+        provisional, as planning one phase after another does."""
+        phases = self.preview_phases(entry)
+        try:
+            self.plan_at_once(phases, self.record.data.get("reads") or {})
+            for planned in phases:
+                self.judge_phase(planned)
+        finally:
+            for planned in phases:
+                # Scratch: a file a scanner still holds is left for the next preview to remove.
+                shutil.rmtree(planned.scratch, ignore_errors=True)
+
+    def preview_phases(self, entry: Entry) -> list[PhasePlan]:
+        """Each phase's steps from ``entry`` on, the first from ``entry`` itself, with what its
+        plans may skip: each step that skips that no change the preview has found so far reaches."""
         entries = self.record.entries
-        key = (entry.repository, entry.component, entry.phase)
-        members = []
+        groups: list[list[Entry]] = []
         for item in entries[entries.index(entry) :]:
-            if item.kind != "preview" or (item.repository, item.component, item.phase) != key:
+            if item.kind != "preview":
                 break
-            members.append(item)
-        cli = self.cli(entry.repository, entry.command)
-        plan_file = self.record.file(
-            "plans", f"{entries.index(entry) + 1:03d}-{entry.component}-{entry.phase}.txt"
+            last = groups[-1][-1] if groups else None
+            if last is not None and (item.repository, item.component, item.phase) == (
+                last.repository,
+                last.component,
+                last.phase,
+            ):
+                groups[-1].append(item)
+            else:
+                groups.append([item])
+        phases = []
+        for members in groups:
+            first = members[0]
+            name = f"{entries.index(first) + 1:03d}-{first.component}-{first.phase}.txt"
+            cli = self.cli(first.repository, first.command)
+            plan_file = self.record.file("plans", name)
+            scratch = plan_file.with_suffix(".tmp")
+            shutil.rmtree(scratch, ignore_errors=True)
+            scratch.mkdir(exist_ok=True)
+            phases.append(PhasePlan(members, cli, plan_file, self.unreached(members), scratch))
+        return phases
+
+    def plan_at_once(self, phases: list[PhasePlan], graph: dict[str, list[str]]) -> None:
+        """Plan the phases, `PHASES_AT_ONCE` at a time, the longest first, as the last drift
+        check measured them, so the slowest never starts last; one never measured goes first."""
+        block = Block("preview", "", "", "", self.footer)
+        done: list[PhasePlan] = []
+
+        def say() -> None:
+            block.message = (
+                f"Planning {len(phases)} phase{'s' if len(phases) != 1 else ''}, "
+                f"{processes.PHASES_AT_ONCE} at a time: {len(done)} done"
+            )
+
+        def plan(planned: PhasePlan) -> None:
+            try:
+                self.plan_phase(planned, graph)
+            except Exception as error:
+                # Raised in its phase's turn, once every phase before it is judged.
+                planned.error = error
+            done.append(planned)
+            say()
+
+        times = self.drift_times()
+        ordered = sorted(
+            phases, key=lambda item: -times.get(f"{item.members[0].component}/{item.phase}", float("inf"))
         )
-        plan_file.unlink(missing_ok=True)
+
+        def work() -> None:
+            built([planned.cli for planned in phases])
+            list(pool.map(plan, ordered))
+
+        self.count(phases[0].members[0], phases[-1].members[-1])
+        say()
+        with ThreadPoolExecutor(max_workers=processes.PHASES_AT_ONCE) as pool:
+            self.screen.run_live(block, work)
+
+    def plan_phase(self, planned: PhasePlan, graph: dict[str, list[str]]) -> None:
+        """Plan one phase up to its first change, then each step after it alone, each skipping
+        what the phase may skip that no change before it in the phase reaches. It runs beside the
+        other phases, so it touches neither the record nor the screen."""
+        planned.took(*self.plan_preview(planned, None, planned.skips))
+        if planned.failed_after is not None:
+            return
+        reached: list[str] | bool = []
+        for member in planned.members:
+            if member.step not in planned.answers:
+                skips = [
+                    pair
+                    for pair in planned.skips
+                    if pair[0] == member.step and reached is not True and member.id not in reached
+                ]
+                planned.took_alone(member.step, *self.plan_preview(planned, member.step, skips))
+            if planned.answers[member.step].changes and not member.holds_until and not member.affects_no_root:
+                reached = reaches(member, graph, reached)
+
+    def plan_preview(
+        self, planned: PhasePlan, step: str | None, skips: list[tuple[str, str]]
+    ) -> tuple[Call, str]:
+        """One plan of the phase, or of one of its steps, skipping ``skips``: its call and the plan
+        text it wrote, to a file of its own in the phase's scratch folder, which the phase's plan
+        file takes in the steps' order. A phase's plans run one after another, never at once."""
+        planned.plans += 1
+        own = planned.scratch / f"{planned.plans:03d}.tmp"
+        only = ["--step", step] if step else []
+        call = planned.cli.run(
+            "plan",
+            "--phase",
+            planned.phase,
+            *only,
+            "--json",
+            "--plan-file",
+            str(own),
+            *self.version,
+            *[part for name, value in skips for part in ("--planned", f"{name}={value}")],
+            *(["--unchanged-since-planned"] if skips else []),
+        )
+        return call, own.read_text(encoding="utf-8") if own.exists() else ""
+
+    def judge_phase(self, planned: PhasePlan) -> None:
+        """Show and judge each step of a phase planned at once with the others, in order, as one
+        planned after the phases before it is: a step whose plan skipped and that a change or a
+        provisional step reaches plans again, alone, and a failed plan whose skips aren't the
+        ones the preview so far leaves plans again, whole. A provisional step whose plan fails, as
+        one that reads an output an earlier step of the change will publish first, is shown as
+        provisional, with why its plan failed; any other failure stops, as does what its
+        planning raised."""
+        if planned.error is not None:
+            raise planned.error
+        entries = self.record.entries
+        entry = planned.members[0]
         block = Block("phase", "", entry.phase, "", self.footer)
         block.message = f"Planning {entry.component}'s {entry.phase} phase"
         self.count(entry)
-        call = self.plan_call(block, cli, plan_file, entry.phase, members=members)
-        events = {event["step"]: event for event in call.finished() if event.get("phase") == entry.phase}
-        failed_at = None
-        if call.status != "done":
-            failed_at = next((item for item in members if item.step not in events), None)
-            if failed_at is None:
-                # It failed after every step reported: the phase's failure is its last step's.
-                self.check_plan(members[-1], call)
-        for member in members:
+        skips = self.unreached(planned.members)
+        if planned.call.status != "done" and skips != planned.skips:
+            planned.took(*self.screen.run_live(block, self.plan_preview, planned, None, skips))
+        planned.plan_file.unlink(missing_ok=True)
+        self.add_plan(planned.plan_file, planned.lead)
+        if planned.failed_after is not None:
+            # It failed after every step reported: the phase's failure is its last step's.
+            self.check_plan(planned.members[-1], planned.failed_after)
+        alone = False
+        for member in planned.members:
             self._position = entries.index(member) + 1
-            event, failure = events.get(member.step), call if member is failed_at else None
-            if event is None and failure is None:
-                alone = self.plan_call(block, cli, plan_file, entry.phase, member.step, members=[member])
-                found = [item for item in alone.finished(member.step) if item.get("phase") == entry.phase]
-                event, failure = (found[-1] if found else None), (alone if alone.status != "done" else None)
-            if failure is not None and self.unavailable_input(failure) is None:
-                self.check_plan(member, failure)
+            answer = planned.answers[member.step]
+            # Past the step the phase's plan stopped at, each step is planned alone, skipping only
+            # while nothing judged so far reaches it.
+            alone = alone or member.step not in planned.reached
+            may_skip = {name for name, _ in (self.unreached([member]) if alone else skips)}
+            if answer.skipped and member.step not in may_skip:
+                found = self.screen.run_live(block, self.plan_preview, planned, member.step, [])
+                answer = planned.took_alone(member.step, *found)
+            self.add_plan(planned.plan_file, answer.text)
+            if answer.failure is not None and self.unavailable_input(answer.failure) is None:
+                self.check_plan(member, answer.failure)
             self.enter(member)
             self._walked.add(member.id)
             shown = self.block(member)
             self._entry, self._block = member, shown
-            self.previewed(member, shown, event, plan_file, failure)
+            self.previewed(member, shown, answer.event, planned.plan_file, answer.failure)
             self.reach(member)
             self._entry = self._block = None
+            alone = alone or answer.stops
 
-    def plan_call(
-        self, block: Block, cli, plan_file: Path, phase: str, step: str | None = None, *, members=()
-    ):
-        only = ["--step", step] if step else []
-        unchanged = self.unreached(members)
-        return self.screen.run_live(
-            block,
-            cli.run,
-            "plan",
-            "--phase",
-            phase,
-            *only,
-            "--json",
-            "--plan-file",
-            str(plan_file),
-            *self.version,
-            *[part for name, value in unchanged for part in ("--planned", f"{name}={value}")],
-            *(["--unchanged-since-planned"] if unchanged else []),
-        )
+    @staticmethod
+    def add_plan(plan_file: Path, text: str) -> None:
+        """Add one plan's text to the phase's plan file, after a blank line when it holds one
+        already, as the engine separates the plans it adds to one file."""
+        if not text:
+            return
+        with plan_file.open("a", encoding="utf-8") as stream:
+            if stream.tell():
+                stream.write("\n")
+            stream.write(text)
 
     def unreached(self, members) -> list[tuple[str, str]]:
         """The steps the preview needn't plan: each that skips, as an apply last left it, that
@@ -543,12 +762,9 @@ class Prepare(Run):
             return
         if entry.affects_no_root:
             return
-        reached = self.record.data.get("preview_reached") or []
-        if reached is True or not entry.terraform:
-            self.record.data["preview_reached"] = True
-            return
-        graph = self.record.data.get("reads") or {}
-        self.record.data["preview_reached"] = sorted({*reached, *downstream(graph, entry.id)})
+        self.record.data["preview_reached"] = reaches(
+            entry, self.record.data.get("reads") or {}, self.record.data.get("preview_reached") or []
+        )
 
     def check_plan(self, entry: Entry, call) -> None:
         if call.status == "done":
@@ -861,7 +1077,14 @@ class Prepare(Run):
         if others:
             lines += ["", "**This change's other pull requests:**", ""]
             lines += [f"- {item['repository']}: {item['url']}" for item in others]
-        lines += ["", "**Preview:**", ""]
+        if self.record.data.get("no_preview"):
+            lines += [
+                "",
+                "**Preview:** none: prepared with `--no-preview`, so `dp-instance apply` asks about each "
+                "change before it applies it, unless `--auto-approve`.",
+            ]
+        else:
+            lines += ["", "**Preview:**", ""]
         preview = self.record.data.get("preview") or {}
         for entry in self.record.entries:
             if entry.kind != "preview" or entry.repository != repository:
@@ -939,7 +1162,17 @@ class Prepare(Run):
             f"Prepared: {len(requests)} pull request{'s' if len(requests) != 1 else ''} to review and "
             "merge in GitHub, then dp-instance apply."
         )
-        steps = (Next("dp-instance apply", "once each pull request is merged: brings the platform to main"),)
+        steps = (
+            Next(
+                "dp-instance apply",
+                "once each pull request is merged: brings the platform to main"
+                + (
+                    ", asking about each change, which no preview showed, unless --auto-approve"
+                    if self.record.data.get("no_preview")
+                    else ""
+                ),
+            ),
+        )
         self.screen.then(
             "Merge each pull request, then run dp-instance apply.", self.relative(self.record.folder) + "/"
         )

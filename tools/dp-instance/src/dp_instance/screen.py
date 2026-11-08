@@ -2,12 +2,14 @@
 
 Every command opens with `dp-instance`, then a line each for its command, its instance and
 what else it knows, each as it becomes known; ends each of its parts with a line of its time,
-and ends with its total, as its JSON events and result give them too. What it reads before its
-first part shows a spinner. A prepare's parts are Preflight, Repository Changes, Platform Preview
-and Pull Requests, and an apply's Preflight and Platform Changes, each named as it starts; a
-level's lines wait for a step to show under them, so a level with nothing to show takes no line.
-Each level is named as it's entered, with its position:
-repository n of N, component n of N, phase n of N and step n of N. A level's line holds the
+and ends with its total, as its JSON events and result give them too. At a terminal a spinner
+shows while it reads before its first part, from each answer to a question until a step or the
+next part shows, and while a part sets up before its first step shows. A prepare's parts are
+Repository Changes, Platform Preview and Pull Requests, an apply's Drift Check and Platform
+Changes, and `preflight`'s Preflight, each named as it starts; a level's lines wait for a step to
+show under them, so a level with nothing to show takes no line. Each level is named as it's
+entered, with its position: repository n of N, component n of N, phase n of N and step n of N. A
+level's line holds the
 level, a cyan counter, the outcome and the time, read as 4.2s, 1m 50s or 1h 2m 5s; each
 labelled item then has a line of its own, blue label first. Each step is one block, updated in
 place while it plans, waits and applies, and printed once when done; under it, the part, its
@@ -81,6 +83,8 @@ FAILURE = (
     "interrupted",
 )
 UNDER_WAY = ("planning", "applying", "checking", "verifying", "holding")
+# What the spinner says while the command works with nothing else showing.
+WORKING = "Working"
 NAME_LABELS = {
     "repository": "Repo Name:",
     "component": "Component Name:",
@@ -300,8 +304,9 @@ class Screen:
         # The opening lines shown, each once.
         self._opened = False
         self._rows: set[str] = set()
-        # The spinner while the command reads, before its first part.
+        # The spinner while the command works with nothing else showing, and what it says.
         self._status = None
+        self._said = WORKING
         # Each level's lines, until a step shows under them.
         self._held: dict[str, list[tuple[str, tuple]]] = {}
         self._holding: str | None = None
@@ -318,18 +323,45 @@ class Screen:
         """What the command reads before its first part: a spinner saying so, at a terminal, until
         it asks something, shows a step or ends."""
         self.begin(title, shown=False)
-        if self.interactive:
-            if self._status is not None:
-                self._status.update(Text(title))
-            else:
-                self._status = self.console.status(Text(title), spinner="dots", spinner_style="cyan")
-                self._status.start()
+        self.working(title)
 
-    def read(self) -> None:
-        """The reading is over: the spinner goes."""
+    def working(self, title: str | None = None) -> None:
+        """At a terminal, the spinner, until the command asks something, shows a step or ends:
+        started, saying ``title`` or `Working`, when it isn't showing; when it is, it says
+        ``title``, or goes on saying what it said."""
+        if not self.interactive:
+            return
+        if self._status is None:
+            self._said = title or WORKING
+            self._status = self.console.status(Text(self._said), spinner="dots", spinner_style="cyan")
+            self._status.start()
+        elif title is not None:
+            self._said = title
+            self._status.update(Text(title))
+
+    @contextmanager
+    def busy(self, title: str):
+        """The spinner saying ``title`` while the work inside runs, at a terminal, then as it was:
+        saying what it said before, or gone."""
+        before = self._said if self._status is not None else None
+        self.working(title)
+        try:
+            yield
+        finally:
+            if before is not None:
+                self.working(before)
+            else:
+                self._stop()
+
+    def _stop(self) -> None:
+        """The spinner goes."""
         if self._status is not None:
             self._status.stop()
             self._status = None
+
+    def read(self) -> None:
+        """The reading is over: the spinner goes."""
+        self._stop()
         if self._part is not None and not self._part[3]:
             self.end()
 
@@ -454,9 +486,11 @@ class Screen:
                 self.labelled(f"{label[:1].upper()}{label[1:]}:", value)
 
     def stage(self, title: str) -> None:
+        """A part's heading, and the spinner while the part sets up, until its first step shows."""
         self.blank(2)
         self.print(Text(title, style="bold underline"))
         self.blank()
+        self.working()
 
     def level(self, level: str, counter: str = "", outcome: str = "", seconds: float | None = None) -> None:
         self.print(level_line(level, counter, outcome, seconds))
@@ -495,7 +529,7 @@ class Screen:
     def ask(self, block: Block, choices: list[tuple[str, str]], prompt: str = "") -> str:
         """Wait for a key with the block drawn once and nothing redrawing, so the key
         arrives at once. The wait counts in neither the block's time nor the command's working
-        time."""
+        time; the spinner shows again once it's answered."""
         self.read()
         self.release_held()
         block.seconds, block.live = block.elapsed(), False
@@ -512,6 +546,7 @@ class Screen:
             del block.lines[-2:]
             block.waited += self.waiting(started)
             block.seconds, block.live = None, True
+        self.working()
         return key
 
     def show(self, block: Block, compact: bool = False) -> None:
@@ -528,11 +563,7 @@ class Screen:
             parts += [(key, "bold"), f" {label}    "]
         self.blank()
         self.print(Text.assemble(*parts))
-        started = time.monotonic()
-        try:
-            return keys.choose("".join(key for key, _ in choices))
-        finally:
-            self.waiting(started)
+        return self._answered(lambda: keys.choose("".join(key for key, _ in choices)))
 
     def menu(self, title: str, choices: list[tuple[str, str]]) -> str:
         """A keypress among choices, one a line, under what's being asked."""
@@ -541,11 +572,7 @@ class Screen:
         self.print(Text(title, style="bold"))
         for key, label in choices:
             self.print(Text.assemble("  ", (key, "bold"), f"  {label}"))
-        started = time.monotonic()
-        try:
-            return keys.choose("".join(key for key, _ in choices))
-        finally:
-            self.waiting(started)
+        return self._answered(lambda: keys.choose("".join(key for key, _ in choices)))
 
     def secret(self, label: str) -> str:
         """A hidden prompt: what's typed is never shown."""
@@ -557,13 +584,22 @@ class Screen:
 
     def _ask(self, label: str, *, hidden: bool) -> str:
         self.read()
-        started = time.monotonic()
-        try:
-            value = Prompt.ask(Text(label, style=LABEL), console=self.console, password=hidden)
-        finally:
-            self.waiting(started)
+        value = self._answered(
+            lambda: Prompt.ask(Text(label, style=LABEL), console=self.console, password=hidden)
+        )
         self._blanks = 0
         return value
+
+    def _answered(self, question: Callable[[], str]) -> str:
+        """A person's answer to ``question``, its wait counted apart; the spinner shows again
+        once it's answered."""
+        started = time.monotonic()
+        try:
+            answer = question()
+        finally:
+            self.waiting(started)
+        self.working()
+        return answer
 
     # Endings ----------------------------------------------------------------------------
 

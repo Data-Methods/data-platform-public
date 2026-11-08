@@ -326,6 +326,14 @@ class Container:
             headers["x-ms-lease-id"] = lease
         return self.request("PUT", blob, headers=headers, body=body, timeout=timeout).header("etag") or ""
 
+    def delete(self, blob: str) -> None:
+        """Delete the blob; one that's gone already is left so."""
+        try:
+            self.request("DELETE", blob)
+        except BlobError as error:
+            if error.code != "BlobNotFound":
+                raise
+
     def append(self, blob: str, data: bytes, at: int, content_type: str) -> None:
         """Append ``data``, at most ``APPEND_BYTES``, to the append blob, which holds ``at``
         bytes: a new one when ``at`` is 0. Appending creates no blob version; creating one does. A

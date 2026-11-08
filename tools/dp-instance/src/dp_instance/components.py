@@ -6,11 +6,14 @@ step starts and finishes and a result last, and everything meant for a person to
 which goes to the run's log. Values a person supplies go to its stdin as one JSON document
 and nowhere else. The engine retries its own reads, and a failed result names the kind of
 temporary failure it was, when the command changed nothing, which dp-instance reads instead of
-classifying the message; the command isn't run again. A command that fails because
-the Azure CLI's token cache lost the signed-in account is a sign-in to renew, never any other
-failure: one that only reads runs once more first, and one that writes never does. While the
-command holds the run lock, each call first reads the lock's renewer's last result and stops the
-command once the lock is lost.
+classifying the message; the command isn't run again. uv failing on a Windows file lock before
+the command starts, as uv's own error says with no word from the command, is tried again after
+each of `transient`'s waits: nothing ran, so a write is tried again too. Commands that run at
+once in one environment have it built first, once, so no two build into one new environment
+together. A command that fails because the Azure CLI's token cache lost the signed-in account
+is a sign-in to renew, never any other failure: one that only reads runs once more first, and
+one that writes never does. While the command holds the run lock, each call first reads the
+lock's renewer's last result and stops the command once the lock is lost.
 """
 
 from __future__ import annotations
@@ -19,7 +22,9 @@ import json
 import subprocess
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections import Counter
+from collections.abc import Callable, Iterator, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -29,6 +34,13 @@ from . import processes, transient
 from .outcome import EXIT_CODES, USAGE, Next, Stop, failed
 
 WINDOWS_FILE_LOCK = "os error 1224"
+# What a retry's line says of it.
+FILE_IN_USE = "Windows reported a file in use before the command started (os error 1224)"
+# uv's own failure, as uv 0.13 writes it: its exit code, then its error's header and each cause.
+UV_FAILED = 2
+UV_ERROR = "error: "
+UV_CAUSE = "  cause: "
+UV_HINT = "hint: "
 # The Azure CLI's words when its token cache has lost the signed-in account, as several of its
 # processes refreshing the cache at once can leave it: a sign-in to renew, with `az login`.
 AZURE_TOKEN_CACHE = "does not exist in msal token cache"
@@ -68,6 +80,50 @@ def uv_run(command: str, project: Path | None) -> list[str]:
     if project is not None:
         launcher += ["--project", str(project)]
     return [*launcher, command]
+
+
+def uv_error(stderr: list[str]) -> list[str] | None:
+    """uv's own error, when the output ends with one: its header and each cause, followed only
+    by uv's hints."""
+    lines = [line for line in stderr if line.strip()]
+    headers = [index for index, line in enumerate(lines) if line.startswith(UV_ERROR)]
+    if not headers:
+        return None
+    chain = [lines[headers[-1]]]
+    rest = lines[headers[-1] + 1 :]
+    while rest and rest[0].startswith(UV_CAUSE):
+        chain.append(rest.pop(0))
+    return chain if all(line.startswith(UV_HINT) for line in rest) else None
+
+
+def file_in_use_before_start(code: int, stderr: list[str]) -> bool:
+    """Whether uv failed on a Windows file lock before the command it runs started: uv's own exit
+    code, and its output ending with uv's error, one of whose lines names os error 1224. A
+    command that started and failed on a uv it ran itself ends otherwise, with its own words or
+    its own exit code."""
+    chain = uv_error(stderr)
+    return code == UV_FAILED and chain is not None and any(WINDOWS_FILE_LOCK in line for line in chain)
+
+
+def uv_sync(project: Path) -> list[str]:
+    """The project's environment built from its lock as `uv run --locked` builds it, removing
+    nothing it holds besides."""
+    return [processes.executable("uv"), "sync", "--locked", "--inexact", "--project", str(project)]
+
+
+def built(clis: Sequence[Cli]) -> None:
+    """Build each environment that more than one of ``clis`` runs in, once, before they run at
+    once, so no two of them build into one new environment together; each environment builds
+    in parallel with the others. One that can't be built stops, saying why."""
+    counted = Counter(cli.environment for cli in clis)
+    shared = {cli.environment: cli for cli in clis if counted[cli.environment] > 1}
+    if not shared:
+        return
+    with ThreadPoolExecutor(max_workers=len(shared)) as pool:
+        calls = list(pool.map(Cli.sync, shared.values()))
+    for environment, call in zip(shared, calls, strict=True):
+        if call.status != "done":
+            raise failed(f"The environment in {environment} couldn't be built: {call.message}")
 
 
 class Log:
@@ -115,9 +171,15 @@ class Call:
 
     @property
     def message(self) -> str:
-        """What it said, and, when it looked temporary and doesn't say so, that it did."""
+        """What it said, and, when it looked temporary and doesn't say so, that it did. Where uv
+        itself failed, its error's header and last cause, never its hints."""
+        chain = uv_error(self.stderr)
         if self.result and self.result.get("message"):
             text = str(self.result["message"])
+        elif chain is not None:
+            text = chain[0].removeprefix(UV_ERROR)
+            if len(chain) > 1:
+                text += f": {chain[-1].removeprefix(UV_CAUSE)}"
         else:
             last = self.excerpt(1)
             text = last[0] if last else f"exit code {self.code}"
@@ -156,14 +218,18 @@ class Cli:
     log: Log
     project: Path | None = None
 
+    @property
+    def environment(self) -> Path:
+        """The project whose environment the CLI runs in."""
+        return self.project if self.project is not None else self.checkout
+
     def argv(self, *arguments: str) -> list[str]:
         repository = ["--repo", str(self.checkout)] if self.project is not None else []
         return [*uv_run(self.command, self.project), *repository, *arguments]
 
-    def _once(self, arguments, stdin, on_event, on_line) -> tuple[Call, bool]:
+    def _once(self, argv, stdin, on_event, on_line) -> tuple[Call, bool]:
         if _guard is not None:
             _guard()
-        argv = self.argv(*arguments)
         self.log.command(self.checkout, argv)
         started = time.monotonic()
         try:
@@ -225,10 +291,7 @@ class Cli:
         else:
             status = "usage" if code == USAGE else ("done" if code == 0 else "failed")
         call = Call(status, code, result, events, human, "".join(raw), time.monotonic() - started)
-        retry = (
-            status in ("failed", "usage") and not emitted and any(WINDOWS_FILE_LOCK in line for line in human)
-        )
-        return call, retry
+        return call, not emitted and file_in_use_before_start(code, human)
 
     def label(self, arguments) -> str:
         """The command, as a retry's line names it: its CLI, its words and its phase."""
@@ -241,6 +304,21 @@ class Cli:
         self.log.write(f"   {line}")
         transient.say(line)
 
+    def _started(self, label: str, argv, stdin=None, on_event=None, on_line=None) -> Call:
+        """One process, tried again after each of `transient`'s waits while uv fails on a
+        Windows file lock before the command starts, each retry logged; the last failure
+        stands."""
+        retried = 0
+        while True:
+            call, locked = self._once(argv, stdin, on_event, on_line)
+            if not locked or not transient.retries(FILE_IN_USE, retried, label=label, report=self._report):
+                return call
+            retried += 1
+
+    def sync(self) -> Call:
+        """Build the CLI's environment from its lock, as its first `uv run` would."""
+        return self._started(f"uv sync {self.environment.name}", uv_sync(self.environment))
+
     def run(
         self,
         *arguments: str,
@@ -249,23 +327,20 @@ class Cli:
         on_line: Callable[[str], None] | None = None,
     ) -> Call:
         """Run one command. uv failing on a Windows file lock (os error 1224, usually an
-        antivirus scan holding a file in uv's cache) before the command starts is retried once;
-        a second failure stands. A command that only reads and that the Azure CLI's token cache
-        failed runs once more, as several of its processes refreshing the cache at once can leave
-        it for a moment; failing that way again, it waits for a sign-in. One that writes waits for
-        it at once. A failed command whose result names a temporary failure, its retries spent
-        and nothing changed, holds its kind."""
-        call, retry = self._once(arguments, stdin, on_event, on_line)
-        if retry:
-            self.log.write("   Windows os error 1224 before the command started: retrying once.")
-            call, _ = self._once(arguments, stdin, on_event, on_line)
+        antivirus scan holding a file in uv's cache) before the command starts is tried again
+        after each of `transient`'s waits; the last failure stands. A command that only reads
+        and that the Azure CLI's token cache failed runs once more, as several of its processes
+        refreshing the cache at once can leave it for a moment; failing that way again, it waits
+        for a sign-in. One that writes waits for it at once. A failed command whose result names
+        a temporary failure, its retries spent and nothing changed, holds its kind."""
+        call = self._started(self.label(arguments), self.argv(*arguments), stdin, on_event, on_line)
         reads = read_command(arguments) is not None
         if signed_out(call) and reads:
             self._report(
                 f"{self.label(arguments)}: the Azure CLI's token cache lost the signed-in account; "
                 "running it once more."
             )
-            call, _ = self._once(arguments, stdin, on_event, on_line)
+            call = self._started(self.label(arguments), self.argv(*arguments), stdin, on_event, on_line)
         if signed_out(call):
             call.status = "sign-in"
         if call.status == "failed":

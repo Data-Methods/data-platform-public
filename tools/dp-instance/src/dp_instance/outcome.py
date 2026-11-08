@@ -62,6 +62,23 @@ class Stop(Exception):
         return EXIT_CODES[self.status]
 
 
+# What every failed stop that isn't temporary names last: the components' own checks of the
+# workstation, which may say what it lacks.
+PREFLIGHT = Next(
+    "dp-instance preflight",
+    "runs each component's own checks of this workstation, its sign-in and its access, which may "
+    "name what's missing; it changes nothing",
+)
+
+
+def naming_preflight(status: str, reason: str | None, steps: tuple[Next, ...]) -> tuple[Next, ...]:
+    """The commands a stop names: every failed stop but a temporary one, which a resume tries
+    again, ends naming `dp-instance preflight`, once, after the commands that carry on."""
+    if status != "failed" or reason == "transient" or PREFLIGHT.command in (item.command for item in steps):
+        return tuple(steps)
+    return (*steps, PREFLIGHT)
+
+
 def failed(message: str, *next: Next) -> Stop:
     return Stop("failed", message, next=next)
 

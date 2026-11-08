@@ -7,8 +7,13 @@
     .dp-instance/applied/<hash>/  the commit a component's walk last applied, which the drift check
                                   plans, one component's commit after another's
     .dp-instance/src/<hash>/      the repository's template source at an upgrade's target
+    .dp-instance/preflight/<hash>/
+                                  `origin/main`, which `preflight` runs each component's preflight
+                                  against, and, under another hash, the template source at its
+                                  target, which `preflight --to` runs them from: never `src/`, which
+                                  a running prepare owns
 
-Each but `src/` is a clone of the checkout, its objects hard-linked, with the checkout's origin
+Each but the template sources is a clone of the checkout, its objects hard-linked, with the checkout's origin
 URL and its user, credential, SSH, HTTP, signing, include and long-path configuration, which
 follow the checkout's each time the copy is used. It keeps its environment between commands
 and is brought to its commit with Git alone: what a step leaves untracked goes, and what Git
@@ -35,7 +40,8 @@ PLAN = "plan"
 APPLY = "apply"
 APPLIED = "applied"
 SOURCE = "src"
-OWN = (PREPARE, PLAN, APPLY, APPLIED, SOURCE)
+PREFLIGHT = "preflight"
+OWN = (PREPARE, PLAN, APPLY, APPLIED, SOURCE, PREFLIGHT)
 # The folders of earlier walks.
 RETIRED = ("main", "sources")
 OUTBOX = Path(".git", "outbox.git")
@@ -143,11 +149,11 @@ class Missing(Exception):
         self.origin, self.commit = origin, commit
 
 
-def main_of(instance: Instance, mapped: Mapped) -> str:
-    """The commit `main` holds on GitHub, fetched into the repository's apply copy; for a
+def main_of(instance: Instance, mapped: Mapped, kind: str = APPLY) -> str:
+    """The commit `main` holds on GitHub, fetched into the repository's copy of this kind; for a
     repository whose origin has no `main` yet, as one that joins before its first push, the
     checkout's own `main`, which its first push sends."""
-    folder = clone(instance, APPLY, mapped)
+    folder = clone(instance, kind, mapped)
     fetch(folder)
     found = gitops.git(
         "rev-parse", "--verify", "--quiet", "refs/remotes/origin/main", cwd=folder, check=False
@@ -170,11 +176,17 @@ def at(instance: Instance, kind: str, mapped: Mapped, commit: str) -> Path:
         raise failed(f"{missing}; nothing has changed.") from None
 
 
-def mains(instance: Instance) -> tuple[dict[str, str], dict[str, Path]]:
-    """Each mapped Component Repository's `main` on GitHub, and its apply copy at it."""
-    commits = {key: main_of(instance, mapped) for key, mapped in instance.components.items()}
-    copies = {key: at(instance, APPLY, instance.components[key], commit) for key, commit in commits.items()}
+def mains(instance: Instance, kind: str = APPLY) -> tuple[dict[str, str], dict[str, Path]]:
+    """Each mapped Component Repository's `main` on GitHub, and its copy of this kind at it."""
+    commits = {key: main_of(instance, mapped, kind) for key, mapped in instance.components.items()}
+    copies = {key: at(instance, kind, instance.components[key], commit) for key, commit in commits.items()}
     return commits, copies
+
+
+def preflight_source(instance: Instance, repository: str) -> Path:
+    """The repository's template source at `preflight --to`'s target: in `preflight/` beside its
+    copy, under the hash of another name, so it's no deeper than the copy."""
+    return instance.own(PREFLIGHT, f"{repository}/{SOURCE}")
 
 
 def records(copies: dict[str, Path]) -> dict[str, SourceRecord]:
@@ -191,7 +203,11 @@ def records(copies: dict[str, Path]) -> dict[str, SourceRecord]:
 def tidy(instance: Instance) -> None:
     """Remove every folder of dp-instance's own that nothing uses: those of earlier walks, and
     any of a repository the map no longer holds. One Windows holds open goes next time."""
-    kept = {instance.own(APPLY, key).name for key in instance.components}
+    kept = {
+        found.name
+        for key in instance.components
+        for found in (instance.own(APPLY, key), preflight_source(instance, key))
+    }
     found = [instance.state / name for name in RETIRED]
     for kind in OWN:
         folder = instance.state / kind

@@ -1,5 +1,6 @@
-"""The checks before anything changes: every component's preflight, all at once, and an apply's
-drift check, against the commit each component's walk last applied."""
+"""The checks: every component's preflight, all at once, which `dp-instance preflight` runs, and
+an apply's drift check before anything changes, against the commit each component's walk last
+applied."""
 
 from __future__ import annotations
 
@@ -12,9 +13,9 @@ from pathlib import Path
 from rich.text import Text
 
 from .. import applied, places, targets
-from ..components import Call, Cli
+from ..components import Call, Cli, built
 from ..instance import SourceRecord, registrations
-from ..outcome import WAITING_FOR, WAITS, Next, Stop
+from ..outcome import PREFLIGHT, WAITING_FOR, WAITS, Next, Stop
 from ..processes import PHASES_AT_ONCE
 from ..screen import Block
 from ..sequence import Entry, drift_phases
@@ -24,11 +25,10 @@ from .common import UNKNOWN_VERSION
 
 class Checks(Base):
     def preflights(self, entries: list[Entry]) -> None:
-        """Every preflight not yet passed, all at once, each in its own process and shown as it
-        finishes, with its own time. Once every one has finished, the run stops if any didn't
-        pass, naming each together: for a sign-in to renew, or anything else a component waits
-        on, when one does."""
-        entries = [entry for entry in entries if entry.id not in self._walked]
+        """Every preflight, all at once, each in its own process and shown as it finishes, with
+        its own time. Once every one has finished, the command stops if any didn't pass, naming
+        each together: for a sign-in to renew, or anything else a component waits on, when one
+        does."""
         if not entries:
             return
         self.enter(entries[0])
@@ -50,6 +50,8 @@ class Checks(Base):
             return entry, clis[entry.id].run("preflight", "--json", *self.version)
 
         def work() -> None:
+            # Each environment the preflights share is built first, so none builds twice at once.
+            built(list(clis.values()))
             with ThreadPoolExecutor(max_workers=len(entries)) as pool:
                 for future in as_completed([pool.submit(run, entry) for entry in entries]):
                     entry, call = future.result()
@@ -83,11 +85,7 @@ class Checks(Base):
             ],
             next=(
                 *self.sign_in_next(call),
-                Next(
-                    "dp-instance resume",
-                    "runs each preflight that didn't pass and every check after them, then carries on, "
-                    "once that's done",
-                ),
+                Next(self.restart(), "runs every preflight again, once that's done"),
             ),
             **detail,
         )
@@ -119,14 +117,14 @@ class Checks(Base):
     def drift_check(self, entry: Entry, block: Block) -> None:
         """Plan every component's phases on the commit its walk last applied, as its applied
         commit records it, or, before any walk recorded one, as its last publication's `source`
-        stamp names it: only a real change made outside a run is drift, and work merged to `main`
-        that no walk has applied is pending, which the walk applies. It fails closed: Component
-        Outputs it can't read whole stop it, naming what. Only a component registered and never
-        published, or not registered yet, or one whose walk an apply left part way, is left out,
-        and each of its steps asks. A step that drifted is planned again on `main` when `main` is
-        ahead of what it applied: with no real change there, the change made outside a run is
-        written into the configuration, and the walk goes on. On drift it stops before anything
-        changes, naming the steps."""
+        stamp names it: only a real change made outside a run is drift, never a renewal due, and
+        work merged to `main` that no walk has applied is pending, which the walk applies. It fails
+        closed: Component Outputs it can't read whole stop it, naming what. Only a component
+        registered and never published, or not registered yet, or one whose walk an apply left
+        part way, is left out, and each of its steps asks. A step that drifted is planned again
+        on `main` when `main` is ahead of what it applied: with no drift there, the change made
+        outside a run is written into the configuration, and the walk goes on. On drift it stops
+        before anything changes, naming the steps."""
         # Only this drift check's plans count: an earlier attempt's, before a stop, never do.
         self.record.data.pop("drift_plans", None)
         aggregate, last = self.read_applied(block)
@@ -176,7 +174,8 @@ class Checks(Base):
                 )
                 declared = found[(repository.key, component)]
                 for phase in drift_phases(repository, component, declared):
-                    phases.append((repository, component, phase, declared.command))
+                    steps = [step.name for step in declared.phase(phase).runs]
+                    phases.append((repository, component, phase, declared.command, steps))
             results += self.plan_phases(block, phases, copies, versions)
         self.judge_drift(
             entry,
@@ -313,16 +312,25 @@ class Checks(Base):
     def plan_phases(
         self, block: Block, phases: list, copies: dict[str, Path], versions: dict[str, list[str]]
     ) -> list:
-        """Plan the phases, each on its repository's copy, in parallel."""
+        """Plan the phases, each on its repository's copy, in parallel: each phase's plans, one
+        after another, with the plan file each wrote. A phase's plan stops at its first change, of
+        any kind, so each step after it is planned alone: a drift there is still seen, whatever
+        the drift check makes of the change it stopped at."""
 
         def plan_one(target_phase):
-            repository, component, phase, command = target_phase
-            file = self.record.file("plans", f"drift-{component}-{phase}.txt")
-            file.unlink(missing_ok=True)
-            call = Cli(command, copies[repository.key], self.log).run(
-                "plan", "--phase", phase, "--json", "--plan-file", str(file), *versions[repository.key]
-            )
-            return repository.key, component, phase, file, call
+            repository, component, phase, command, steps = target_phase
+            cli = Cli(command, copies[repository.key], self.log)
+            version = versions[repository.key]
+            plans = [self.drift_plan(cli, component, phase, None, version)]
+            _, call = plans[0]
+            events = call.finished()
+            stopped = events[-1] if call.status == "done" and events else {}
+            if stopped.get("status") == "change" and stopped.get("step") in steps:
+                for step in steps[steps.index(stopped["step"]) + 1 :]:
+                    plans.append(self.drift_plan(cli, component, phase, step, version))
+                    if plans[-1][1].status != "done":
+                        break
+            return repository.key, component, phase, plans
 
         if not phases:
             return []
@@ -331,13 +339,30 @@ class Checks(Base):
         times = self.drift_times()
         phases = sorted(phases, key=lambda item: -times.get(f"{item[1]}/{item[2]}", float("inf")))
         block.message = f"Drift Check: planning {len(phases)} phases, {PHASES_AT_ONCE} at a time"
+
+        def work():
+            built([Cli(command, copies[repository.key], self.log) for repository, _, _, command, _ in phases])
+            return list(pool.map(plan_one, phases))
+
         with ThreadPoolExecutor(max_workers=PHASES_AT_ONCE) as pool:
-            results = self.screen.run_live(block, lambda: list(pool.map(plan_one, phases)))
+            results = self.screen.run_live(block, work)
         block.message = ""
         self.keep_drift_times(
-            {f"{component}/{phase}": round(call.seconds, 1) for _, component, phase, _, call in results}
+            {
+                f"{component}/{phase}": round(sum(call.seconds for _, call in plans), 1)
+                for _, component, phase, plans in results
+            }
         )
         return results
+
+    def drift_plan(
+        self, cli: Cli, component: str, phase: str, step: str | None, version: list[str]
+    ) -> tuple[Path, Call]:
+        """One plan of the phase, or of one of its steps, read only, into a plan file of its own."""
+        file = self.record.file("plans", f"drift-{component}-{phase}{f'-{step}' if step else ''}.txt")
+        file.unlink(missing_ok=True)
+        only = ["--step", step] if step else []
+        return file, cli.run("plan", "--phase", phase, *only, "--json", "--plan-file", str(file), *version)
 
     def drift_times(self) -> dict[str, float]:
         """Each phase's time at the last drift check on this workstation; none when it has none."""
@@ -357,13 +382,14 @@ class Checks(Base):
     def judge_drift(
         self, entry: Entry, block: Block, results: list, applied: dict[tuple[str, str], str]
     ) -> None:
-        """Every phase's plan: a failure stops or is one decision to go on without it; a real
-        change is drift, unless `main`, ahead of what the component applied, plans none there."""
-        failures = [
-            (repository, component, phase, call)
-            for repository, component, phase, _, call in results
-            if call.status != "done"
-        ]
+        """Every phase's plans: a failure stops or is one decision to go on without it; a real
+        change in any of them is drift, unless it's only a renewal due, which its step plans in its
+        turn, or `main`, ahead of what the component applied, plans none there."""
+        failures = []
+        for repository, component, phase, plans in results:
+            stopped = next((call for _, call in plans if call.status != "done"), None)
+            if stopped is not None:
+                failures.append((repository, component, phase, stopped))
         # A plan that failed the way a temporary failure does, its retries spent, stops for a
         # resume, unless another phase waits on a person.
         if any(call.temporary for *_, call in failures) and not any(
@@ -386,38 +412,48 @@ class Checks(Base):
             )
         if failures:
             self.planning_failed(block, failures)
-        drifted = False
-        # Each step's plan, by its entry: its status and, for a Terraform step, the hash of its
-        # inputs, so a later walk can tell when the drift check already planned exactly what it
-        # would plan.
+        found = False
+        # Each step's plan, by its entry: its status and, for a step that reuses it, the hash of
+        # its inputs, so a later walk can tell when the drift check already planned exactly what
+        # it would plan.
         planned = self.record.data["drift_plans"] = {}
-        for repository, component, phase, file, call in results:
-            for event in call.finished():
-                step = event["step"]
-                real = real_change(event)
-                planned[f"{repository}/{component}/{phase}/{step}"] = {
-                    "status": event.get("status"),
-                    **({"inputs_hash": event["inputs_hash"]} if event.get("inputs_hash") else {}),
-                }
-                self.optional(event)
-                if real and self.written_into_main(repository, component, phase, step, applied):
-                    block.add(
-                        "Drift Accepted:",
-                        f"{component} {phase}/{step}: main plans no change there, so the configuration "
-                        "holds it",
-                    )
-                elif real:
-                    drifted = True
-                    block.add("Drift:", f"{component} {phase}/{step}: {event.get('summary') or 'a change'}")
-                    if file.exists():
-                        block.add("Plan File:", self.relative(file))
-                elif event.get("status") == "pending":
-                    block.add(
-                        "Pending:",
-                        f"{component} {phase}/{step}: waits on outside work or an earlier change",
-                    )
+        events = [
+            (repository, component, phase, file, event)
+            for repository, component, phase, plans in results
+            for file, call in plans
+            for event in call.finished()
+        ]
+        for repository, component, phase, file, event in events:
+            step = event["step"]
+            drift = drifted(event)
+            planned[f"{repository}/{component}/{phase}/{step}"] = {
+                "status": event.get("status"),
+                **({"inputs_hash": event["inputs_hash"]} if event.get("inputs_hash") else {}),
+            }
+            self.optional(event)
+            if drift and self.written_into_main(repository, component, phase, step, applied):
+                block.add(
+                    "Drift Accepted:",
+                    f"{component} {phase}/{step}: main plans no change there, so the configuration holds it",
+                )
+            elif drift:
+                found = True
+                block.add("Drift:", f"{component} {phase}/{step}: {event.get('summary') or 'a change'}")
+                if file.exists():
+                    block.add("Plan File:", self.relative(file))
+            elif real_change(event):
+                block.add(
+                    "Renewal Due:",
+                    f"{component} {phase}/{step}: {event.get('summary') or 'a renewal'}; it plans and "
+                    "asks in its turn",
+                )
+            elif event.get("status") == "pending":
+                block.add(
+                    "Pending:",
+                    f"{component} {phase}/{step}: waits on outside work or an earlier change",
+                )
         self.record.save()
-        if drifted:
+        if found:
             raise Stop(
                 "failed",
                 "The platform differs from the code and configuration it last applied: a change made "
@@ -464,9 +500,9 @@ class Checks(Base):
         events = call.finished(step)
         if not events:
             return False
-        # Only no change, or a change that isn't a real one; pending or anything else isn't proof.
+        # Only no change, or a change that isn't drift; pending or anything else isn't proof.
         status = events[-1].get("status")
-        return status == "no-change" or (status == "change" and not real_change(events[-1]))
+        return status == "no-change" or (status == "change" and not drifted(events[-1]))
 
     def planning_failed(self, block: Block, failures: list[tuple[str, str, str, Call]]) -> None:
         """Show each phase the drift check couldn't plan. A sign-in to renew, or anything else a
@@ -512,12 +548,15 @@ class Checks(Base):
         if notes:
             block.add("Release Notes:", notes)
         if self.session.interactive:
+            block.add("Preflight:", f"{PREFLIGHT.command}, in another terminal, {PREFLIGHT.why}")
             key = self.screen.ask(
                 block, [("y", "go on"), ("n", "stop the run here")], "Go on without checking them?"
             )
             if key == "y":
                 block.lines = [
-                    line for line in block.lines if line.label not in ("Decision:", "Release Notes:")
+                    line
+                    for line in block.lines
+                    if line.label not in ("Decision:", "Release Notes:", "Preflight:")
                 ]
                 block.lines[-1].text.append("   approved", style="green")
                 return
@@ -537,6 +576,7 @@ class Checks(Base):
                 "resume": command,
             },
             next=(
+                PREFLIGHT,
                 Next(
                     command,
                     "goes on with those phases unchecked for drift: approve only when the release's notes "
@@ -559,23 +599,40 @@ DRIFT_TIMES = "drift-times.json"
 REAL = ("create", "update", "replace", "destroy")
 
 
+def real_decision(decision: dict) -> bool:
+    """Whether one decision is a real change: its counts hold one, or it has none, as a native
+    decision has none."""
+    counts = decision.get("counts")
+    return not isinstance(counts, dict) or any(counts.get(kind) for kind in REAL)
+
+
 def real_change(event: dict) -> bool:
-    """Whether a plan's finished event is a real change, as the design counts drift: a create,
-    an update in place, a replacement or a destroy. Output changes, handoff document rewrites,
-    forgets, moves and imports aren't. Each decision's counts say it, a native decision counting
-    as real; before the engine counted decisions, a Terraform step's summary does, and the text
-    of a change that's only a handoff rewrite or outputs to publish again."""
+    """Whether a plan's finished event is a real change: a create, an update in place, a
+    replacement or a destroy. Output changes, handoff document rewrites, forgets, moves and
+    imports aren't. Each decision's counts say it, a native decision counting as real; before
+    the engine counted decisions, a Terraform step's summary does, and the text of a change
+    that's only a handoff rewrite or outputs to publish again. A renewal is a real change."""
     if event.get("status") != "change":
         return False
     decisions = event.get("decisions")
     if isinstance(decisions, list):
-        return any(
-            not isinstance(item.get("counts"), dict) or any(item["counts"].get(kind) for kind in REAL)
-            for item in decisions
-            if isinstance(item, dict)
-        )
+        return any(real_decision(item) for item in decisions if isinstance(item, dict))
     summary = str(event.get("summary") or "")
     counted = TERRAFORM_COUNTS.findall(summary)
     if counted:
         return any(int(number) for number, _ in counted)
     return not summary.startswith(NOT_REAL)
+
+
+def drifted(event: dict) -> bool:
+    """Whether a plan's finished event is drift, as the design counts it: a real change, unless
+    each of its real decisions is a renewal the platform owns, as each decision's `renewal` says,
+    which the step plans and asks for in its turn. An engine before renewals names none."""
+    if not real_change(event):
+        return False
+    decisions = event.get("decisions")
+    if not isinstance(decisions, list):
+        return True
+    return not all(
+        item.get("renewal") is True for item in decisions if isinstance(item, dict) and real_decision(item)
+    )

@@ -1,7 +1,8 @@
 """The commands that walk: `prepare`, `apply` and `resume`.
 
 `prepare` turns a change into pull requests: a Configuration Change, the commits on your branch,
-or, with `--to`, an upgrade to the next required stop, which it never starts without `--to`. An
+or, with `--to`, an upgrade to the next required stop, which it never starts without `--to`;
+with `--no-preview`, it plans no step, and `apply` asks about each change. An
 instance has one open change, recorded in its shared run record: while its pull requests are
 open, `prepare` adds to it, keeping its kind and target, an upgrade's re-run where its branch
 hasn't it, and `prepare --to` refuses unless it re-prepares that upgrade. `prepare --to` also
@@ -311,9 +312,10 @@ def _check_applied(
     )
 
 
-def _check_branches(session: Session, found: dict | None, states: dict, version: str) -> None:
+def _check_branches(session: Session, found: dict | None, states: dict, version: str, flag: str) -> None:
     """An upgrade starts from what the platform applied: its migrate units read it, and an edit
-    would go in before them, against the old schema. Your branch's commits join it afterwards."""
+    would go in before them, against the old schema. Your branch's commits join it afterwards.
+    ``flag`` is `--no-preview`, when the command had it, which each prepare it names keeps."""
     prepared = session.prepared(found.get("run")) if found is not None else None
     sources = (prepared.data.get("sources") or {}) if prepared is not None else {}
     merged = {
@@ -341,11 +343,11 @@ def _check_branches(session: Session, found: dict | None, states: dict, version:
         branches=ahead,
         next=(
             Next(
-                "dp-instance prepare",
+                f"dp-instance prepare{flag}",
                 "turns your commits into pull requests; merge them, then dp-instance apply",
             ),
             Next(
-                f"git switch main, then dp-instance prepare --to {version}",
+                f"git switch main, then dp-instance prepare --to {version}{flag}",
                 "upgrades first; a plain dp-instance prepare on your branch then adds your commits",
             ),
         ),
@@ -492,7 +494,9 @@ def _ask_intent(
     return version is not None, version
 
 
-def prepare(session: Session, version: str | None, manifest_file: str | None) -> Result:
+def prepare(
+    session: Session, version: str | None, manifest_file: str | None, *, preview: bool = True
+) -> Result:
     _reading(session, "prepare")
     if session.lock is None:
         raise failed(
@@ -523,6 +527,7 @@ def prepare(session: Session, version: str | None, manifest_file: str | None) ->
         if not going:
             return Result("prepare", "done", "Nothing prepared.")
     upgrade = version is not None or manifest_file is not None
+    flag = "" if preview else " --no-preview"
     if upgrade:
         target, channel = targets.target(releases, version, manifest_file)
         if open_now and (found.get("target") != target.platform_version or found.get("kind") != "upgrade"):
@@ -533,18 +538,20 @@ def prepare(session: Session, version: str | None, manifest_file: str | None) ->
                 + f". An instance has one open change: merge or close them before preparing Platform "
                 f"{target.platform_version}; nothing has changed.",
                 reason="open-change",
-                next=(Next("dp-instance prepare", "adds your edits to the open change instead"),),
+                next=(Next(f"dp-instance prepare{flag}", "adds your edits to the open change instead"),),
             )
         option = f"--candidate {manifest_file}" if manifest_file else f"--to {target.platform_version}"
         command = f"dp-instance prepare {option}"
+        # The command as typed, which every command this names keeps; the run records it apart.
+        typed = f"{command}{flag}"
         _approving_only_the_replace(session, session.stopped(), command)
         running = targets.manifest_of(instance, releases, recorded, given=given)
         if not open_now:
-            _check_applied(session, running, commits, copies, command)
-            _check_branches(session, found, states, target.platform_version)
+            _check_applied(session, running, commits, copies, typed)
+            _check_branches(session, found, states, target.platform_version, flag)
         start = targets.standing(instance, releases, recorded, given=given, verified=True)
         targets.check_next_stop(start, releases, target, pinned=installed.pinned(instance.state) is not None)
-        _check_adoption(session, running, copies, command)
+        _check_adoption(session, running, copies, typed)
         change, title = target.change, _title(target, channel, manifest_file)
         candidate = "candidate " if channel == "canary" else ""
         manifest, goal = (
@@ -566,7 +573,11 @@ def prepare(session: Session, version: str | None, manifest_file: str | None) ->
                     f"The instance's open change, {title}, was prepared from a candidate manifest this "
                     "workstation can't read, so its edits can't be added here; nothing has changed.",
                     reason="open-change",
-                    next=(Next("dp-instance prepare --candidate <candidate manifest>", "adds them with it"),),
+                    next=(
+                        Next(
+                            f"dp-instance prepare --candidate <candidate manifest>{flag}", "adds them with it"
+                        ),
+                    ),
                 )
             manifest = releases.manifest(change_target)
         manifest = manifest or targets.manifest_of(instance, releases, recorded, given=given)
@@ -584,7 +595,7 @@ def prepare(session: Session, version: str | None, manifest_file: str | None) ->
     # naming it.
     replaces = previous if upgrade else None
     if upgrade:
-        _replacing(session, previous, command)
+        _replacing(session, previous, command, typed)
     elif previous is not None:
         session.show_stopped()
     run = Record.new(
@@ -598,6 +609,8 @@ def prepare(session: Session, version: str | None, manifest_file: str | None) ->
         title=title,
         start=start_version,
         command=command,
+        # Apart from `command`, which tells a plain prepare from others and draws a replace's ID.
+        no_preview=not preview,
         manifest_origin=manifest_file or manifest.origin,
         change_kind=kind,
         change_target=change_target,
@@ -687,9 +700,8 @@ def apply(session: Session) -> Result:
     _check_names_every_repository(session, manifest)
     previous = session.stopped()
     _replacing(session, previous, "dp-instance apply")
-    reviewed = (
-        (session.prepared(applies).data.get("preview") or {}) if applies and session.prepared(applies) else {}
-    )
+    prepared = session.prepared(applies) if applies else None
+    reviewed = (prepared.data.get("preview") or {}) if prepared is not None else {}
     run = Record.new(
         record.runs_folder(instance.state),
         "apply",
@@ -699,6 +711,8 @@ def apply(session: Session) -> Result:
         manifest_origin=manifest.origin,
         applies=applies,
         reviewed=reviewed,
+        # Whether the prepare it applies previewed nothing, as `--no-preview` does, so each change asks.
+        prepared_without_preview=bool(prepared is not None and prepared.data.get("no_preview")),
         started_by={**session.operator, "at": now()},
     )
     run.manifest_path.write_text(manifest.text, encoding="utf-8")
@@ -885,9 +899,10 @@ def _approving_only_the_replace(session: Session, run: Record | None, command: s
         )
 
 
-def _replacing(session: Session, run: Record | None, command: str) -> None:
+def _replacing(session: Session, run: Record | None, command: str, typed: str | None = None) -> None:
     """A new run replaces the stopped run, a prepare or an apply, only after a question, whoever
-    started it: nothing is replaced silently."""
+    started it: nothing is replaced silently. The answer's ID is drawn from ``command``, and the
+    command that gives it repeats ``typed``, the command as typed, such as with `--no-preview`."""
     _approving_only_the_replace(session, run, command)
     identifier = _replace_id(run, command)
     if run is None:
@@ -906,7 +921,7 @@ def _replacing(session: Session, run: Record | None, command: str) -> None:
             Next("dp-instance resume", "carries the stopped run on"),
         ),
         next=(
-            Next(f"{command} --approve {identifier}", "replaces the stopped run with a new one"),
+            Next(f"{typed or command} --approve {identifier}", "replaces the stopped run with a new one"),
             Next("dp-instance resume", "carries the stopped run on instead"),
         ),
     )

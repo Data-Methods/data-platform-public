@@ -1,10 +1,20 @@
-"""The read-only commands over the sequence: `plan` and `verify`.
+"""The read-only commands over the sequence: `preflight`, `plan` and `verify`.
 
-`plan` previews what `apply` would do once the change merges: `origin/main`, the open change and
-your branch's commits, built in copies of its own as `prepare` builds them, edits that aren't
-committed left out and named; it pushes nothing and opens no pull request. It plans every
-platform step, read only, each with its outcome and whether it's
-provisional, and with `--step`, one step alone. `verify` is the Completion Check, from
+`preflight` runs every component's own preflight, all at once, from `main`'s code or, with
+`--to`, the target's, against copies of `origin/main` in `.dp-instance/preflight/`, its own
+folder: it holds no run lock, starts no run and works signed out and before the state account
+exists, each preflight saying what it needs. Like `plan`, it stops when the release `main`
+records can't be named.
+
+`plan` previews what `apply` would do once the change merges: `origin/main`, the open change's
+branch while its pull requests are open, then your branch's commits, built in copies of its own
+in `.dp-instance/plan/` as `prepare` builds them, edits that aren't committed left out and named.
+It renders first, then plans every enabled platform step of every component in the release,
+the phases after a merge included, read only, each with its outcome and whether it's
+provisional, and with `--step`, one step alone. It runs no upgrade or migrate, pushes nothing and
+opens no pull request, and its record never feeds `apply`. A step that skips across runs and
+that nothing in the change reaches reports no change without planning, so `plan` can't find
+drift there, which `apply`'s drift check finds. `verify` is the Completion Check, from
 `origin/main`: when `main` is ahead of what each component's walk last applied, it says `apply`
 is pending and runs the drift check, against the commits the walks applied; otherwise every
 step's read-only verify, by phase, six phases at a time, each step shown with its own time; a
@@ -20,13 +30,14 @@ from __future__ import annotations
 import json
 import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 from rich.text import Text
 
 from . import gitops, places, targets
-from .components import StepReports
+from .components import StepReports, built
 from .manifest import Manifest, read_file
-from .outcome import WAITING_FOR, Next, Result, Stop, failed
+from .outcome import PREFLIGHT, WAITING_FOR, Next, Result, Stop, failed, naming_preflight
 from .processes import PHASES_AT_ONCE
 from .record import Record, runs_folder
 from .screen import Block
@@ -37,9 +48,11 @@ from .walk.common import DRIFT_TEXT
 from .walk.reading import refuse_earlier_release, walks
 
 
-def _record(session: Session, kind: str, goal: str, manifest: Manifest, **extra) -> Record:
+def _record(
+    session: Session, kind: str, goal: str, manifest: Manifest, target: str | None = None, **extra
+) -> Record:
     found = Record.new(
-        runs_folder(session.instance.state), kind, None, goal, manifest_origin=manifest.origin, **extra
+        runs_folder(session.instance.state), kind, target, goal, manifest_origin=manifest.origin, **extra
     )
     found.manifest_path.write_text(manifest.text, encoding="utf-8")
     session.name(found.id)
@@ -94,7 +107,7 @@ class Preview(Prepare):
         self.header()
         try:
             if step:
-                self.show_part("before")
+                self.show_part("code")
                 self.build()
                 self.record.entries = []
                 self.show_part("preview")
@@ -169,6 +182,103 @@ def plan(session: Session, step: str | None = None) -> Result:
     return Preview(session, record, manifest, copies).walk(step)
 
 
+class Preflights(View):
+    """`preflight`: every component's own preflight, all at once, from `main`'s code or the
+    target's, against copies of `origin/main` of its own."""
+
+    def source_folder(self, repository: str) -> Path:
+        return places.preflight_source(self.instance, repository)
+
+    def walk(self) -> Result:
+        self.header()
+        self.show_part("preflight")
+        target = self.record.data.get("target")
+        try:
+            if target:
+                # The target's own steps, so a component new in it is asked for in its code.
+                self.fetch_sources()
+                sources = {key: self.source(key) for key in self.places}
+                declarations = self.declarations(sources, project=sources)
+            else:
+                declarations = self.declarations()
+            entries = self.plan(declarations).preflights()
+            for entry in entries:
+                entry.fetched = bool(target)
+            self.record.entries = entries
+            self.record.save()
+            self.preflights(entries)
+        except KeyboardInterrupt:
+            return self.stopped(Stop("failed", "Interrupted.", reason="interrupted"))
+        except Stop as stop:
+            return self.stopped(stop)
+        self.record.complete()
+        self.close_part("preflight")
+        message = f"Every preflight passed: {len(entries)} component{'s' if len(entries) != 1 else ''}."
+        self.screen.blank(2)
+        self.screen.print(Text(message, style="bold green"))
+        return Result("preflight", "done", message, detail={"run": self.record.id})
+
+    def stopped(self, stop: Stop) -> Result:
+        """A stop names this command again where a run's names `dp-instance resume`: a preflight
+        is no run to carry on."""
+        reason = stop.detail.get("reason", stop.status)
+        self.pause()
+        again = Next(self.restart(), "runs every preflight again, once that's done")
+        steps = (
+            *(
+                item
+                for item in stop.next
+                if not item.command.startswith(("dp-instance resume", "dp-instance preflight"))
+            ),
+            again,
+        )
+        detail = {key: value for key, value in stop.detail.items() if key != "reason"}
+        self.record.stop(
+            stop.status,
+            reason,
+            stop.message,
+            entry=self._entry.id if self._entry is not None else None,
+            next=[item.describe() for item in steps],
+            **detail,
+        )
+        self.screen.blank()
+        self.screen.note(stop.message, {"failed": "bold red"}.get(stop.status, "bold orange1"))
+        self.screen.continuing(steps, self.relative(self.record.folder) + "/")
+        return Result(
+            "preflight", stop.status, stop.message, steps, {"run": self.record.id, "reason": reason, **detail}
+        )
+
+
+def preflight(session: Session, version: str | None, file: str | None) -> Result:
+    """Every component's preflight, from `main`'s code or, with ``version`` or a candidate
+    ``file``, the target's; it takes no run lock and never reaches the shared run record."""
+    instance = session.instance
+    _, copies = places.mains(instance, places.PREFLIGHT)
+    if version is None and file is None:
+        manifest = targets.manifest_of(instance, session.releases, places.records(copies))
+        goal = f"preflight: every component's preflight, from Platform {manifest.platform_version}'s main"
+        record = _record(session, "preflight", goal, manifest, command="dp-instance preflight")
+    else:
+        manifest, channel = targets.target(session.releases, version, file)
+        candidate = "candidate " if channel == "canary" else ""
+        option = f"--candidate {file}" if file else f"--to {manifest.platform_version}"
+        goal = (
+            f"preflight: every component's preflight, from {candidate}Platform "
+            f"{manifest.platform_version}'s templates"
+        )
+        record = _record(
+            session,
+            "preflight",
+            goal,
+            manifest,
+            target=manifest.platform_version,
+            command=f"dp-instance preflight {option}",
+            channel=channel,
+        )
+    listed = {item.key: copies[item.key] for item in manifest.order if item.key in copies}
+    return Preflights(session, record, manifest, listed).walk()
+
+
 class Verification(View):
     """`verify`: every step's read-only verify, or one step's, by phase, six phases at a time."""
 
@@ -192,6 +302,7 @@ class Verification(View):
             steps = stop.next
             if stop.status == "sign-in":
                 steps = (*steps, Next(again, "checks again once signed in"))
+            steps = naming_preflight(stop.status, stop.detail.get("reason"), steps)
             self.record.complete()
             self.screen.blank(2)
             self.screen.note(stop.message, "bold orange1")
@@ -251,6 +362,7 @@ class Verification(View):
                 "request to merge and release, is done where it says, and no run does it",
             ),
             Next(again, "checks again once each is done"),
+            PREFLIGHT,
         )
         self.screen.continuing(steps, self.relative(self.record.folder) + "/")
         return Result(
@@ -334,9 +446,13 @@ class Verification(View):
             say()
             return phase, (call, reports)
 
+        def work():
+            built([self.cli(repository, command) for repository, _, command, _ in phases])
+            return list(pool.map(verify, phases))
+
         say()
         with ThreadPoolExecutor(max_workers=PHASES_AT_ONCE) as pool:
-            return dict(self.screen.run_live(block, lambda: list(pool.map(verify, phases))))
+            return dict(self.screen.run_live(block, work))
 
     def verified(
         self, entry: Entry, call, reports: StepReports, failed_phases: set[tuple[str, str, str, str]]

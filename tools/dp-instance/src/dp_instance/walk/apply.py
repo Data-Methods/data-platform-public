@@ -1,17 +1,18 @@
 """`apply`: the platform brought to `main`, as merged on GitHub, from each repository's own copy
 at `origin/main`: your checkout is only an input, and `apply` commits to no repository.
 
-Before anything changes, every component's preflight and the drift check, against the commit
-each component's walk last applied. Then every platform step, in the manifest's order, each
-planned again: a change the reviewed preview recorded applies as approved by review, any other
-asks (rule 5), and a step that writes the repository finds that `prepare` already did. A step
-whose rendered files would change at apply, as a provisional one's can, stops before it runs,
-naming them: `prepare` renders them for review. A component's first applied step records its
-walk as part way in the shared run record, with the commit it applies; when its last step has
-finished, `outputs mark-applied` records the commit as the one its whole walk applied, and the
-walk is no longer part way. A stopped apply finishes the commits it planned; `status` names
-`apply` again when `main` moved since. A completed apply names each Managed Repository's
-Adoption PR a step left open, whose merge and release come first, then `dp-instance verify`."""
+Before anything changes, the drift check, against the commit each component's walk last
+applied; it runs no preflight, which `dp-instance preflight` runs. Then every platform step, in
+the manifest's order, each planned again: a change the reviewed preview recorded applies as
+approved by review, any other asks (rule 5), and a step that writes the repository finds that
+`prepare` already did. A step whose rendered files would change at apply, as a provisional
+one's can, stops before it runs, naming them: `prepare` renders them for review. A component's
+first applied step records its walk as part way in the shared run record, with the commit it
+applies; when its last step has finished, `outputs mark-applied` records the commit as the one
+its whole walk applied, and the walk is no longer part way. A stopped apply finishes the commits
+it planned; `status` names `apply` again when `main` moved since. A completed apply names each
+Managed Repository's Adoption PR a step left open, whose merge and release come first, then
+`dp-instance verify`."""
 
 from __future__ import annotations
 
@@ -39,16 +40,15 @@ class Apply(Run):
         self.walk_entries()
 
     def build(self) -> None:
-        """The entries of a new apply, from the steps `main` declares: the preflights, the drift
-        check, every platform step and, after each component's last, its applied commit."""
+        """The entries of a new apply, from the steps `main` declares: the drift check, every
+        platform step and, after each component's last, its applied commit."""
         self._progress = None
         started = time.monotonic()
         declarations = self.declarations()
         if not walks(declarations):
             raise refuse_earlier_release("The templates on main")
         plan = self.plan(declarations)
-        entries = plan.preflights()
-        entries.append(Entry(id="drift-check", kind="drift", description=DRIFT_TEXT))
+        entries = [Entry(id="drift-check", kind="drift", description=DRIFT_TEXT)]
         platform = plan.platform()
         last = {(entry.repository, entry.component): index for index, entry in enumerate(platform)}
         for index, entry in enumerate(platform):
@@ -73,12 +73,14 @@ class Apply(Run):
                 )
         self.record.entries = entries
         self.record.data["reads"] = reads(platform, declarations)
+        self.record.data["reuses"] = plan.reusing(platform)
         self.seed_handoffs()
         self.timed("read", f"the steps of {len(declarations)} components", started)
 
     def seed_handoffs(self) -> None:
-        """Start the run's handoff documents from the last completed apply's, so a step this run
-        doesn't evaluate keeps its standing actions; a step that applies writes its own over them."""
+        """Start the run's handoff documents from those each component's walk last left, so a step
+        this run doesn't evaluate keeps its standing actions; a step that applies writes its own
+        over them."""
         folder = self.record.folder / "handoffs"
         folder.mkdir(exist_ok=True)
         found = self.session.shared.handoffs(self.record.id) if self.session.shared is not None else {}

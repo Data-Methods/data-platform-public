@@ -2,11 +2,11 @@
 
 A prepare turns a change into pull requests, building each repository's change in its own copy
 (`prepare`); an apply brings the platform to `main`, from each repository's own copy at
-`origin/main` (`apply`). Each kind's parts are counted and timed on their own, in wall time:
-before anything changes, every component's `preflight` runs, all at once, and in an apply the
-drift check; a prepare then walks the code, its preview and its pull requests, and an apply the
-platform. In the platform, each step is planned only after the steps before it have applied: a
-step with no change passes, and at a step with a change the run stops for review and, on
+`origin/main` (`apply`). Each kind's parts are counted and timed on their own, in wall time: a
+prepare walks the code, its preview and its pull requests; an apply, before anything changes,
+the drift check, then the platform. Neither runs a component's `preflight`, which `dp-instance
+preflight` runs, all at once. In the platform, each step is planned only after the steps before
+it have applied: a step with no change passes, and at a step with a change the run stops for review and, on
 approval, applies exactly that plan, which the component verifies before the next step starts.
 A failed step's stop ends with its own command in its repository. While rule C holds in an
 apply, a Terraform step whose drift plan had no change is named to its component's `apply`

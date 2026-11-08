@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from .. import installed
-from ..components import Cli
+from ..components import Cli, built
 from ..outcome import Stop, failed
 from ..screen import Block
 from ..sequence import UPGRADE_STEPS, Declaration, Plan, declaration
@@ -37,10 +37,13 @@ class Reading(Base):
             if only in (None, (repository.key, component.key))
         ]
 
+        def cli_of(job) -> Cli:
+            repository, component = job
+            return Cli(component.command, places[repository], self.log, (project or {}).get(repository))
+
         def read(job):
             repository, component = job
-            cli = Cli(component.command, places[repository], self.log, (project or {}).get(repository))
-            found = declaration(cli.document("steps", "--json"), component.command)
+            found = declaration(cli_of(job).document("steps", "--json"), component.command)
             if found.key != component.key:
                 raise failed(
                     f"{component.command} declares the component {found.key}; the manifest "
@@ -50,8 +53,13 @@ class Reading(Base):
 
         block = Block("sequence", "", "", "", self.footer)
         block.message = f"Reading the steps of {len(jobs)} component{'s' if len(jobs) != 1 else ''}"
+
+        def work():
+            built([cli_of(job) for job in jobs])
+            return list(pool.map(read, jobs))
+
         with ThreadPoolExecutor(max_workers=4) as pool:
-            return dict(self.screen.run_live(block, lambda: list(pool.map(read, jobs))))
+            return dict(self.screen.run_live(block, work))
 
     def plan(self, declarations) -> Plan:
         return Plan(self.manifest, self.repositories, declarations)

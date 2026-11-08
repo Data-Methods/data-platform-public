@@ -1,5 +1,5 @@
-"""Before a prepared upgrade's code part: each repository's target source, the development keys
-a candidate reads it with, and the release notes."""
+"""Before a prepared upgrade's code part, or `preflight --to`'s preflights: each repository's
+target source, the development keys a candidate reads it with, and the release notes."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from .. import gitops, template_access
+from .. import gitops, places, template_access
 from ..instance import SourceRecord
 from ..manifest import version_key
 from ..outcome import Next, Stop, failed
@@ -18,18 +18,21 @@ from .base import Base
 
 class Sources(Base):
     def source(self, repository: str) -> Path:
-        """The owner's source at the target, fetched with the instance's template access into
-        `.dp-instance/src/`. A prepared upgrade runs its CLI against the repository's copy for
-        the preflights and the owner's `upgrade`, so a fix to either works in the upgrade that
-        ships it. Only the target's source is kept: an earlier target's goes, environment and
-        all."""
+        """The owner's source at the target, fetched with the instance's template access. A
+        prepared upgrade runs its CLI against the repository's copy for the owner's `upgrade`, so
+        a fix to it works in the upgrade that ships it, and `preflight --to` for each preflight.
+        Only the target's source is kept: an earlier target's goes, environment and all."""
         return self.fetch(repository)[0]
+
+    def source_folder(self, repository: str) -> Path:
+        """Where the target's source is fetched: a prepare's `.dp-instance/src/`."""
+        return self.instance.own(places.SOURCE, repository)
 
     def fetch(self, repository: str) -> tuple[Path, bool]:
         """The owner's source at the target, and whether this fetched it. A fetch that fails
         leaves no folder behind, so the next one starts clean."""
         commit = self.manifest.sources[repository]
-        folder = self.instance.own("src", repository)
+        folder = self.source_folder(repository)
         with self._fetching[repository]:
             if gitops.is_checkout_root(folder) and gitops.commit_of(folder) == commit:
                 return folder, False
@@ -57,8 +60,8 @@ class Sources(Base):
 
     def fetch_sources(self) -> None:
         """Fetch every repository's target source at once, with Git alone, before an upgrade
-        runs its preflights and owners' `upgrade` phases from them; every fetch that failed stops
-        the run, which `resume` fetches again."""
+        runs its owners' `upgrade` phases, or `preflight --to` its preflights, from them; every
+        fetch that failed stops the run, which `resume` fetches again."""
         self.check_development_keys()
         block = Block("sources", "", "", "", self.footer)
         block.message = f"Fetching the target source of {len(self.repositories)} repositories at once"

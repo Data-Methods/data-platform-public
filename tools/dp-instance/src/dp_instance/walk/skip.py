@@ -14,7 +14,8 @@ class Skip(Base):
         """Whether rule C holds: in an apply, since its drift check, nothing has applied a real
         change but steps declared to write only their repositories or to change nothing a
         Terraform root reads, and the run hasn't waited on outside work or resumed after any stop but a
-        decision, nor found a decision's step with nothing left to apply on resuming."""
+        decision, nor found a decision's step with nothing left to apply on resuming. A native
+        step's real change also ends native steps' reuse (`end_reuse`)."""
         data = self.record.data
         return "drift_plans" in data and not data.get("plan_skip_off")
 
@@ -30,19 +31,40 @@ class Skip(Base):
         else:
             self.screen.labelled("Plan Skip:", line)
 
+    def end_reuse(self, block: Block, reason: str) -> None:
+        """No later native step reuses its drift check, for the rest of the run, which the record
+        keeps with why, as a resume does; Terraform steps keep rule C's own rule."""
+        if self.record.data.get("reuse_off"):
+            return
+        self.record.data["reuse_off"] = reason
+        self.record.save()
+        if self.skipping():
+            block.add(
+                "Plan Skip:", f"off for native steps from here: {reason}; Terraform steps skip as before"
+            )
+
     def applied_change(self, entry: Entry, block: Block, *, real: bool = True) -> None:
         """A real change ends rule C, unless the step writes only its repositories or changes
         nothing a Terraform root reads, as its declaration says: a Terraform step's for the steps
         that read from it, by the graph of declared inputs; any other step's, or one in a run
-        without that graph, for every later step. Output changes, forgets, moves and imports
-        aren't real changes."""
-        if not real or entry.affects_no_root:
+        without that graph, for every later step. A native step's real change, a hold's included,
+        also ends every later native step's reuse, whatever its declaration says; recording a
+        component's applied commit is no step's. Output changes, forgets, moves and imports aren't
+        real changes."""
+        if not real:
             return
+        if not entry.affects_no_root:
+            self.reach_readers(entry, block)
+        if entry.kind == "step" and not entry.terraform:
+            self.end_reuse(block, f"{entry.where} applied a change")
+
+    def reach_readers(self, entry: Entry, block: Block) -> None:
+        """A Terraform step's real change reaches only the steps that read from it; any other's,
+        or one in a run without that graph, every later step."""
         graph = self.record.data.get("reads")
         if not entry.terraform or graph is None:
             self.end_plan_skip(block, f"{entry.where} applied a change")
             return
-        # A Terraform step's real change reaches only the steps that read from it.
         reached = downstream(graph, entry.id) - set(self.record.data.get("reached") or ())
         if not reached or not self.skipping():
             return
@@ -72,10 +94,11 @@ class Skip(Base):
         return self._hashes
 
     def keep_hash(self, entry: Entry, event: dict) -> None:
-        """Keep the hash an apply left a step at, which a later `prepare`'s preview compares."""
+        """Keep the hash an apply left a step that skips across runs at, which a later `prepare`'s
+        preview compares; a step that only reuses its drift check within a run needs none kept."""
         digest = event.get("inputs_hash")
         shared = self.session.shared
-        if shared is None or not digest or self.kept_hashes().get(entry.id) == digest:
+        if shared is None or not entry.plan_skip or not digest or self.kept_hashes().get(entry.id) == digest:
             return
         self.kept_hashes()[entry.id] = digest
         shared.record_step_hashes(self.kept_hashes())
@@ -123,13 +146,22 @@ class Skip(Base):
             if item is not None and event.get("skip_rule"):
                 self._skipped[item.id] = event
 
+    def reuses(self, entry: Entry) -> bool:
+        """Whether the step reuses its drift check within a run: one that skips across runs, or one
+        the run's declarations say reuses, as its record keeps them."""
+        return entry.plan_skip or entry.id in (self.record.data.get("reuses") or ())
+
     def planned(self, entry: Entry) -> list[tuple[str, str]]:
-        """What a step's apply may skip planning, from the drift check: the step itself, when it's
-        a step that skips and its component takes the skip for, its drift plan had no change and named
-        its inputs hash. Nothing while rule C doesn't hold."""
-        if not self.skipping() or not entry.plan_skip or entry.id in (self.record.data.get("reached") or ()):
+        """What a step's apply may skip planning, from the drift check: the step itself, when it
+        reuses its drift check, nothing applied earlier in the run reaches it, and its drift plan
+        had no change and named its inputs hash. Nothing while rule C doesn't hold, nor, for a
+        native step, once a native step has applied a real change."""
+        data = self.record.data
+        if not self.skipping() or not self.reuses(entry) or entry.id in (data.get("reached") or ()):
             return []
-        planned = self.record.data["drift_plans"].get(entry.id) or {}
+        if not entry.terraform and data.get("reuse_off"):
+            return []
+        planned = data["drift_plans"].get(entry.id) or {}
         if planned.get("status") != "no-change" or not planned.get("inputs_hash"):
             return []
         return [(entry.step, planned["inputs_hash"])]

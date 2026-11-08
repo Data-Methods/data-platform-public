@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ..outcome import WAITING_FOR, Next, Result, Stop
+from ..outcome import WAITING_FOR, Next, Result, Stop, naming_preflight
 from ..record import Record
 from ..sequence import Entry
 from .base import Base
@@ -68,14 +68,13 @@ class Stops(Base):
         )
         return (first,) if state == HOLDING else (first, alone)
 
-    @staticmethod
-    def beside(steps: tuple[Next, ...]) -> tuple[Next, ...]:
+    def beside(self, steps: tuple[Next, ...]) -> tuple[Next, ...]:
         """A prepare that ran beside the instance's stopped run is never resumed, which carries
-        that run on: a new prepare starts it again."""
+        that run on: a new prepare starts it again, with `--no-preview` when this one had it."""
         found: list[Next] = []
         for item in steps:
             if item.command.startswith("dp-instance resume"):
-                item = Next("dp-instance prepare", "starts a new prepare, with your branch as it is then")
+                item = Next(self.restart(), "starts a new prepare, with your branch as it is then")
             if all(other.command != item.command for other in found):
                 found.append(item)
         return tuple(found)
@@ -103,7 +102,19 @@ class Stops(Base):
         if reason == "sign-in" and not any(item.command == "dp-instance resume" for item in next_steps):
             # A read that waits for a sign-in inside a run: the run goes on from here once signed in.
             next_steps = (*next_steps, Next("dp-instance resume", "carries on from here once signed in"))
-        steps = (*next_steps, *self.hold_lines(), *self.step_alone(entry, reason))
+        if self.record.kind == "plan":
+            # A plan starts no run to resume: it's planned again.
+            again = self.again()
+            next_steps = (
+                *(item for item in next_steps if item.command != "dp-instance resume"),
+                *(item for item in again if item not in next_steps),
+            )
+        # A step's own command, alone, comes last.
+        steps = (
+            *naming_preflight(stop.status, reason, next_steps),
+            *self.hold_lines(),
+            *self.step_alone(entry, reason),
+        )
         if self.record.data.get("beside"):
             steps = self.beside(steps)
         detail = {key: value for key, value in stop.detail.items() if key != "reason"}

@@ -8,17 +8,19 @@ from ..outcome import Next
 from ..record import Record
 from ..sequence import Entry
 
-# A run's parts, in order, each counted and timed on its own: a prepare's are Preflight,
-# Repository Changes, Platform Preview and Pull Requests; an apply's, Preflight and Platform Changes.
+# A run's parts, in order, each counted and timed on its own: a prepare's are Repository Changes,
+# Platform Preview and Pull Requests; an apply's, Drift Check and Platform Changes. `preflight`
+# has one, Preflight, which a run an earlier dp-instance started also holds.
 PARTS = {
-    "before": "Preflight",
+    "preflight": "Preflight",
+    "before": "Drift Check",
     "code": "Repository Changes",
     "preview": "Platform Preview",
     "requests": "Pull Requests",
     "platform": "Platform Changes",
 }
 # The checks before the run, as a resumed run names those that passed earlier.
-CHECKS = {"preflight": "preflights", "drift": "the drift check"}
+CHECKS = {"drift": "the drift check"}
 # How many of a decision's plan lines its JSON result carries.
 PLAN_HEAD = 40
 UNKNOWN_VERSION = (
@@ -47,9 +49,11 @@ CODE_KINDS = ("upgrade", "migrate", "render")
 
 
 def part_of(entry: Entry) -> str:
-    """The part a run's entry is in: the checks before anything changes, a prepare's code, its
-    preview and its pull requests, or an apply's platform."""
-    if entry.kind in ("preflight", "drift"):
+    """The part a run's entry is in: the preflights, an apply's drift check before anything
+    changes, a prepare's code, its preview and its pull requests, or an apply's platform."""
+    if entry.kind == "preflight":
+        return "preflight"
+    if entry.kind == "drift":
         return "before"
     if entry.kind in CODE_KINDS:
         return "code"

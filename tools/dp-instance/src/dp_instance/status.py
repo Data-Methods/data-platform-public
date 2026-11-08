@@ -111,7 +111,7 @@ def _enter(screen, entry: Entry, shown: tuple) -> tuple:
     if now != stage:
         screen.stage(PARTS[now])
         repository = component = phase = None
-    if now == "before":
+    if now in ("preflight", "before"):
         return now, None, None, None
     part = (now, entry.repository)
     if part != repository:

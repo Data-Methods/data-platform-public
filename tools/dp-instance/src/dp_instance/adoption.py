@@ -16,7 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from . import gitops
-from .components import Cli, Log
+from .components import Cli, Log, built
 from .instance import Instance
 from .manifest import Manifest
 from .outcome import Next, Stop, failed
@@ -47,6 +47,7 @@ def _maintainers(instance: Instance, manifest: Manifest, places: dict[str, Path]
         found = declaration(cli.document("steps", "--json"), cli.command)
         return found.declares(ADOPTION_STATE) and found.manages
 
+    built(clis)
     with ThreadPoolExecutor(max_workers=max(len(clis), 1)) as pool:
         return [cli for cli, maintains in zip(clis, pool.map(declares, clis), strict=True) if maintains]
 

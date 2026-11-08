@@ -177,7 +177,7 @@ class Progress(Base):
         down to ``until``, the level the caller shows itself."""
         stage = part_of(entry)
         self.show_part(stage)
-        if stage in ("before", "requests"):
+        if stage in ("preflight", "before", "requests"):
             return
         depth = LEVELS.index(until)
         _, repository, component, phase = self._shown
@@ -268,9 +268,8 @@ class Progress(Base):
         self.screen.show(block, compact=True)
 
     def replay_checks(self) -> None:
-        """The checks before the run (preflights and the drift check) are its start: those
-        that passed earlier take one line and don't run again. Each preflight that didn't pass
-        runs, and every check after the preflights."""
+        """The check before the run, an apply's drift check, is its start: once it passed
+        earlier, it takes one line and doesn't run again."""
         stage = [item for item in self.record.entries if part_of(item) == "before"]
         passed = [item for item in stage if self.record.finished(item.id) and item.id not in self._walked]
         if not passed:

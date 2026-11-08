@@ -46,16 +46,16 @@ class Run(Progress, Sources, Reading, Checks, Code, Skip, Holds, Steps, Waits, S
         line of its time."""
         handlers = self.handlers()
         for index, entry in enumerate(self.record.entries, 1):
+            if entry.kind == "preflight":
+                # Only a run an earlier dp-instance started has one: a run passes over it, as
+                # `dp-instance preflight` runs them.
+                continue
             if part_of(entry) != self._part:
                 self.close_part()
                 self._part = part_of(entry)
             if entry.id in self._walked:
                 continue
             self._position = index
-            if entry.kind == "preflight":
-                self.replay_checks()
-                self.preflights([item for item in self.record.entries if item.kind == "preflight"])
-                continue
             if self.record.finished(entry.id) or (entry.kind == "preview" and self.record.outcome(entry.id)):
                 self.replay(index - 1)
                 continue
@@ -74,7 +74,7 @@ class Run(Progress, Sources, Reading, Checks, Code, Skip, Holds, Steps, Waits, S
         self.close_part()
 
     def preview_group(self, entry: Entry) -> None:
-        """A prepare plans its preview a phase at a time."""
+        """A prepare plans its preview's phases at once, then judges each step in order."""
         raise NotImplementedError
 
     def show_adoption(self, adoption: list[dict]) -> None:

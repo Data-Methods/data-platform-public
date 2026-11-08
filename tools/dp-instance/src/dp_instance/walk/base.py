@@ -103,14 +103,23 @@ class Base:
         `plan`, `apply` and `verify` take."""
         return ["--platform-version", self.manifest.platform_version]
 
-    def restart(self) -> str:
-        """The command that starts this kind of run again."""
+    @property
+    def command(self) -> str:
+        """The command that started the run, without `--no-preview`, which its record keeps
+        apart."""
         return self.record.data.get("command") or f"dp-instance {self.record.kind}"
+
+    def restart(self) -> str:
+        """The command that starts this kind of run again: a prepare's with `--no-preview` when
+        it had it."""
+        return f"{self.command} --no-preview" if self.record.data.get("no_preview") else self.command
 
     def again(self) -> tuple[Next, ...]:
         """A new run in place of resuming this one: an apply or `prepare --to`, which its first
         question replaces; a plain prepare, which runs beside it and asks nothing."""
-        if self.restart() == "dp-instance prepare":
+        if self.record.kind == "plan":
+            return (Next(self.restart(), "plans again, as it starts no run to resume"),)
+        if self.command == "dp-instance prepare":
             return (
                 Next(self.restart(), "starts a new prepare beside this one, with your branch as it is then"),
             )

@@ -4,8 +4,10 @@ reports. A prepare's code steps commit on the change's branch; an apply's steps 
 Rule 5: an apply's step with a change asks unless its decision is one the reviewed preview
 recorded, by its digest, and `--auto-approve` would cover, which applies as approved by review;
 destroys and replacements ask even then, by a Terraform decision's counts, and so does a native
-decision that doesn't say it destroys nothing. A change merged outside `prepare` has no preview,
-so it asks, as does every step of a component the drift check left out. A preview holds
+decision that doesn't say it destroys nothing. A change merged outside `prepare`, or prepared
+with `--no-preview`, has no preview, so each change asks unless `--auto-approve`, which approves
+destroys and replacements too; every step of a component the drift check left out asks, with
+`--auto-approve` or without. A preview holds
 decisions where its component's plan reports them (`plan_decisions`); otherwise every change
 asks, showing the reviewed summary beside its own."""
 
@@ -127,10 +129,10 @@ class Steps(Base):
         folder = self.record.folder / "handoffs"
         folder.mkdir(exist_ok=True)
         arguments += ["--handoffs", str(folder)]
-        terraform = self.planned(entry)
+        planned = self.planned(entry)
         # Rule C alone: never --planned without --unchanged-since-planned.
-        arguments += [part for step, value in terraform for part in ("--planned", f"{step}={value}")]
-        if terraform:
+        arguments += [part for step, value in planned for part in ("--planned", f"{step}={value}")]
+        if planned:
             arguments.append("--unchanged-since-planned")
         if not automatic:
             return arguments + [
@@ -262,7 +264,12 @@ class Steps(Base):
             said = reviewed.get("summary") or reviewed.get("outcome") or "no change"
             block.add("Reviewed:", said + (" (provisional)" if reviewed.get("provisional") else ""))
         elif self.record.kind == "apply":
-            block.add("Reviewed:", "no preview: the change merged outside dp-instance prepare")
+            block.add(
+                "Reviewed:",
+                "no preview: dp-instance prepare --no-preview prepared the change"
+                if self.record.data.get("prepared_without_preview")
+                else "no preview: the change merged outside dp-instance prepare",
+            )
         shown_plan = plan_file is not None and plan_file.exists() and plan_file.stat().st_size > 0
         if shown_plan:
             block.add("Plan File:", self.relative(plan_file))

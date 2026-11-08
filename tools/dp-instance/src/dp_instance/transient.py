@@ -11,6 +11,7 @@ from __future__ import annotations
 import re
 import sys
 import time
+from collections.abc import Callable
 
 # The waits before each retry: three retries over about two minutes.
 DELAYS = (10, 30, 60)
@@ -126,13 +127,13 @@ def say(line: str) -> None:
     sys.stderr.flush()
 
 
-def retries(found: str | None, retried: int, *, label: str) -> bool:
+def retries(found: str | None, retried: int, *, label: str, report: Callable[[str], None] = say) -> bool:
     """After a failure and ``retried`` retries, whether to try again: a temporary failure, with
-    retries left. Reports it in one line and waits before returning True."""
+    retries left. Reports it in one line, with ``report``, and waits before returning True."""
     if found is None or retried >= len(DELAYS):
         return False
     delay = DELAYS[retried]
-    say(f"{label}: {found}; retrying in {delay}s ({retried + 1} of {len(DELAYS)}).")
+    report(f"{label}: {found}; retrying in {delay}s ({retried + 1} of {len(DELAYS)}).")
     _sleep(delay)
     return True
 

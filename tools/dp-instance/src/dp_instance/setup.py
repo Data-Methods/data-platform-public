@@ -163,10 +163,7 @@ def _outputs(root: Path, found: Found, screen: Screen) -> tuple[dict | None, str
         return None, "no single Client Infrastructure Repository to read them with"
     cli = Cli(INFRASTRUCTURE_COMMAND, paths[0], Log(None))
     try:
-        if screen.interactive:
-            with screen.console.status("Reading the published Component Outputs"):
-                found = cli.document("outputs", "aggregate")
-        else:
+        with screen.busy("Reading the published Component Outputs"):
             found = cli.document("outputs", "aggregate")
         return check_aggregate(found, INFRASTRUCTURE_COMMAND), None
     except Stop as stop:

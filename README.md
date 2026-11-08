@@ -60,10 +60,13 @@ delete its `.venv` and run `uv sync --locked` in it, with the extras its own doc
 
 ```bash
 dp-instance status                           # where the instance stands; changes nothing
+dp-instance preflight                        # each component's own checks of this workstation
+dp-instance preflight --to <version>         # the checks of that Platform Version's templates
 dp-instance prepare                          # turn your branch's commits into pull requests
 dp-instance prepare --to <version>           # an upgrade to the next required stop, as pull requests
-dp-instance plan                             # preview main, the open change and your branch
-dp-instance plan --step <repo/component/phase/step>    # preview one step
+dp-instance prepare --no-preview             # pull requests without the preview; apply asks at each change
+dp-instance plan                             # plan every step on main, the open change and your branch
+dp-instance plan --step <repo/component/phase/step>    # plan one step
 dp-instance apply                            # bring the platform to main, once the pull requests merge
 dp-instance resume                           # carry on where the run stopped, a prepare or an apply
 dp-instance verify                           # check every step
@@ -82,13 +85,24 @@ dp-instance --version                        # the installed dp-instance version
 
 `dp-instance status` names what comes next. Run only what `dp-instance` names.
 
+`dp-instance preflight` runs each component's own checks of this workstation: its tools, its
+sign-in and its access, all at once, from `main`'s code, or with `--to <version>` from that
+Platform Version's templates, before you prepare it. It changes nothing, starts no run and holds
+no run lock, so it runs beside any command, signed out or before the state account exists. No
+other command runs a preflight; a failure that isn't temporary names it.
+
 A change is prepared, reviewed, merged, then applied. Edit configuration on a branch of your
 checkout, commit it, and run `dp-instance prepare`; an upgrade is `dp-instance prepare --to
 <version>`, the next required stop, once `main` is applied, whose notes say what changed.
 `prepare` builds the change in its own copy of each repository, on `platform-change` or
 `platform-<version>`, adds the commits on your branch that `main` doesn't hold, renders the files
 that depend on configuration, previews every step, then pushes each changed repository's branch
-and opens its pull request with its part of the preview. Your checkout is only an input: edits
+and opens its pull request with its part of the preview. With nothing to push, it ends before
+the preview. With `--no-preview`, it opens the pull requests without the preview, and `apply`
+asks about each change; a plain `prepare` afterwards previews the change again for `apply`.
+`dp-instance plan` plans every step, read only, as `prepare` would preview it, with no pull
+request and no run; a step that skips and that nothing reaches isn't planned, so drift there
+shows only in `apply`'s drift check. Your checkout is only an input: edits
 you haven't committed are left out, or committed to your branch when you say so at a terminal.
 An instance has one open change; running `prepare` again adds to it while a pull request of it
 is open. A change whose pull requests were all closed is no longer open; one partly merged waits
@@ -100,7 +114,8 @@ Review and merge each pull request in GitHub, then run `dp-instance apply`, whic
 `origin/main` in its own copy. Each step with a change shows its plan file, under
 `.dp-instance/runs/<run>/plans/`, beside what the review showed: a change the review showed
 applies as approved by review, and any other, or any destroy or replacement, asks: `y` applies
-exactly that plan, `n` stops. Approval is the call of the person accountable for the instance;
+exactly that plan, `n` stops. `apply --auto-approve` approves every change without asking,
+destroys and replacements included, with a preview or without one. Approval is the call of the person accountable for the instance;
 stop and ask about any destroy (`-`) or replace (`-/+`) of data, or a change the release notes
 don't explain.
 
@@ -112,9 +127,13 @@ what it runs.
 
 Every stop ends with **To Continue**, the commands that continue:
 
+- **Failure:** `dp-instance preflight` may name what the workstation lacks; once it's fixed,
+  `dp-instance resume`.
 - **Decision:** review the plan, then `dp-instance resume`.
 - **Drift:** a change made outside a run; nothing has changed. The accountable person writes it
-  into the configuration, with `dp-instance prepare`, or reverts it; then apply again.
+  into the configuration, with `dp-instance prepare`, or reverts it; then apply again. A renewal
+  the platform owns, such as a certificate's when it's due, isn't drift: its step plans and asks
+  in its turn.
 - **Conflict:** your branch conflicts with the open change's branch, `origin/<branch>`, or with
   `origin/main`, naming the files; rebase it onto the one named, then prepare again. When the
   open change's branch itself conflicts with `origin/main`, rebase it, resolve the conflicts and

@@ -2,8 +2,9 @@
 
     dp-instance [status]                    where the instance stands, planning nothing
     dp-instance setup                       map the instance's repositories
+    dp-instance preflight [--to VERSION]    each component's own checks of this workstation
     dp-instance prepare [--to VERSION]      turn your edits, or a Platform Version, into pull requests
-    dp-instance plan [--step NAME]          preview main, the open change and your branch; starts no run
+    dp-instance plan [--step NAME]          plan main, the open change and your branch; starts no run
     dp-instance apply                       bring the platform to main, once its pull requests merge
     dp-instance resume                      carry on the instance's stopped run, a prepare or an apply
     dp-instance verify [--step NAME]        the completion check, or one step's verify
@@ -14,8 +15,10 @@
     dp-instance --version                   this dp-instance's version
 
 prepare, apply, resume, plan, verify and the secret commands hold the instance's run lock while
-they run, and refuse while another command holds it. An upgrade is `prepare --to`, the merge of
-its pull requests, `apply`, each Adoption PR's merge and release, then `verify`.
+they run, and refuse while another command holds it; status holds it only while it reads
+main's copies, and preflight and unlock hold none. Neither prepare, plan nor apply runs a
+preflight: preflight runs them. An upgrade is `prepare --to`, the merge of its pull requests,
+`apply`, each Adoption PR's merge and release, then `verify`.
 
 Every command takes --json: one JSON object per line on stdout, ending with the result, and
 no question asked. Exit codes: 0 done, 1 failed, 2 a usage error, 3 an external handoff,
@@ -30,7 +33,7 @@ import sys
 from pathlib import Path
 
 from . import installed, lock, runs, secrets, self_update, setup, status, template_access, views
-from .outcome import USAGE, Next, Result, Stop
+from .outcome import USAGE, Next, Result, Stop, naming_preflight
 from .screen import Screen
 from .session import Options, Session, ready_for_template_access, terminal
 
@@ -47,7 +50,10 @@ def _parser() -> argparse.ArgumentParser:
     automatic.add_argument(
         "--auto-approve",
         action="store_true",
-        help="Approve each step's plan, and the restarts of secret commands, without stopping.",
+        help=(
+            "Approve each step's plan without stopping, destroys and replacements included, with a preview "
+            "or without one, as after prepare --no-preview; and the restarts of secret commands."
+        ),
     )
     # A decision's ID, which only a stop names: resume and the secret commands take it, prepare for
     # the upgrade's restore and remove questions, and prepare and apply for their question about
@@ -78,25 +84,67 @@ def _parser() -> argparse.ArgumentParser:
     setup_parser.add_argument(
         "--approve", action="append", default=[], metavar="ID", help="Write the map setup showed."
     )
+    checking = commands.add_parser(
+        "preflight",
+        parents=[common],
+        help=(
+            "Run each component's own checks of this workstation, from main's code or with --to a "
+            "Platform Version's; holds no run lock."
+        ),
+        description=(
+            "Run each component's own preflight, all at once: its checks of this workstation, its tools, "
+            "its sign-in and its access. From main's code, or with --to the templates of that Platform "
+            "Version, against copies of origin/main in .dp-instance/preflight/. It changes nothing, starts "
+            "no run and holds no run lock, so it runs beside any command, signed out and before the state "
+            "account exists; each preflight says what it needs. Neither prepare, plan nor apply runs one."
+        ),
+    )
     preparing = commands.add_parser(
         "prepare",
         parents=[common, approving],
         help="Turn your edits, or with --to a Platform Version, into pull requests to review and merge.",
     )
-    target = preparing.add_mutually_exclusive_group()
-    target.add_argument(
-        "--to",
-        metavar="VERSION",
-        help="The published Platform Version to upgrade to, the next required stop, such as 2026.6.0.",
-    )
-    target.add_argument(
-        "--candidate",
-        metavar="FILE",
-        # Data Methods' own pre-release instance only: an unpublished candidate manifest.
-        help=argparse.SUPPRESS,
+    for sub, what in (
+        (checking, "The published Platform Version whose templates' checks run, such as 2026.6.0."),
+        (
+            preparing,
+            "The published Platform Version to upgrade to, the next required stop, such as 2026.6.0.",
+        ),
+    ):
+        target = sub.add_mutually_exclusive_group()
+        target.add_argument("--to", metavar="VERSION", help=what)
+        target.add_argument(
+            "--candidate",
+            metavar="FILE",
+            # Data Methods' own pre-release instance only: an unpublished candidate manifest.
+            help=argparse.SUPPRESS,
+        )
+    preparing.add_argument(
+        "--no-preview",
+        action="store_true",
+        help=(
+            "Open the pull requests without planning the platform's steps, so apply asks about each change "
+            "unless --auto-approve. The preview apply reads is the last prepare's: prepare again without "
+            "it to preview the change."
+        ),
     )
     preview = commands.add_parser(
-        "plan", parents=[common], help="Preview main, the open change and your branch; starts no run."
+        "plan",
+        parents=[common],
+        help=(
+            "Plan, read only, every enabled step of every component in the release, or one with --step, "
+            "on main, the open change and your branch; starts no run."
+        ),
+        description=(
+            "Plan, read only, every enabled platform step of every component in the release, the phases "
+            "after a merge included, or one step with --step. It plans what apply would do once the change "
+            "merges: origin/main, the open change's branch while its pull requests are open, then your "
+            "branch's commits, in copies of its own, renders first; edits that aren't committed are left "
+            "out and named. It runs no upgrade or migrate, pushes nothing, opens no pull request and starts "
+            "no run, and its record stays on this workstation. A step that skips across runs, and that "
+            "nothing in the change reaches, reports no change without planning, so drift there shows only "
+            "in apply's drift check."
+        ),
     )
     commands.add_parser(
         "apply",
@@ -203,13 +251,31 @@ def _dispatch(arguments, screen: Screen) -> Result:
     )
     session = Session(options, start, screen=screen)
     command = arguments.command or "status"
+    if command == "preflight":
+        return views.preflight(session, arguments.to, arguments.candidate)
+    try:
+        return _on_instance(session, command, arguments)
+    except Stop as stop:
+        raise Stop(
+            stop.status,
+            stop.message,
+            next=naming_preflight(stop.status, stop.detail.get("reason"), stop.next),
+            **stop.detail,
+        ) from None
+
+
+def _on_instance(session: Session, command: str, arguments) -> Result:
+    """A command on a found instance, which `preflight` can check: each of its failed stops but a
+    temporary one names it. A stop before, as when the instance can't be found or is
+    refused, names none, as `preflight` meets it too; nor do `setup`, `template-access` and
+    `self update`, which run without an instance."""
     if command == "status":
         return status.status(session)
     if command == "unlock":
         return lock.unlock(session, arguments.run)
     with session.locked(" ".join(part for part in (command, getattr(arguments, "secret", None)) if part)):
         if command == "prepare":
-            return runs.prepare(session, arguments.to, arguments.candidate)
+            return runs.prepare(session, arguments.to, arguments.candidate, preview=not arguments.no_preview)
         if command == "apply":
             return runs.apply(session)
         if command == "resume":

@@ -17,13 +17,12 @@ from __future__ import annotations
 
 import re
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import nullcontext
 from dataclasses import dataclass
 
 from rich.text import Text
 
 from . import prompts, record, targets
-from .components import Call, Cli, Log
+from .components import Call, Cli, Log, built
 from .outcome import WAITS, Next, Result, Stop, failed
 from .session import Session
 
@@ -67,10 +66,9 @@ def _listing(session: Session, found: list[Holder], doing: str) -> list[tuple[Ho
     screen = session.screen
     secrets = []
     reading = f"{doing} every component's secrets"
-    with screen.console.status(reading) if screen.interactive else nullcontext() as status:
+    with screen.busy(reading):
         for number, holder in enumerate(found, 1):
-            if status is not None:
-                status.update(f"{doing} {holder.component}'s secrets ({number} of {len(found)})")
+            screen.working(f"{doing} {holder.component}'s secrets ({number} of {len(found)})")
             call = holder.cli.run("secret", "list", "--json")
             if call.status == "usage":
                 continue  # the component keeps no secrets, so it has no `secret` commands
@@ -93,6 +91,7 @@ def _ask(found: list[Holder], name: str, *command: str) -> tuple[Holder, Call] |
     """The component that keeps ``name``, and its answer: every component is asked at once, and
     one that doesn't declare it answers `not-mine` before any cluster or vault. None when none
     answers that way, as on an engine before Platform 2026.6.0."""
+    built([holder.cli for holder in found])
     with ThreadPoolExecutor(max_workers=len(found)) as pool:
         answers = list(pool.map(lambda holder: (holder, holder.cli.run("secret", *command, "--json")), found))
     if not any(call.status == "not-mine" for _, call in answers):
@@ -295,14 +294,12 @@ def set_secret(session: Session, name: str) -> Result:
             ),
         )
     screen.begin("the secrets")
-    with (
-        screen.console.status(f"Asking which component keeps {name}") if screen.interactive else nullcontext()
-    ):
+    with screen.busy(f"Asking which component keeps {name}"):
         owner = _ask(found, name, "set", name, "--no-sections")
     if owner is None:
         holder = _owner(session, found, name)
         asking = f"Asking {holder.component} which values {name} takes"
-        with screen.console.status(asking) if screen.interactive else nullcontext():
+        with screen.busy(asking):
             asked = holder.cli.run("secret", "set", name, "--json")
     else:
         holder, asked = owner
