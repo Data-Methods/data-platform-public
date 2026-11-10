@@ -2,14 +2,14 @@
 reports. A prepare's code steps commit on the change's branch; an apply's steps run on `main`.
 
 Rule 5: an apply's step with a change asks unless its decision is one the reviewed preview
-recorded, by its digest, and `--auto-approve` would cover, which applies as approved by review;
-destroys and replacements ask even then, by a Terraform decision's counts, and so does a native
-decision that doesn't say it destroys nothing. A change merged outside `prepare`, or prepared
-with `--no-preview`, has no preview, so each change asks unless `--auto-approve`, which approves
-destroys and replacements too; every step of a component the drift check left out asks, with
-`--auto-approve` or without. A preview holds
-decisions where its component's plan reports them (`plan_decisions`); otherwise every change
-asks, showing the reviewed summary beside its own."""
+recorded, by its digest, and that's covered without a person, which applies as approved by
+review. A change merged outside `prepare`, or prepared with `--no-preview`, has no preview, so
+each change asks unless `--auto-approve` covers it without a person. A decision is covered
+without a person only when it's `auto` and destroys nothing: a Terraform decision whose counts
+hold no destroy or replacement, or a native decision that says it destroys nothing. A destroy, a
+replacement, or a decision that doesn't say, always asks, as engine 0.26.0's own
+`--auto-approve` has it; every step of a component the drift check left out asks, with `--auto-approve` or
+without."""
 
 from __future__ import annotations
 
@@ -25,6 +25,19 @@ from .base import Base
 from .checks import real_change
 from .common import DECISION_LABELS, PLAN_HEAD
 from .holds import HELD
+
+
+def covered(decision: dict) -> bool:
+    """Whether a decision is covered without a person, by `--auto-approve` or a reviewed preview:
+    it's `auto` and destroys nothing, a Terraform decision's counts holding no destroy or
+    replacement, a forget never asking, or a native decision saying it destroys nothing. Unsaid
+    counts as a destroy."""
+    if decision.get("auto") is not True:
+        return False
+    counts = decision.get("counts")
+    if counts is None:
+        return decision.get("destroys") is False
+    return not (counts.get("destroy") or counts.get("replace"))
 
 
 class Steps(Base):
@@ -125,10 +138,7 @@ class Steps(Base):
         ]
         if supplied:
             arguments.append("--values-from-stdin")
-        # The run's handoff documents, in its folder of the shared run record.
-        folder = self.record.folder / "handoffs"
-        folder.mkdir(exist_ok=True)
-        arguments += ["--handoffs", str(folder)]
+        arguments += self.handoff_folder()
         planned = self.planned(entry)
         # Rule C alone: never --planned without --unchanged-since-planned.
         arguments += [part for step, value in planned for part in ("--planned", f"{step}={value}")]
@@ -151,21 +161,14 @@ class Steps(Base):
         )
 
     def approved_by_review(self, entry: Entry, decision: dict) -> bool:
-        """Whether the decision is one the reviewed preview recorded, by its full digest, that
-        `--auto-approve` would cover and that destroys nothing: a Terraform decision whose counts
-        hold no destroy or replacement, a forget never asking, or a native decision that says it
-        destroys nothing. Any other asks even when it matches, as does one with no digest, from an
-        engine before it, and every step of a component the drift check couldn't check."""
+        """Whether the decision is one the reviewed preview recorded, by its full digest, and is
+        covered without a person. Any other asks even when it matches, as does one with no
+        digest, and every step of a component the drift check couldn't check."""
         if self.unchecked(entry):
             return False
         digest = decision.get("digest")
         reviewed = {item.get("digest") for item in (self.reviewed(entry) or {}).get("decisions") or []}
-        if not digest or digest not in reviewed or decision.get("auto") is not True:
-            return False
-        counts = decision.get("counts")
-        if counts is None:
-            return decision.get("destroys") is False
-        return not (counts.get("destroy") or counts.get("replace"))
+        return bool(digest) and digest in reviewed and covered(decision)
 
     def approve_with_hold(
         self, entry: Entry, block: Block, call: Call, approvals: list[str], plan_file: Path, hold: Entry
@@ -175,9 +178,7 @@ class Steps(Base):
         asked."""
         decision = (call.result or {}).get("decision") or {}
         identifier = decision.get("id")
-        automatic = (
-            self.options.auto_approve and decision.get("auto") is not False and not self.unchecked(entry)
-        )
+        automatic = self.options.auto_approve and covered(decision) and not self.unchecked(entry)
         reviewed = self.approved_by_review(entry, decision)
         if identifier and (identifier in approvals or automatic or reviewed):
             seen = self.record.data.setdefault("decisions", {}).setdefault(entry.id, [])
@@ -279,9 +280,8 @@ class Steps(Base):
                 "Hold:",
                 f"approving it first applies {hold.component}'s {hold.step}: {self.hold_note(hold)}",
             )
-        notes = self.notes_line()
-        if notes:
-            block.add("Release Notes:", notes)
+        for line in self.notes_lines():
+            block.add("Release Notes:", line)
         if self.session.interactive:
             asked = (
                 f"{self.hold_note(hold)}. Apply {hold.step}, then this step?"
@@ -451,8 +451,7 @@ class Steps(Base):
     def pull_requests(self, block: Block, event: dict | None = None) -> list[dict]:
         """The pull requests the step reported, each in its last state: as each happened, then
         as its finished event, when it has one, lists them; the step's outcome in the record
-        keeps them. An engine before 0.15 reports none, and one before 0.16 only when the step
-        finishes."""
+        keeps them."""
         for item in (event or {}).get("pull_requests") or []:
             if isinstance(item, dict) and item.get("url"):
                 self.show_pull_request(block, item["url"], item.get("state"), at_once=False)

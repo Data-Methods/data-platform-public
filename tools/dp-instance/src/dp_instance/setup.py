@@ -3,11 +3,9 @@
 It scans the current folder and any paths already in the repository map, recognising each
 Component Repository by its template source record. Like every command that finds an
 instance, it first refuses one on a release before this dp-instance's floor, as the checkouts it
-found record it, and then moves a map from before Platform 2026.5.0 into `.dp-instance/`. It
-reads `config/infrastructure/components.json` in the Client Infrastructure Repository, which names
-every repository the instance has, each component's own and the Managed Repositories it lists, or,
-on an instance before Platform 2026.6.0, which has no list yet, its published Component Outputs,
-whose registrations name them. It checks each repository alike; shows what
+found record it. It reads `config/infrastructure/components.json` in the Client Infrastructure
+Repository, which names every repository the instance has, each component's own and the Managed
+Repositories it lists. It checks each repository alike; shows what
 it found, what's missing, duplicated or on another remote; and on approval writes the map,
 `.dp-instance/repositories.json`. It refuses while a repository the instance has is missing or
 on another remote, naming the `git clone` for each, and in a folder with no Component
@@ -25,19 +23,13 @@ from pathlib import Path
 from rich.text import Text
 
 from . import gitops, synced, targets
-from .components import Cli, Log
 from .instance import (
     INFRASTRUCTURE,
-    INFRASTRUCTURE_COMMAND,
     MAP_FILE,
-    STATE_FOLDER,
     Instance,
     Mapped,
     SourceRecord,
-    check_aggregate,
-    managed_registrations,
     map_path,
-    registrations,
     stored_path,
 )
 from .outcome import Next, Result, Stop, failed
@@ -64,11 +56,11 @@ class Found:
 
 @dataclass
 class Compared:
-    """The checkouts against the instance's published Component Outputs."""
+    """The checkouts against the repositories the instance lists."""
 
     missing: list[str] = field(default_factory=list)
     wrong: list[str] = field(default_factory=list)
-    unregistered: list[str] = field(default_factory=list)
+    unlisted: list[str] = field(default_factory=list)
 
 
 def _json(path: Path) -> dict | None:
@@ -109,22 +101,22 @@ COMPONENTS = "config/infrastructure/components.json"
 
 @dataclass
 class Named:
-    """The repositories the instance has, as its list or its registrations name them."""
+    """The repositories the instance has, as its list names them."""
 
     components: list[str]
     # Each Managed Repository's URL and the component that lists it.
     managed: dict[str, str]
-    # How a line says the instance names one.
-    verb: str
     said: str
 
 
-def _listed(found: Found) -> Named | None:
-    """The repositories `components.json` in the Client Infrastructure Repository names, or None
-    on an instance before Platform 2026.6.0, which has no list yet."""
+def _listed(found: Found) -> tuple[Named | None, str | None]:
+    """The repositories `components.json` in the Client Infrastructure Repository names, or
+    None and why it can't be read."""
     paths = found.components.get(INFRASTRUCTURE) or []
-    if len(paths) != 1 or not (paths[0] / COMPONENTS).is_file():
-        return None
+    if len(paths) != 1:
+        return None, "no single Client Infrastructure Repository to read it in"
+    if not (paths[0] / COMPONENTS).is_file():
+        return None, f"the Client Infrastructure Repository holds no {COMPONENTS}"
     document = _json(paths[0] / COMPONENTS)
     members = document.get("components") if isinstance(document, dict) else None
     if not isinstance(members, dict):
@@ -140,38 +132,12 @@ def _listed(found: Found) -> Named | None:
                 }.items()
             )
         ),
-        "lists",
         f"{len(members)} components listed in {COMPONENTS}",
-    )
-
-
-def _registered(outputs: dict) -> Named:
-    """The repositories the instance's published registrations name."""
-    return Named(
-        sorted({url for _, url in registrations(outputs)}),
-        dict(sorted({url: key for key, url in managed_registrations(outputs)}.items())),
-        "registers",
-        f"{len(outputs.get('components', []))} registered components compared",
-    )
-
-
-def _outputs(root: Path, found: Found, screen: Screen) -> tuple[dict | None, str | None]:
-    """The published Component Outputs, read by the Client Infrastructure Repository's own
-    CLI, or why they couldn't be read."""
-    paths = found.components.get(INFRASTRUCTURE) or []
-    if len(paths) != 1:
-        return None, "no single Client Infrastructure Repository to read them with"
-    cli = Cli(INFRASTRUCTURE_COMMAND, paths[0], Log(None))
-    try:
-        with screen.busy("Reading the published Component Outputs"):
-            found = cli.document("outputs", "aggregate")
-        return check_aggregate(found, INFRASTRUCTURE_COMMAND), None
-    except Stop as stop:
-        return None, stop.message
+    ), None
 
 
 def _check(
-    named: list[str], checkouts: list[Mapped], compared: Compared, verb: str
+    named: list[str], checkouts: list[Mapped], compared: Compared
 ) -> tuple[dict[str, Mapped], list[Mapped]]:
     """Each named repository's checkout, by its URL, and the checkouts nothing names. One that
     isn't checked out is missing, and a checkout on another remote of the same name is on the
@@ -197,21 +163,20 @@ def _check(
             compared.missing.append(url)
             continue
         loose.remove(namesake)
-        compared.wrong.append(f"{namesake.stored}'s origin is {namesake.remote}; the instance {verb} {url}")
+        compared.wrong.append(f"{namesake.stored}'s origin is {namesake.remote}; the instance lists {url}")
     return found, loose
 
 
 def compare(named: Named, components: list[Mapped], others: list[Mapped]) -> tuple[Compared, list[Mapped]]:
     """Every repository the instance names, each component's own and each Managed Repository a
-    component lists, must be checked out, on that remote. A checkout nothing names is only noted,
-    since on an instance before Platform 2026.6.0 a component registers once it first publishes.
+    component lists, must be checked out, on that remote. A checkout nothing names is only noted.
     Returns the comparison and each Managed Repository's checkout, mapped to the component that
     lists it."""
     compared = Compared()
-    _, unnamed = _check(named.components, components, compared, named.verb)
-    managed, others_unnamed = _check(list(named.managed), others, compared, named.verb)
-    compared.unregistered = [
-        f"{item.stored}: {item.remote} isn't a repository the instance {named.verb} yet"
+    _, unnamed = _check(named.components, components, compared)
+    managed, others_unnamed = _check(list(named.managed), others, compared)
+    compared.unlisted = [
+        f"{item.stored}: {item.remote} isn't a repository the instance lists yet"
         for item in (*unnamed, *others_unnamed)
     ]
     return compared, [replace(item, managed_by=named.managed[url]) for url, item in managed.items()]
@@ -249,7 +214,6 @@ def setup(start: Path, screen: Screen, approvals: tuple[str, ...]) -> Result:
     targets.check_floor(
         {template: paths[0] for template, paths in found.components.items()}, releases_of(root)
     )
-    targets.check_earlier_run(root / STATE_FOLDER)
     problems: list[str] = []
     for path in [*(p for paths in found.components.values() for p in paths), *found.others]:
         provider = synced.provider(path)
@@ -291,12 +255,7 @@ def setup(start: Path, screen: Screen, approvals: tuple[str, ...]) -> Result:
     screen.header(
         "setup: map this instance's repositories", ("instance", key or "unknown"), ("folder", str(root))
     )
-    named, unread = _listed(found), None
-    if named is None:
-        screen.begin("the published outputs")
-        outputs, unread = _outputs(root, found, screen)
-        named = _registered(outputs) if outputs is not None else None
-        screen.end()
+    named, unread = _listed(found)
     compared = Compared()
     if named is not None:
         compared, managed = compare(named, repositories, others)
@@ -313,8 +272,8 @@ def setup(start: Path, screen: Screen, approvals: tuple[str, ...]) -> Result:
         screen.labelled("Missing:", f"{url} (git clone {url} in this folder, then setup again)", "bold red")
     for line in compared.wrong:
         screen.labelled("Wrong Remote:", line, "bold red")
-    for line in compared.unregistered:
-        screen.labelled("Not Registered:", line)
+    for line in compared.unlisted:
+        screen.labelled("Not Listed:", line)
     for line in problems:
         screen.labelled("Problem:", line, "bold red")
     screen.labelled(
@@ -326,9 +285,9 @@ def setup(start: Path, screen: Screen, approvals: tuple[str, ...]) -> Result:
         "repositories": [item.describe() for item in repositories],
         "missing": compared.missing,
         "wrong_remote": compared.wrong,
-        "not_registered": compared.unregistered,
+        "not_listed": compared.unlisted,
         "problems": problems,
-        "outputs": None if named is not None else unread,
+        "components_list": unread,
     }
     if problems or compared.missing or compared.wrong:
         clones = tuple(

@@ -82,6 +82,7 @@ class Stops(Base):
     def stopped(self, stop: Stop) -> Result:
         entry, block = self._entry, self._block
         reason = stop.detail.get("reason", stop.status)
+        self.screen.read()
         self.pause()
         if entry is not None and block is not None and block.live:
             outcome = {"failed": "failed", "decision": "stopped", **WAITING_FOR}[stop.status]

@@ -18,8 +18,7 @@ compare whole, so 2026.3.1 is newer than 2026.3.
 Each dp-instance knows only its own floor, the oldest Platform Version whose contracts it reads.
 Every command that finds an instance on a published release before it, as each repository's
 `main` records it, refuses it first, and names the dp-instance that reads it; it fetches `main`
-only to make sure before it refuses. So does every command that finds a run under way or
-stopped that an earlier walk started, which only the dp-instance before this walk carries on.
+only to make sure before it refuses.
 """
 
 from __future__ import annotations
@@ -37,9 +36,9 @@ from .outcome import Next, Stop, failed
 
 # The oldest Platform Version whose contracts this dp-instance reads, and the dp-instance that
 # reads the releases before it, from the oldest it reads.
-FLOOR = "2026.5.1"
-BELOW_FLOOR = "3.0.0"
-BELOW_FLOOR_READS = "Platform 2026.4 to 2026.5.1"
+FLOOR = "2026.7.0"
+BELOW_FLOOR = "5.0.1"
+BELOW_FLOOR_READS = "Platform 2026.5.1 to 2026.7.2"
 
 
 def apply_steps(recorded: dict[str, SourceRecord], why: str) -> tuple[Next, ...]:
@@ -47,7 +46,7 @@ def apply_steps(recorded: dict[str, SourceRecord], why: str) -> tuple[Next, ...]
     the release these records name, which is an older one for a release below the floor."""
     apply = Next("dp-instance apply", why)
     older = any(
-        item.platform_version and version_key(item.platform_version) <= version_key(FLOOR)
+        item.platform_version and version_key(item.platform_version) < version_key(FLOOR)
         for item in recorded.values()
     )
     return (below_floor(", which walks this release"), apply) if older else (apply,)
@@ -396,38 +395,12 @@ def check_floor(checkouts: dict[str, Path], releases: Releases) -> None:
     raise Stop(
         "failed",
         f"This instance runs Platform {version}, and {installed.shown(installed.version())} reads "
-        f"Platform {FLOOR} and later; nothing has changed." + installed.before_self_update(BELOW_FLOOR),
+        f"Platform {FLOOR} and later; nothing has changed.",
         next=(below_floor(""),),
         reason="below-floor",
         platform_version=version,
         floor=FLOOR,
     )
-
-
-def refuse_earlier_walk(run: records.Record) -> None:
-    """Stop at a run a dp-instance before this walk started, one before `self update` among
-    them, whose record this one doesn't walk: only such a dp-instance carries it on. Nothing is
-    written."""
-    if run.data.get("schema_version") == records.SCHEMA_VERSION and "dp_instance" in run.data:
-        return
-    found = run.data.get("dp_instance")
-    started = f"dp-instance {found}" if found else f"a dp-instance before {installed.SELF_UPDATE}"
-    raise Stop(
-        "failed",
-        f"Run {run.id}, which {started} started, hasn't finished, and {installed.shown(installed.version())} "
-        "walks prepare then apply, so it can't carry it on; nothing has changed."
-        + installed.before_self_update(BELOW_FLOOR),
-        next=(below_floor(", and finishes the run with dp-instance resume"),),
-        reason="earlier-run",
-        run=run.id,
-    )
-
-
-def check_earlier_run(state: Path) -> None:
-    """Stop when this workstation's run under way or stopped is one an earlier walk started."""
-    run = records.active(state, kinds=records.EARLIER_KINDS + records.KINDS)
-    if run is not None:
-        refuse_earlier_walk(run)
 
 
 def target(releases: Releases, version: str | None, file: str | None) -> tuple[Manifest, str]:

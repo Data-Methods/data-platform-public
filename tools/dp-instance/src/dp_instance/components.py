@@ -350,10 +350,6 @@ class Cli:
     def document(self, *arguments: str) -> dict:
         """A command that prints one JSON document, such as `steps --json`; one that waits for a
         sign-in stops for it, naming the command that renews it."""
-        return self.document_and_warnings(*arguments)[0]
-
-    def document_and_warnings(self, *arguments: str) -> tuple[dict, list[str]]:
-        """A command's JSON document and each warning it gave a person, a `Warning: ` line."""
         call = self.run(*arguments)
         if call.status != "done":
             message = f"{self.command} {' '.join(arguments)} failed: {call.message}"
@@ -375,5 +371,4 @@ class Cli:
             raise failed(f"{self.command} {' '.join(arguments)} printed no JSON document.") from None
         if not isinstance(found, dict):
             raise failed(f"{self.command} {' '.join(arguments)} printed no JSON object.")
-        warnings = [line.removeprefix("Warning: ") for line in call.stderr if line.startswith("Warning: ")]
-        return found, warnings
+        return found

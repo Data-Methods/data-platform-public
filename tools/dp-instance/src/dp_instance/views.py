@@ -45,7 +45,6 @@ from .sequence import Entry, parse_step
 from .session import Session
 from .walk import APPLY, Prepare, Run
 from .walk.common import DRIFT_TEXT
-from .walk.reading import refuse_earlier_release, walks
 
 
 def _record(
@@ -222,6 +221,7 @@ class Preflights(View):
         """A stop names this command again where a run's names `dp-instance resume`: a preflight
         is no run to carry on."""
         reason = stop.detail.get("reason", stop.status)
+        self.screen.read()
         self.pause()
         again = Next(self.restart(), "runs every preflight again, once that's done")
         steps = (
@@ -291,8 +291,6 @@ class Verification(View):
                 entries = [self.single(step)]
             else:
                 declarations = self.declarations()
-                if not walks(declarations):
-                    raise refuse_earlier_release("The templates on main")
                 pending = self.pending()
                 if pending:
                     return self.apply_pending(pending)
@@ -303,6 +301,7 @@ class Verification(View):
             if stop.status == "sign-in":
                 steps = (*steps, Next(again, "checks again once signed in"))
             steps = naming_preflight(stop.status, stop.detail.get("reason"), steps)
+            self.screen.read()
             self.record.complete()
             self.screen.blank(2)
             self.screen.note(stop.message, "bold orange1")
@@ -317,8 +316,7 @@ class Verification(View):
             if found is not None:
                 problems.append(found)
         signed_out = next((call for call, _ in results.values() if call.status == "sign-in"), None)
-        # The Completion Check passed: what `status` reads to stop naming the Adoption PRs a run
-        # left open.
+        # Whether the Completion Check passed.
         self.record.data["converged"] = step is None and signed_out is None and not problems
         self.record.complete()
         self.close_part("platform")

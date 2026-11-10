@@ -23,8 +23,7 @@ stays.
 A prepare copy's pushes, such as a component's commit on the change's branch, land in its own
 outbox, `.git/outbox.git`, which each build starts empty: nothing reaches GitHub until the
 change's pull request step pushes the branch. `tidy` removes every folder nothing uses: a
-repository's the map no longer holds, and those of earlier walks, `.dp-instance/main/` and
-`.dp-instance/sources/`.
+repository's the map no longer holds.
 """
 
 from __future__ import annotations
@@ -42,8 +41,6 @@ APPLIED = "applied"
 SOURCE = "src"
 PREFLIGHT = "preflight"
 OWN = (PREPARE, PLAN, APPLY, APPLIED, SOURCE, PREFLIGHT)
-# The folders of earlier walks.
-RETIRED = ("main", "sources")
 OUTBOX = Path(".git", "outbox.git")
 # The checkout's configuration a copy carries: who commits, how it signs in, reaches GitHub and
 # signs, the files it includes, and Windows' long paths.
@@ -201,14 +198,14 @@ def records(copies: dict[str, Path]) -> dict[str, SourceRecord]:
 
 
 def tidy(instance: Instance) -> None:
-    """Remove every folder of dp-instance's own that nothing uses: those of earlier walks, and
-    any of a repository the map no longer holds. One Windows holds open goes next time."""
+    """Remove every folder of dp-instance's own that nothing uses: any of a repository the map no
+    longer holds. One Windows holds open goes next time."""
     kept = {
         found.name
         for key in instance.components
         for found in (instance.own(APPLY, key), preflight_source(instance, key))
     }
-    found = [instance.state / name for name in RETIRED]
+    found = []
     for kind in OWN:
         folder = instance.state / kind
         if folder.is_dir():

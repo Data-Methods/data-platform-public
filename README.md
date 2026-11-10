@@ -114,8 +114,11 @@ Review and merge each pull request in GitHub, then run `dp-instance apply`, whic
 `origin/main` in its own copy. Each step with a change shows its plan file, under
 `.dp-instance/runs/<run>/plans/`, beside what the review showed: a change the review showed
 applies as approved by review, and any other, or any destroy or replacement, asks: `y` applies
-exactly that plan, `n` stops. `apply --auto-approve` approves every change without asking,
-destroys and replacements included, with a preview or without one. Approval is the call of the person accountable for the instance;
+exactly that plan, `n` stops. `apply --auto-approve` approves each change that destroys
+nothing without asking, with a preview or without one; a destroy or replacement, or a change
+that doesn't say whether it destroys, still asks, and without a terminal stops for `dp-instance
+resume --approve <ID>`. On an instance whose code is older than Platform 2026.8.0, a
+component's own engine still approves destroys under `--auto-approve`. Approval is the call of the person accountable for the instance;
 stop and ask about any destroy (`-`) or replace (`-/+`) of data, or a change the release notes
 don't explain.
 
@@ -180,9 +183,8 @@ upgrade is prepared only once it's released.
   settings, Permissions.
 - **A path too long on Windows:** move the folder near the drive root, or turn on Windows long
   paths and run `git config --global core.longpaths true`.
-- **An instance on Platform 2026.5.1:** `dp-instance prepare --to` its next stop, at a terminal,
-  where it asks whether each Managed Repository's Adoption PR is merged and released; anything
-  else there is dp-instance 3.0.0's, which a command names.
+- **An instance before Platform 2026.7.0:** dp-instance 5.0.1 walks it, which every command
+  names.
 
 ## For Agents
 

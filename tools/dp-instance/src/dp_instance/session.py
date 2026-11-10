@@ -2,7 +2,7 @@
 instance's shared run record and run lock.
 
 Every command that finds an instance first refuses one on a release before this dp-instance's
-floor, or with a run an earlier dp-instance left unfinished. The commands that read or change the
+floor. The commands that read or change the
 platform hold the run lock from start to exit, but on a first deployment, before the state
 account exists:
 until a step creates it, a run keeps its record here and takes no lock, as Terraform's state
@@ -11,8 +11,7 @@ account Azure Resource Manager says doesn't exist goes without the lock; one tha
 doesn't answer stops the command. While they hold it, the instance's stopped run is the shared
 record's unfinished run, or else an unfinished run this workstation kept before the state account
 existed: `verify` refuses while there is one, `plan`, `prepare` and the `secret` commands name
-it, and a new `apply` or prepared upgrade replaces it only after a question. A stopped run an
-earlier walk started is refused, naming the dp-instance that carries it on.
+it, and a new `apply` or prepared upgrade replaces it only after a question.
 """
 
 from __future__ import annotations
@@ -48,11 +47,10 @@ def releases_of(root: Path) -> Releases:
 
 
 def ready(instance: Instance) -> Releases:
-    """A found instance's first steps: refuse it when it's on a release before this
-    dp-instance's floor or has a run an earlier dp-instance left unfinished."""
+    """A found instance's first step: refuse it when it's on a release before this dp-instance's
+    floor."""
     releases = releases_of(instance.root)
     targets.check_floor({key: item.path for key, item in instance.components.items()}, releases)
-    targets.check_earlier_run(instance.state)
     return releases
 
 
@@ -196,7 +194,6 @@ class Session:
             return unnamed(state)
         found = self.shared.unfinished(runs_folder(state))
         if found is not None:
-            targets.refuse_earlier_walk(found)
             return found
         left = unnamed(state)
         if left is not None:

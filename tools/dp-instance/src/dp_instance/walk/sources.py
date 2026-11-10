@@ -1,5 +1,10 @@
 """Before a prepared upgrade's code part, or `preflight --to`'s preflights: each repository's
-target source, the development keys a candidate reads it with, and the release notes."""
+target source, the development keys a candidate reads it with, and the release notes.
+
+A published release's sources come from each template's Release Repository. A candidate's come
+from there too where a published Release Manifest names the commit, a Template Release the
+candidate keeps, and from the template's Development Repository otherwise, through its
+development key."""
 
 from __future__ import annotations
 
@@ -8,7 +13,9 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from .. import gitops, places, template_access
+from rich.text import Text
+
+from .. import gitops, handoffs, places, template_access
 from ..instance import SourceRecord
 from ..manifest import version_key
 from ..outcome import Next, Stop, failed
@@ -28,6 +35,13 @@ class Sources(Base):
         """Where the target's source is fetched: a prepare's `.dp-instance/src/`."""
         return self.instance.own(places.SOURCE, repository)
 
+    def from_development(self, repository: str) -> bool:
+        """Whether the target's source comes from the template's Development Repository: a
+        candidate's commit that no published Release Manifest names."""
+        return self.channel != "stable" and not self.session.releases.released(
+            repository, self.manifest.sources[repository]
+        )
+
     def fetch(self, repository: str) -> tuple[Path, bool]:
         """The owner's source at the target, and whether this fetched it. A fetch that fails
         leaves no folder behind, so the next one starts clean."""
@@ -39,7 +53,7 @@ class Sources(Base):
             try:
                 gitops.remove(folder)
                 record = SourceRecord.read(self.checkout(repository))
-                url = record.release_url if self.channel == "stable" else record.development_url
+                url = record.development_url if self.from_development(repository) else record.release_url
                 gitops.fetch_commit(folder, url, commit)
             except BaseException as error:
                 try:
@@ -95,14 +109,13 @@ class Sources(Base):
 
     def check_development_keys(self) -> None:
         """A candidate reads each development repository only through the instance's key for
-        it: before anything is fetched, the run stops for each template whose development key
-        isn't on this workstation."""
-        if self.channel != "canary":
-            return
+        it: before anything is fetched, the run stops for each template whose source comes from
+        its development repository and whose development key isn't on this workstation."""
         missing = [
             repository.key
             for repository in self.repositories
-            if not template_access.Access(
+            if self.from_development(repository.key)
+            and not template_access.Access(
                 self.instance.key, repository.key + gitops.DEVELOPMENT_SUFFIX
             ).private.is_file()
         ]
@@ -150,15 +163,14 @@ class Sources(Base):
         self.record.data["notes"] = copied
         self.record.save()
 
-    def notes_line(self) -> str | None:
-        """The release notes the run copied, on one line: each file, in version order, and their
-        folder."""
-        notes = self.record.data.get("notes") or []
-        if not notes:
-            return None
-        folder = self.relative(self.record.folder / "notes")
-        files = ", ".join(item.removeprefix(folder + "/") for item in notes)
-        return f"{files} · notes/"
+    def notes_lines(self) -> list[Text]:
+        """The release notes the run copied, a line each in version order, by its path in the run,
+        `notes/<template>/<version>.md`, which opens the file where the terminal can."""
+        folder = self.relative(self.record.folder)
+        return [
+            handoffs.page_link(item.removeprefix(folder + "/"), self.instance.root / item)
+            for item in self.record.data.get("notes") or []
+        ]
 
     def notes_detail(self) -> dict:
         """The release notes the run copied, for --json: each file's path in the instance folder."""
@@ -166,9 +178,10 @@ class Sources(Base):
 
     def show_notes(self) -> None:
         """Name the release notes as the code part starts."""
-        line = self.notes_line()
-        if line is None or self._notes_shown:
+        lines = self.notes_lines()
+        if not lines or self._notes_shown:
             return
         self._notes_shown = True
-        self.screen.labelled("Release Notes:", line)
+        for line in lines:
+            self.screen.labelled("Release Notes:", line)
         self.screen.emit({"event": "notes", "run": self.record.id, **self.notes_detail()})

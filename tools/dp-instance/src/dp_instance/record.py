@@ -32,12 +32,9 @@ ACTIVE = ("running", "stopped", "failed")
 # nothing and never started, so it isn't one of the instance's runs, and the run that stopped
 # stays the unfinished one.
 NOT_STARTED = "not started"
-# 2 is the walk of prepare then apply; a record at 1 is an earlier walk's, which only the
-# dp-instance before it carries on.
 SCHEMA_VERSION = 2
-# The runs this walk walks, and an earlier walk's.
+# The runs this walk walks.
 KINDS = ("prepare", "apply")
-EARLIER_KINDS = ("upgrade",)
 # Windows refuses to replace a file another program has open, such as a reader of the record or
 # an antivirus scan of a file just written; that passes within moments.
 REPLACE_TRIES = 20
@@ -161,8 +158,7 @@ class Record:
                 "kind": kind,
                 "target": target,
                 "goal": goal,
-                # The dp-instance that started it: a record without one is from a dp-instance
-                # before `self update`, which only such a dp-instance carries on.
+                # The dp-instance that started it.
                 "dp_instance": installed.version(),
                 "started": now(),
                 "updated": now(),

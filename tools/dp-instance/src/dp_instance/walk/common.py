@@ -10,7 +10,7 @@ from ..sequence import Entry
 
 # A run's parts, in order, each counted and timed on its own: a prepare's are Repository Changes,
 # Platform Preview and Pull Requests; an apply's, Drift Check and Platform Changes. `preflight`
-# has one, Preflight, which a run an earlier dp-instance started also holds.
+# has one, Preflight.
 PARTS = {
     "preflight": "Preflight",
     "before": "Drift Check",
@@ -62,6 +62,24 @@ def part_of(entry: Entry) -> str:
     if entry.kind == "pull-request":
         return "requests"
     return "platform"
+
+
+def labels(entry: Entry, branch: str = "") -> tuple[str, str, str]:
+    """An entry's level, counter and name, as a run's block and `status` both show it; a pull
+    request is named by the change's ``branch``."""
+    if entry.kind == "preflight":
+        return "preflight", entry.preflight_counter, entry.component
+    if entry.kind == "drift":
+        return "drift check", "", ""
+    if entry.kind in ("render", "migrate", "upgrade"):
+        return f"{entry.kind} step", "", entry.kind
+    if entry.kind == "pull-request":
+        return "pull request", "", branch
+    if entry.kind == "mark":
+        return "applied commit", "", entry.component
+    if entry.kind == "preview":
+        return "step preview", entry.step_counter, entry.step
+    return "step", entry.step_counter, entry.step
 
 
 def level_key(entry: Entry, level: str) -> tuple:

@@ -26,7 +26,6 @@ from ..sequence import Entry
 from .common import DRIFT_TEXT, VERIFY, adoption_left, adoption_prs
 from .graph import reads
 from .holds import HELD, HOLDING
-from .reading import refuse_earlier_release, walks
 from .run import Run
 
 MARK_TEXT = "Records the commit this apply brought the component to as the one its whole walk applied."
@@ -45,8 +44,6 @@ class Apply(Run):
         self._progress = None
         started = time.monotonic()
         declarations = self.declarations()
-        if not walks(declarations):
-            raise refuse_earlier_release("The templates on main")
         plan = self.plan(declarations)
         entries = [Entry(id="drift-check", kind="drift", description=DRIFT_TEXT)]
         platform = plan.platform()

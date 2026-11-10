@@ -33,7 +33,7 @@ import sys
 from pathlib import Path
 
 from . import installed, lock, runs, secrets, self_update, setup, status, template_access, views
-from .outcome import USAGE, Next, Result, Stop, naming_preflight
+from .outcome import USAGE, Result, Stop, naming_preflight
 from .screen import Screen
 from .session import Options, Session, ready_for_template_access, terminal
 
@@ -51,8 +51,11 @@ def _parser() -> argparse.ArgumentParser:
         "--auto-approve",
         action="store_true",
         help=(
-            "Approve each step's plan without stopping, destroys and replacements included, with a preview "
-            "or without one, as after prepare --no-preview; and the restarts of secret commands."
+            "Approve each step's change that destroys nothing without stopping, with a preview or without "
+            "one, as after prepare --no-preview, and the restarts of secret commands. A destroy or "
+            "replacement, or a change that doesn't say whether it destroys, always asks: approve it by "
+            "its ID with --approve. On code older than Platform 2026.8.0, the component's engine still "
+            "approves destroys."
         ),
     )
     # A decision's ID, which only a stop names: resume and the secret commands take it, prepare for
@@ -108,10 +111,10 @@ def _parser() -> argparse.ArgumentParser:
         help="Turn your edits, or with --to a Platform Version, into pull requests to review and merge.",
     )
     for sub, what in (
-        (checking, "The published Platform Version whose templates' checks run, such as 2026.6.0."),
+        (checking, "The published Platform Version whose templates' checks run, such as 2026.8.0."),
         (
             preparing,
-            "The published Platform Version to upgrade to, the next required stop, such as 2026.6.0.",
+            "The published Platform Version to upgrade to, the next required stop, such as 2026.8.0.",
         ),
     ):
         target = sub.add_mutually_exclusive_group()
@@ -127,8 +130,8 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Open the pull requests without planning the platform's steps, so apply asks about each change "
-            "unless apply --auto-approve. The preview apply reads is the last prepare's: prepare again "
-            "without it to preview the change."
+            "unless apply --auto-approve covers it; a destroy or replacement always asks. The preview "
+            "apply reads is the last prepare's: prepare again without it to preview the change."
         ),
     )
     preview = commands.add_parser(
@@ -305,30 +308,9 @@ def utf8_output() -> None:
             stream.reconfigure(encoding="utf-8", errors="replace")
 
 
-# A command a person may still type, and the one that does its work.
-RETIRED = {
-    "upgrade": (
-        "dp-instance has no upgrade command: an upgrade is prepared as pull requests, then applied once "
-        "they merge.",
-        Next(
-            "dp-instance prepare --to <version>",
-            "prepares the upgrade to the next required stop, which dp-instance status names",
-        ),
-    ),
-}
-
-
 def main(argv: list[str] | None = None) -> int:
     utf8_output()
     argv = sys.argv[1:] if argv is None else argv
-    if argv[:1] and argv[0] in RETIRED:
-        message, step = RETIRED[argv[0]]
-        screen = Screen(json_mode="--json" in argv, interactive=terminal())
-        screen.note(message, "bold red")
-        screen.continuing((step,))
-        result = Result(argv[0], "failed", message, (step,))
-        screen.emit(result.describe())
-        return USAGE
     parser = _parser()
     try:
         arguments = parser.parse_args(argv)
@@ -349,9 +331,13 @@ def main(argv: list[str] | None = None) -> int:
         )
         or "status"
     )
+    # One spinner from here, at a terminal: each section takes it over, and a question or a stop
+    # ends it.
+    screen.working()
     try:
         result = _dispatch(arguments, screen)
     except Stop as stop:
+        screen.read()
         result = Result(command, stop.status, stop.message, stop.next, stop.detail)
         screen.blank()
         screen.note(
@@ -360,6 +346,7 @@ def main(argv: list[str] | None = None) -> int:
         if stop.next:
             screen.continuing(stop.next)
     except KeyboardInterrupt:
+        screen.read()
         result = Result(command, "failed", "Interrupted.")
     # Every command's total, the time it took, and its parts' times.
     result.detail.update(screen.total())

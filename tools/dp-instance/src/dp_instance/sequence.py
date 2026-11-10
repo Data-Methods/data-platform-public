@@ -9,12 +9,9 @@ at the schemas of the code before them, so the platform's steps are read only on
 Then, per repository, each component's phases, then the phases that
 read the merged commit.
 
-A declaration says what `dp-instance` may rely on: its `interface` version and its
-`capabilities`, which `dp-instance` branches on, never an engine or Platform Version. A
-declaration from before them, as at the contract floor, declares neither, and its code has no
-`code` phase: it moves to its target through the owner's `upgrade` command, then the target's
-`code` phase migrates it. The `code` phase reads no configuration and changes only the
-repository, so it's never one of the platform's phases.
+A declaration says what `dp-instance` may rely on: its `interface` version, never an engine or
+Platform Version. The `code` phase reads no configuration and changes only the repository, so
+it's never one of the platform's phases.
 """
 
 from __future__ import annotations
@@ -25,23 +22,13 @@ from .manifest import Manifest, Repository
 from .outcome import Next, Stop, failed
 
 UPGRADE = "upgrade"
-# The phase code an instance last applied before Platform 2026.6.0 declares. Removed at the next stop.
-MERGE = "merge"
 # The `steps --json` schemas this dp-instance reads.
 SCHEMAS = (2,)
-# The engine interfaces this dp-instance reads: the contract's version, which a declaration from
-# before it doesn't name.
+# The engine interfaces this dp-instance reads.
 INTERFACES = (1,)
-# The capabilities `dp-instance` branches on, which tell Platform 2026.5.1 from later. `upgrade_steps`: the
-# `code` phase's `upgrade` and `migrate` as ordinary steps, which the walk needs of every template.
-# `adoption_state`: `repo adoption`.
-UPGRADE_STEPS = "upgrade_steps"
-ADOPTION_STATE = "adoption_state"
-# The engine's phase before every component's own, its steps, and the step of the owner's
-# `upgrade` command that moves the template source, which a release before the `code` phase runs.
+# The engine's phase before every component's own, and its steps.
 CODE = "code"
 MIGRATE = "migrate"
-SOURCE = "source"
 UPGRADE_TEXT = "Moves this repository to the target's template source and commits it."
 RENDER_TEXT = "Writes the committed files this component's steps keep current; each step's is a commit."
 MIGRATE_TEXT = "Runs this component's repository migrate units and commits what they change."
@@ -60,7 +47,7 @@ class Step:
     kind: str = "native"
     # The names of the Component Outputs it publishes.
     outputs: tuple[str, ...] = ()
-    # Whether the step changes nothing a Terraform root reads: engine 0.19.0 on.
+    # Whether the step changes nothing a Terraform root reads.
     affects_no_root: bool = False
     # Each input's source, such as `output:infrastructure/postgres_server_id`: what the step reads.
     inputs: tuple[str, ...] = ()
@@ -70,7 +57,7 @@ class Step:
     # step, and a native step that declares it.
     skips: bool = False
     # Whether, within a run, its drift check's plan with no change stands for it: every Terraform
-    # step, and a native step that declares it, which a template before engine 0.25.0 never does.
+    # step, and a native step that declares it.
     reuses: bool = False
 
 
@@ -100,14 +87,10 @@ class Declaration:
     command: str
     preflight: str | None
     phases: tuple[Phase, ...]
-    # The engine interface it declares, and its capabilities; None and none before them.
-    interface: int | None = None
-    capabilities: frozenset[str] = frozenset()
+    # The engine interface it declares.
+    interface: int
     # Whether it maintains a Managed Repository.
     manages: bool = False
-
-    def declares(self, capability: str) -> bool:
-        return capability in self.capabilities
 
     @property
     def platform_phases(self) -> tuple[Phase, ...]:
@@ -167,12 +150,7 @@ def declaration(document: dict, command: str) -> Declaration:
             next=(Next("dp-instance self update", "installs the newest dp-instance, which reads it"),),
         )
     try:
-        if document.get("schema_version") not in SCHEMAS:
-            raise ValueError
-        if interface is not None and not isinstance(interface, int):
-            raise ValueError
-        capabilities = document.get("capabilities") or []
-        if not isinstance(capabilities, list) or not all(isinstance(item, str) for item in capabilities):
+        if document.get("schema_version") not in SCHEMAS or not isinstance(interface, int):
             raise ValueError
         component = document["component"]
         preflight = document.get("preflight")
@@ -182,7 +160,6 @@ def declaration(document: dict, command: str) -> Declaration:
             preflight["description"] if preflight else None,
             tuple(_phase(phase) for phase in document.get("phases", [])),
             interface,
-            frozenset(capabilities),
             bool(document.get("managed_repositories")),
         )
     except (KeyError, TypeError, ValueError):
@@ -346,23 +323,20 @@ class Plan:
             for number, (repository, component) in enumerate(found, 1)
         ]
 
-    def code(self, upgrades: dict[str, bool]) -> list[Entry]:
+    def code(self, upgrades: list[str]) -> list[Entry]:
         """A prepare's code, repository by repository: for each repository ``upgrades`` names,
-        its owner's upgrade to the target, the `code` phase's `upgrade` step, or, with True, as
-        for code from before the `code` phase, the `upgrade` command's `source` step; then every
+        its owner's upgrade to the target, the `code` phase's `upgrade` step; then every
         component's `migrate`, which runs from the code the upgrade leaves."""
         entries = []
         for repository in self.repositories:
             owner = repository.owner
             if repository.key in upgrades:
-                before = upgrades[repository.key]
-                phase, step = (UPGRADE, SOURCE) if before else (CODE, UPGRADE)
                 entries.append(
                     Entry(
-                        id=f"{repository.key}/{owner.key}/{phase}/{step}",
+                        id=f"{repository.key}/{owner.key}/{CODE}/{UPGRADE}",
                         description=UPGRADE_TEXT,
-                        phase=phase,
-                        step=step,
+                        phase=CODE,
+                        step=UPGRADE,
                         repository_only=True,
                         fetched=True,
                         **self._base(repository, owner, "upgrade"),
@@ -464,10 +438,8 @@ class Plan:
 
 def drift_phases(repository: Repository, component: str, declared: Declaration) -> list[str]:
     """A component's phases the drift check plans: each platform phase but the phases after a
-    merge, and the `merge` phase of the code an instance last applied before Platform 2026.6.0."""
+    merge."""
     listed = {item.phase for item in repository.after_merge if item.component == component}
     return [
-        phase.name
-        for phase in declared.platform_phases
-        if phase.name != MERGE and not phase.after_merge and phase.name not in listed
+        phase.name for phase in declared.platform_phases if not phase.after_merge and phase.name not in listed
     ]

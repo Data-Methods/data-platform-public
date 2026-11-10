@@ -51,7 +51,6 @@ from ..screen import Block
 from ..sequence import Entry
 from .graph import MERGED_COMMIT, downstream, producers, reads
 from .holds import STANDING_BY
-from .reading import refuse_earlier_release, walks
 from .run import Run
 
 # Git's answer when a push's lease no longer holds: GitHub's branch moved.
@@ -214,39 +213,32 @@ class Prepare(Run):
     # The change's branch -----------------------------------------------------------------
 
     def build(self) -> None:
-        """Bring up each repository's branch, read its steps and, for an upgrade, the target's,
-        then the run's entries: each repository's code."""
+        """Bring up each repository's branch, read its steps and, for an upgrade, fetch the
+        target's sources, then the run's entries: each repository's code."""
         self._progress = None
         started = time.monotonic()
         self.read_change()
         for repository in self.repositories:
             self.bring_up(repository.key)
+        count = len(self.repositories)
         self.timed(
-            "brought up",
-            f"the {self.record.data['branch']} branch of {len(self.repositories)} repositories",
+            "branch",
+            f"{self.record.data['branch']} in {count} repositor{'y' if count == 1 else 'ies'}",
             started,
         )
         started = time.monotonic()
         declarations = self.declarations()
-        upgrades: dict[str, bool] = {}
+        upgrades: list[str] = []
         if self.record.data.get("target"):
             self.fetch_sources()
-            target = self.declarations(
-                {key: self.source(key) for key in self.places},
-                project={key: self.source(key) for key in self.places},
-            )
-            if not walks(target):
-                raise refuse_earlier_release(f"Platform {self.manifest.platform_version}'s templates")
-            jump = not walks(declarations)
-            for repository in self.repositories:
-                recorded = self.record_in(repository.key)
-                if recorded.commit != self.manifest.sources[repository.key]:
-                    upgrades[repository.key] = jump
-            self.record.data["upgrading"] = list(upgrades)
+            upgrades = [
+                repository.key
+                for repository in self.repositories
+                if self.record_in(repository.key).commit != self.manifest.sources[repository.key]
+            ]
+            self.record.data["upgrading"] = upgrades
             self.copy_notes()
             self.show_notes()
-        elif not walks(declarations):
-            raise refuse_earlier_release("This instance's templates")
         self.timed("read", f"the steps of {len(declarations)} components", started)
         self.record.entries = [] if self.previewing_only else self.plan(declarations).code(upgrades)
         self.record.save()
@@ -525,8 +517,6 @@ class Prepare(Run):
         component's render; the declarations, which the preview reads."""
         started = time.monotonic()
         declarations = self.declarations()
-        if not walks(declarations):
-            raise refuse_earlier_release(f"Platform {self.manifest.platform_version}'s templates")
         self.timed("read", f"the steps of {len(declarations)} components", started)
         self.record.entries = self.record.entries + self.plan(declarations).renders()
         self.record.save()
@@ -1081,7 +1071,8 @@ class Prepare(Run):
             lines += [
                 "",
                 "**Preview:** none: prepared with `--no-preview`, so `dp-instance apply` asks about each "
-                "change before it applies it, unless `--auto-approve`.",
+                "change before it applies it, unless `--auto-approve` covers it; a destroy or replacement "
+                "always asks.",
             ]
         else:
             lines += ["", "**Preview:**", ""]
@@ -1127,12 +1118,15 @@ class Prepare(Run):
 
     # Its end ----------------------------------------------------------------------------
 
-    def end(self) -> Result:
-        requests = self.requests()
-        if len(requests) > 1:
-            for item in requests:
-                others = [other for other in requests if other is not item]
-                copy = self.checkout(item["repository"])
+    def link_requests(self, requests: list[dict]) -> list[dict]:
+        """Describe each pull request again, naming the change's others. Each already carries its
+        own description, so one that can't be described again is only noted, and the run
+        completes; each such pull request and why."""
+        undescribed = []
+        for item in requests if len(requests) > 1 else []:
+            others = [other for other in requests if other is not item]
+            copy = self.checkout(item["repository"])
+            try:
                 github.describe(
                     copy,
                     gitops.origin(copy) or "",
@@ -1140,6 +1134,13 @@ class Prepare(Run):
                     self.record.data["title"],
                     self.body(item["repository"], others),
                 )
+            except Stop as stop:
+                undescribed.append({"url": item["url"], "message": stop.message})
+        return undescribed
+
+    def end(self) -> Result:
+        requests = self.requests()
+        undescribed = self.link_requests(requests)
         if requests:
             self.record_open_change()
         self.record.complete()
@@ -1162,12 +1163,22 @@ class Prepare(Run):
             f"Prepared: {len(requests)} pull request{'s' if len(requests) != 1 else ''} to review and "
             "merge in GitHub, then dp-instance apply."
         )
+        if undescribed:
+            self.screen.blank()
+            for item in undescribed:
+                self.screen.labelled("Not Linked:", f"{item['url']}: {item['message']}", "bold orange1")
         steps = (
+            *(
+                (Next("dp-instance prepare", "describes the pull requests again, each naming the others"),)
+                if undescribed
+                else ()
+            ),
             Next(
                 "dp-instance apply",
                 "once each pull request is merged: brings the platform to main"
                 + (
-                    ", asking about each change, which no preview showed, unless --auto-approve"
+                    ", asking about each change, which no preview showed, unless --auto-approve covers it; "
+                    "a destroy or replacement always asks"
                     if self.record.data.get("no_preview")
                     else ""
                 ),
@@ -1187,5 +1198,6 @@ class Prepare(Run):
                 "left_out": left_out,
                 "run_time": took,
                 "preview": self.record.data.get("preview") or {},
+                **({"undescribed": undescribed} if undescribed else {}),
             },
         )

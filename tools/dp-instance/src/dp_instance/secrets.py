@@ -87,15 +87,12 @@ def _unknown(name: str) -> Stop:
     )
 
 
-def _ask(found: list[Holder], name: str, *command: str) -> tuple[Holder, Call] | None:
+def _ask(found: list[Holder], name: str, *command: str) -> tuple[Holder, Call]:
     """The component that keeps ``name``, and its answer: every component is asked at once, and
-    one that doesn't declare it answers `not-mine` before any cluster or vault. None when none
-    answers that way, as on an engine before Platform 2026.6.0."""
+    one that doesn't declare it answers `not-mine` before any cluster or vault."""
     built([holder.cli for holder in found])
     with ThreadPoolExecutor(max_workers=len(found)) as pool:
         answers = list(pool.map(lambda holder: (holder, holder.cli.run("secret", *command, "--json")), found))
-    if not any(call.status == "not-mine" for _, call in answers):
-        return None
     owners = [(holder, call) for holder, call in answers if call.status not in ("not-mine", "usage")]
     if not owners:
         raise _unknown(name)
@@ -104,16 +101,9 @@ def _ask(found: list[Holder], name: str, *command: str) -> tuple[Holder, Call] |
     return owners[0]
 
 
-def _named(session: Session, found: list[Holder], name: str) -> list[tuple[Holder, dict]]:
+def _named(found: list[Holder], name: str) -> list[tuple[Holder, dict]]:
     """``name``, read by the component that keeps it."""
-    asked = _ask(found, name, "list", name)
-    if asked is None:
-        listed = _listing(session, found, f"Finding {name}: reading")
-        secrets = [(holder, event) for holder, event in listed if event.get("name") == name]
-        if not secrets:
-            raise _unknown(name)
-        return secrets
-    holder, call = asked
+    holder, call = _ask(found, name, "list", name)
     if call.status in WAITS:
         raise _waiting(call)
     if call.status != "done":
@@ -121,8 +111,8 @@ def _named(session: Session, found: list[Holder], name: str) -> list[tuple[Holde
     return [(holder, event) for event in call.events if event.get("event") == "secret"]
 
 
-def _owner(session: Session, found: list[Holder], name: str) -> Holder:
-    return _named(session, found, name)[0][0]
+def _owner(found: list[Holder], name: str) -> Holder:
+    return _named(found, name)[0][0]
 
 
 def list_secrets(session: Session, name: str | None) -> Result:
@@ -132,7 +122,7 @@ def list_secrets(session: Session, name: str | None) -> Result:
     screen.header("secret list", *rows)
     session.show_stopped()
     screen.begin("the secrets")
-    secrets = _named(session, found, name) if name else _listing(session, found, "Reading")
+    secrets = _named(found, name) if name else _listing(session, found, "Reading")
     shown = []
     for holder, event in secrets:
         screen.blank()
@@ -241,7 +231,7 @@ def reload(session: Session, name: str | None) -> Result:
     session.screen.begin("the secrets")
     command = "dp-instance secret reload" + (f" {name}" if name else "")
     chosen = (
-        [_owner(session, found, name)]
+        [_owner(found, name)]
         if name
         else [holder for holder in found if holder.cli.run("secret", "list", "--json").status != "usage"]
     )
@@ -262,7 +252,7 @@ def rotate(session: Session, name: str) -> Result:
     session.screen.header("secret rotate", ("instance", session.instance.key), ("secret", name))
     session.show_stopped()
     session.screen.begin("the secrets")
-    holder = _owner(session, found, name)
+    holder = _owner(found, name)
     session.screen.begin(holder.component)
     session.screen.blank()
     session.screen.labelled("Component Name:", Text(holder.component, style="bold"))
@@ -295,22 +285,10 @@ def set_secret(session: Session, name: str) -> Result:
         )
     screen.begin("the secrets")
     with screen.busy(f"Asking which component keeps {name}"):
-        owner = _ask(found, name, "set", name, "--no-sections")
-    if owner is None:
-        holder = _owner(session, found, name)
-        asking = f"Asking {holder.component} which values {name} takes"
-        with screen.busy(asking):
-            asked = holder.cli.run("secret", "set", name, "--json")
-    else:
-        holder, asked = owner
+        holder, asked = _ask(found, name, "set", name, "--no-sections")
     screen.begin(holder.component)
     screen.blank()
     screen.labelled("Component Name:", Text(holder.component, style="bold"))
-    if asked.status == "usage":
-        raise failed(
-            f"{holder.component}'s engine predates secret set, so it can't set {name}; "
-            "a newer Platform Version brings it."
-        )
     supply = ((asked.result or {}).get("values") or {}).get("supply")
     if asked.status != "values" or not supply:
         _report(session, holder, asked, "secret set")

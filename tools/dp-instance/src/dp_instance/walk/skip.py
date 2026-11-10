@@ -136,6 +136,7 @@ class Skip(Base):
             "--plan-file",
             str(plan_file),
             *self.version,
+            *self.handoff_folder(),
             *planned,
             "--unchanged-since-planned",
             "--skips-only",

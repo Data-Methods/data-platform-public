@@ -9,8 +9,7 @@ checkout. Versions: the Platform Version the records hold, a newer one to upgrad
 dp-instance's version and any newer one published. Repositories: what each records. Pending
 Changes: the open change and its pull requests, each component `main` is ahead of by what it
 last applied, each Managed Repository's Adoption PR still to merge and release, read now from
-each component that declares it publishes one, or, where none does, each the last run left open
-until a whole `verify` converges after it, and the files and commits in your checkouts, by the
+each component that maintains one, and the files and commits in your checkouts, by the
 rule `prepare` takes them by. Optional Handoffs: the outside work the newest completed apply
 recommended, with each page, fetched here from the shared run record when another workstation
 ran it. While another command holds the lock, it reads only the open change. It starts only the
@@ -35,7 +34,7 @@ from .screen import LABEL, NAME_LABELS, level_line, link
 from .sequence import Entry
 from .session import Session
 from .walk import LEFT_OPEN, PARTS, adoption_left, part_of
-from .walk.common import by_system
+from .walk.common import by_system, labels
 
 REASONS = {
     "decision": "stopped for review",
@@ -68,7 +67,7 @@ def journey(session: Session, run: record.Record) -> None:
     parts = run.data.get("parts", {})
     for index, entry in enumerate(entries):
         shown = _enter(screen, entry, shown)
-        level, counter, name = _labels(entry)
+        level, counter, name = labels(entry, run.data.get("branch") or "")
         noted = run.outcome(entry.id)
         if not noted:
             screen.print(level_line(level, counter, "not reached"))
@@ -85,24 +84,6 @@ def journey(session: Session, run: record.Record) -> None:
         part = part_of(entry)
         if part in parts and (index + 1 == len(entries) or part_of(entries[index + 1]) != part):
             screen.part(PARTS[part], sum(part_of(item) == part for item in entries), parts[part])
-
-
-def _labels(entry: Entry) -> tuple[str, str, str]:
-    if entry.kind == "preflight":
-        return "preflight", entry.preflight_counter, entry.component
-    if entry.kind == "drift":
-        return "drift check", "", ""
-    if entry.kind == "migrate":
-        return "migrate step", "", "migrate"
-    if entry.kind == "upgrade":
-        return "upgrade step", "", "upgrade"
-    if entry.kind == "pull-request":
-        return "pull request", "", entry.repository
-    if entry.kind == "mark":
-        return "applied commit", "", entry.component
-    if entry.kind == "preview":
-        return "step preview", entry.step_counter, entry.step
-    return "step", entry.step_counter, entry.step
 
 
 def _enter(screen, entry: Entry, shown: tuple) -> tuple:
@@ -180,7 +161,7 @@ def _aggregate(
     if first is None:
         return None, None
     try:
-        found, _ = applied.read(session.instance, manifest, copies[first.key])
+        found = applied.read(session.instance, manifest, copies[first.key])
     except Stop as stop:
         return None, stop.message
     return found, None
@@ -257,41 +238,22 @@ def _open_change(session: Session, detail: dict) -> tuple[list[dict], list[dict]
     return open_now, closed, (found.get("branch") if open_now else None)
 
 
-def _recorded_adoption(session: Session) -> list[dict]:
-    """Each Adoption PR the last completed upgrade or configuration change left open, as its
-    record keeps them, until a whole `verify` since then converged: what an instance whose
-    components publish no adoption state says."""
-    for item in record.records(session.instance.state, ("upgrade", "apply", "verify")):
-        if item.kind == "verify":
-            if item.data.get("converged"):
-                return []
-            continue
-        if item.status == "complete":
-            return item.data.get("adoption_prs") or []
-    return []
-
-
 def _adoption(
     session: Session, detail: dict, manifest: Manifest | None, copies: dict[str, Path]
 ) -> list[dict]:
-    """Each Managed Repository's Adoption PR still to merge and release, or to release: read now
-    from each component that declares it publishes one, or else as the last completed run left
-    them open; `adoption_read` says which, and `failed` when a read now failed. The Completion
-    Check passes only once each is merged and released."""
+    """Each Managed Repository's Adoption PR still to merge and release, or to release, read now
+    from each component that maintains one; `adoption_read` says `failed` when the read failed.
+    The Completion Check passes only once each is merged and released."""
     screen = session.screen
-    found: list[dict] | None = None
-    detail["adoption_read"] = "recorded"
+    found: list[dict] = []
+    detail["adoption_read"] = "now"
     try:
-        live = adoption.read(session.instance, manifest, copies) if manifest is not None and copies else None
-        if live is not None:
-            found, detail["adoption_read"] = adoption.outstanding(live), "now"
+        if manifest is not None and copies:
+            found = adoption.outstanding(adoption.read(session.instance, manifest, copies))
     except Stop as stop:
         detail["adoption_read"] = "failed"
         screen.blank()
         screen.labelled("Adoption PR:", f"not read now: {stop.message}")
-        screen.labelled("", "each one the last run left open follows, if any")
-    if found is None:
-        found = _recorded_adoption(session)
     detail["adoption_prs"] = found
     if found:
         screen.blank()
@@ -348,8 +310,7 @@ def _pending(
             session.screen.labelled("Apply Pending:", f"not checked: {unread}")
         detail["pending"] = None
         return []
-    copies = {key: instance.own(places.APPLY, key) for key in commits}
-    found = applied.pending(instance, aggregate, applied.applied_commits(aggregate)[0], commits, copies)
+    found = applied.pending(instance, aggregate, applied.applied_commits(aggregate)[0], commits)
     if found:
         session.screen.labelled("Apply Pending:", ", ".join(found))
     detail["pending"] = found
@@ -508,7 +469,8 @@ def _instance(session: Session, detail: dict, unread: str | None) -> None:
     pending = _pending(session, detail, aggregate, why or unread, commits)
     left = _adoption(session, detail, manifest, copies)
     edits = _edits(session, detail, commits, branch)
-    if not (detail.get("open_change") or pending or left or edits or why or unread):
+    unread_adoption = detail["adoption_read"] == "failed"
+    if not (detail.get("open_change") or pending or left or unread_adoption or edits or why or unread):
         screen.note("None")
     if unread is None:
         _optional_handoffs(session, detail)

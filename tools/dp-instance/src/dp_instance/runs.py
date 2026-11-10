@@ -8,7 +8,7 @@ open, `prepare` adds to it, keeping its kind and target, an upgrade's re-run whe
 hasn't it, and `prepare --to` refuses unless it re-prepares that upgrade. `prepare --to` also
 refuses while `main` is ahead of what the platform applied, naming `apply`, and while any
 Managed Repository's Adoption PR from the previous upgrade is unreleased, read now, or can't be
-read; where no component reads them, it asks at a terminal. A change whose pull requests were
+read. A change whose pull requests were
 all closed without merging is no longer the open change; one partly merged, with the rest
 closed, waits for those to be reopened and merged. A merged change no apply has applied doesn't
 block a Configuration Change's `prepare`, which builds on `main` and names it. `apply` brings
@@ -296,7 +296,7 @@ def _check_applied(
         included,
         Next(command, "once what the platform applied can be read"),
     )
-    ahead = applied.pending(session.instance, found, last, commits, copies)
+    ahead = applied.pending(session.instance, found, last, commits)
     if not ahead:
         return
     raise Stop(
@@ -354,42 +354,9 @@ def _check_branches(session: Session, found: dict | None, states: dict, version:
     )
 
 
-ADOPTION_QUESTION = "Is each Managed Repository's Adoption PR merged and released?"
-
-
-def _ask_adoption(session: Session, command: str) -> None:
-    """Where no component reads its Managed Repositories' Adoption PRs, as before the
-    capability, a person says each is merged and released, at a terminal; without one, or with
-    `n`, `prepare --to` refuses."""
-    if not session.instance.managed:
-        return
-    said = (
-        "No component of the release this instance runs reads its Managed Repositories' Adoption PRs, "
-        "and an upgrade is prepared only once each is merged and released."
-    )
-    if session.interactive:
-        session.screen.blank()
-        session.screen.note(said, "bold")
-        if session.screen.choose([("y", "yes"), ("n", "no")], ADOPTION_QUESTION) == "y":
-            return
-        raise Stop(
-            "failed",
-            f"{said} Nothing has changed.",
-            reason="adoption",
-            next=(Next(command, "once each is merged and released"),),
-        )
-    raise Stop(
-        "failed",
-        f"{said} Without a terminal, nothing asks whether they are; nothing has changed.",
-        reason="adoption-unread",
-        next=(Next(command, "at a terminal: asks whether each is merged and released"),),
-    )
-
-
 def _check_adoption(session: Session, manifest: Manifest, copies: dict, command: str) -> None:
     """An upgrade is prepared only once every Managed Repository's Adoption PR from the previous
-    one is released, read now; a read that fails refuses too, and where no component reads
-    them, a person says so at a terminal."""
+    one is released, read now; a read that fails refuses too."""
     try:
         found = adoption.read(session.instance, manifest, copies)
     except Stop as stop:
@@ -400,9 +367,6 @@ def _check_adoption(session: Session, manifest: Manifest, copies: dict, command:
             reason="adoption-unread",
             next=(Next(command, "once each can be read: prepares this upgrade"),),
         ) from None
-    if found is None:
-        _ask_adoption(session, command)
-        return
     left = adoption.outstanding(found)
     if not left:
         return
@@ -927,6 +891,15 @@ def _replacing(session: Session, run: Record | None, command: str, typed: str | 
     )
 
 
+def _resumed_by(session: Session, run: Record) -> None:
+    """The run under way again: who resumed it and when, beside the stop it resumed from, which
+    the record keeps as `stopped` once its `stop` is cleared."""
+    run.data.setdefault("resumed_by", []).append(
+        {**session.operator, "at": now(), "stopped": run.data.get("stop")}
+    )
+    run.data["status"], run.data["stop"] = "running", None
+
+
 def resume(session: Session) -> Result:
     run = session.stopped()
     completed = session.shared.completed if session.lock is not None else None
@@ -969,13 +942,12 @@ def resume(session: Session) -> Result:
     # The time since the run last wrote its record, at its stop, is time it waited.
     stood = (datetime.now().astimezone() - datetime.fromisoformat(run.data["updated"])).total_seconds()
     run.data["waiting"] = round(run.data.get("waiting", 0) + max(stood, 0), 1)
-    run.data["status"], run.data["stop"] = "running", None
+    _resumed_by(session, run)
     # A run resumed after any stop but a decision skips no plan: whatever happened while it stood
     # still, every step plans. Before the drift check finished, nothing can skip yet, and the
     # check it runs again is as fresh as a run's first.
     if resumed_after is not None and "drift_plans" in run.data:
         run.data.setdefault("plan_skip_off", resumed_after)
-    run.data.setdefault("resumed_by", []).append({**session.operator, "at": now()})
     run.save()
     Log(run.log_path).write(f"== {record.now()} dp-instance resume: run {run.id} {picks_up}")
     if _walked_here(session, run):
@@ -990,8 +962,7 @@ def _resume_prepare(session: Session, run: Record, manifest: Manifest, mapped: d
     stood = (datetime.now().astimezone() - datetime.fromisoformat(run.data["updated"])).total_seconds()
     Prepare.start_again(run)
     run.data["waiting"] = round(run.data.get("waiting", 0) + max(stood, 0), 1)
-    run.data["status"], run.data["stop"] = "running", None
-    run.data.setdefault("resumed_by", []).append({**session.operator, "at": now()})
+    _resumed_by(session, run)
     run.save()
     Log(run.log_path).write(
         f"== {record.now()} dp-instance resume: run {run.id} starts again from its start, with the "

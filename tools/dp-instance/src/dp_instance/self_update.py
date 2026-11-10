@@ -249,17 +249,23 @@ def self_update(screen: Screen, start: Path, to: str | None) -> Result:
     if windows():
         log = Path(tempfile.gettempdir()) / "dp-instance-self-update.log"
         waited, console = chain()
-        hand_off(
-            [processes.executable("uv"), *arguments],
-            waited,
-            log,
-            console=console,
-            done=f"dp-instance {wanted} is installed.",
-            broken=(
-                f"uv couldn't install dp-instance {wanted}, and dp-instance may not run until it does: "
-                f"its output is in {log}. Install it again in a new window: {again}"
-            ),
-        )
+        try:
+            hand_off(
+                [processes.executable("uv"), *arguments],
+                waited,
+                log,
+                console=console,
+                done=f"dp-instance {wanted} is installed.",
+                broken=(
+                    f"uv couldn't install dp-instance {wanted}, and dp-instance may not run until it does: "
+                    f"its output is in {log}. Install it again in a new window: {again}"
+                ),
+            )
+        except OSError as error:
+            raise failed(
+                f"The install of dp-instance {wanted} couldn't start: {error}. Nothing was installed.",
+                Next(again, f"installs dp-instance {wanted} in a new window"),
+            ) from None
         detail.update(log=str(log), console=console is not None)
         message = (
             f"uv installs dp-instance {wanted} once this command ends, and dp-instance doesn't run "

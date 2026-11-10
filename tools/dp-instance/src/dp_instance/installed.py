@@ -18,9 +18,6 @@ from pathlib import Path
 from .outcome import Next
 
 VERSION = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
-# The first dp-instance with `self update`. An older one has `update`, which installs the
-# newest published version.
-SELF_UPDATE = "4.0.0"
 # Where an instance folder keeps the version `self update --to` installed.
 PINNED = "pinned.json"
 
@@ -56,18 +53,6 @@ def at_least(installed: str | None, minimum: str) -> bool:
 def install(version: str, then: str = "") -> Next:
     """The command that installs dp-instance ``version``, and ``then``, what comes after it."""
     return Next(f"dp-instance self update --to {version}", f"installs dp-instance {version}{then}")
-
-
-def before_self_update(version: str) -> str:
-    """What a refusal naming ``version`` adds when it predates `self update`: that version's own
-    `update` and `status` name the newest dp-instance again, which is the one that refused."""
-    if at_least(version, SELF_UPDATE):
-        return ""
-    return (
-        f" dp-instance {version} has no `self update`: its `dp-instance update`, which its `status` "
-        "names, installs the newest dp-instance again, so run it only once you no longer need "
-        f"dp-instance {version}."
-    )
 
 
 def pin(state: Path, version: str) -> None:

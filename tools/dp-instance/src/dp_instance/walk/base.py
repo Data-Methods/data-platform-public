@@ -99,9 +99,16 @@ class Base:
 
     @property
     def version(self) -> list[str]:
-        """The Platform Version the run's manifest names, as it names it, which `preflight`,
-        `plan`, `apply` and `verify` take."""
+        """The Platform Version the run's manifest names, as it names it, which `plan`, `apply`,
+        `verify` and `render` take."""
         return ["--platform-version", self.manifest.platform_version]
+
+    def handoff_folder(self) -> list[str]:
+        """Where an apply's step writes its handoff document: the run's own `handoffs/`, in its
+        folder of the shared run record, never the checkout."""
+        folder = self.record.folder / "handoffs"
+        folder.mkdir(exist_ok=True)
+        return ["--handoffs", str(folder)]
 
     @property
     def command(self) -> str:

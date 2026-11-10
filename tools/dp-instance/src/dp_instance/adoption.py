@@ -1,7 +1,7 @@
 """Each Managed Repository's Adoption PR as it is now, from the component that maintains it.
 
-A component that declares the `adoption_state` capability and a Managed Repository publishes
-that repository's adoption state, and answers `repo adoption --json`, which asks GitHub alone
+A component that declares a Managed Repository publishes that repository's adoption state, and
+answers `repo adoption --json`, which asks GitHub alone
 and writes nothing. Its people merge and release an Adoption PR on their own timing, outside any
 run, so its state is read now: each component's declaration, then each such component's `repo
 adoption`, every read at once. Nothing here names a component: the declarations say which
@@ -20,7 +20,7 @@ from .components import Cli, Log, built
 from .instance import Instance
 from .manifest import Manifest
 from .outcome import Next, Stop, failed
-from .sequence import ADOPTION_STATE, declaration
+from .sequence import declaration
 
 # The `repo adoption --json` schemas this dp-instance reads.
 SCHEMAS = (1,)
@@ -29,9 +29,8 @@ OUTSTANDING = ("open", "merged")
 
 
 def _maintainers(instance: Instance, manifest: Manifest, places: dict[str, Path] | None) -> list[Cli]:
-    """Each mapped component that declares it publishes a Managed Repository's adoption state,
-    by its CLI in its Component Repository's checkout, or the copy ``places`` names, from its
-    declaration there."""
+    """Each mapped component that declares a Managed Repository, by its CLI in its Component
+    Repository's checkout, or the copy ``places`` names, from its declaration there."""
     clis = [
         Cli(
             component.command,
@@ -44,8 +43,7 @@ def _maintainers(instance: Instance, manifest: Manifest, places: dict[str, Path]
     ]
 
     def declares(cli: Cli) -> bool:
-        found = declaration(cli.document("steps", "--json"), cli.command)
-        return found.declares(ADOPTION_STATE) and found.manages
+        return declaration(cli.document("steps", "--json"), cli.command).manages
 
     built(clis)
     with ThreadPoolExecutor(max_workers=max(len(clis), 1)) as pool:
@@ -66,14 +64,13 @@ def _document(found: dict, command: str) -> list:
     return items
 
 
-def read(instance: Instance, manifest: Manifest, places: dict[str, Path] | None = None) -> list[dict] | None:
+def read(instance: Instance, manifest: Manifest, places: dict[str, Path] | None = None) -> list[dict]:
     """Every Managed Repository's latest Adoption PR, read now by the component that maintains
-    it, from its Component Repository's checkout or the copy ``places`` names; None when no
-    component declares that it publishes one, as before the capability. A read that fails
+    it, from its Component Repository's checkout or the copy ``places`` names. A read that fails
     stops, naming why."""
     maintainers = _maintainers(instance, manifest, places)
     if not maintainers:
-        return None
+        return []
 
     def named(url: str) -> str:
         mapped = next((item for item in instance.managed if gitops.same_repository(item.remote, url)), None)

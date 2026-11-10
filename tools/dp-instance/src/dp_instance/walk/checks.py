@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -47,7 +46,8 @@ class Checks(Base):
             )
 
         def run(entry: Entry) -> tuple[Entry, Call]:
-            return entry, clis[entry.id].run("preflight", "--json", *self.version)
+            # A preflight reads no Platform Version.
+            return entry, clis[entry.id].run("preflight", "--json")
 
         def work() -> None:
             # Each environment the preflights share is built first, so none builds twice at once.
@@ -73,7 +73,7 @@ class Checks(Base):
             detail["sign_in"] = {"entry": stopped.id, "command": self.sign_in_next(call)[0].command}
         raise Stop(
             call.status if waiting else "failed",
-            " ".join(self.preflight_failure(entry, call) for entry, call in failures),
+            preflight_failures(failures),
             failures=[
                 {
                     "entry": entry.id,
@@ -105,19 +105,9 @@ class Checks(Base):
             self.excerpt(block, call)
         self.finish(entry, block, WAITING_FOR.get(call.status, "failed"))
 
-    @staticmethod
-    def preflight_failure(entry: Entry, call: Call) -> str:
-        """One preflight that didn't pass, in a sentence: what it waits for, or that it failed and,
-        when it looked temporary and its retries are spent, why, and that nothing changed."""
-        if call.status in WAITS or call.temporary:
-            said = call.message if call.message.endswith(".") else f"{call.message}."
-            return f"{entry.component}'s preflight {'waits' if call.status in WAITS else 'failed'}: {said}"
-        return f"{entry.component}'s preflight failed."
-
     def drift_check(self, entry: Entry, block: Block) -> None:
         """Plan every component's phases on the commit its walk last applied, as its applied
-        commit records it, or, before any walk recorded one, as its last publication's `source`
-        stamp names it: only a real change made outside a run is drift, never a renewal due, and
+        commit records it: only a real change made outside a run is drift, never a renewal due, and
         work merged to `main` that no walk has applied is pending, which the walk applies. It fails
         closed: Component Outputs it can't read whole stop it, naming what. Only a component
         registered and never published, or not registered yet, or one whose walk an apply left
@@ -262,11 +252,9 @@ class Checks(Base):
         code, and each component's applied commit, read whole for the components this walk
         includes: whatever can't be read stops, naming it."""
         copy = self.checkout(self.repositories[0].key)
-        found, warnings = self.screen.run_live(
-            block, applied.read, self.instance, self.manifest, copy, self.log
-        )
+        found = self.screen.run_live(block, applied.read, self.instance, self.manifest, copy, self.log)
         included = {component.key for repository in self.repositories for component in repository.components}
-        problems = applied.problems(found, warnings, included)
+        problems = applied.problems(found, included)
         commits, missing = applied.applied_commits(found)
         problems = problems or missing
         if problems:
@@ -544,9 +532,8 @@ class Checks(Base):
         block.outcome = "change"
         block.add("Step Plan:", summary)
         block.add("Decision:", identifier)
-        notes = self.notes_line()
-        if notes:
-            block.add("Release Notes:", notes)
+        for line in self.notes_lines():
+            block.add("Release Notes:", line)
         if self.session.interactive:
             block.add("Preflight:", f"{PREFLIGHT.command}, in another terminal, {PREFLIGHT.why}")
             key = self.screen.ask(
@@ -587,16 +574,31 @@ class Checks(Base):
         )
 
 
-# A Terraform step's summary, before the engine counted each decision: what it adds, changes and
-# destroys, a replacement counting as both an add and a destroy.
-TERRAFORM_COUNTS = re.compile(r"(\d+) to (add|change|destroy)\b")
-# What an engine before decisions reports as a change that isn't one on the platform: a handoff
-# document it would rewrite, or outputs it would publish again.
-NOT_REAL = ("its handoff document changes", "its published outputs are out of date")
 # Each phase's time at the last drift check, kept to plan the longest first.
 DRIFT_TIMES = "drift-times.json"
 # A real change, as the design counts one: create, update in place, replace or destroy.
 REAL = ("create", "update", "replace", "destroy")
+
+
+def preflight_failures(failures: list[tuple[Entry, Call]]) -> str:
+    """The preflights that didn't pass, a sentence for each thing they say: what they wait for,
+    or that they failed and, when it looked temporary and the retries are spent, why. Those that
+    say the same, as every component's wait for one sign-in, share one sentence naming each."""
+    said: dict[tuple[str, str], list[str]] = {}
+    for entry, call in failures:
+        verb = "wait" if call.status in WAITS else "failed"
+        why = ""
+        if call.status in WAITS or call.temporary:
+            why = call.message if call.message.endswith(".") else f"{call.message}."
+        said.setdefault((verb, why), []).append(f"{entry.component}'s")
+    sentences = []
+    for (verb, why), names in said.items():
+        named = names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
+        if len(names) == 1:
+            verb = "waits" if verb == "wait" else verb
+        what = "preflight" if len(names) == 1 else "preflights"
+        sentences.append(f"{named} {what} {verb}: {why}" if why else f"{named} {what} {verb}.")
+    return " ".join(sentences)
 
 
 def real_decision(decision: dict) -> bool:
@@ -609,25 +611,20 @@ def real_decision(decision: dict) -> bool:
 def real_change(event: dict) -> bool:
     """Whether a plan's finished event is a real change: a create, an update in place, a
     replacement or a destroy. Output changes, handoff document rewrites, forgets, moves and
-    imports aren't. Each decision's counts say it, a native decision counting as real; before
-    the engine counted decisions, a Terraform step's summary does, and the text of a change
-    that's only a handoff rewrite or outputs to publish again. A renewal is a real change."""
+    imports aren't. Each decision's counts say it, a native decision counting as real, and a change
+    that names no decisions counts as real. A renewal is a real change."""
     if event.get("status") != "change":
         return False
     decisions = event.get("decisions")
-    if isinstance(decisions, list):
-        return any(real_decision(item) for item in decisions if isinstance(item, dict))
-    summary = str(event.get("summary") or "")
-    counted = TERRAFORM_COUNTS.findall(summary)
-    if counted:
-        return any(int(number) for number, _ in counted)
-    return not summary.startswith(NOT_REAL)
+    if not isinstance(decisions, list):
+        return True
+    return any(real_decision(item) for item in decisions if isinstance(item, dict))
 
 
 def drifted(event: dict) -> bool:
     """Whether a plan's finished event is drift, as the design counts it: a real change, unless
     each of its real decisions is a renewal the platform owns, as each decision's `renewal` says,
-    which the step plans and asks for in its turn. An engine before renewals names none."""
+    which the step plans and asks for in its turn."""
     if not real_change(event):
         return False
     decisions = event.get("decisions")

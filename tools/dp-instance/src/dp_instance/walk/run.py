@@ -27,6 +27,7 @@ class Run(Progress, Sources, Reading, Checks, Code, Skip, Holds, Steps, Waits, S
             return self.stopped(Stop("failed", "Interrupted.", reason="interrupted"))
         except Stop as stop:
             return self.stopped(stop)
+        self.close_part()
         self.pause()
         return self.end()
 
@@ -42,14 +43,11 @@ class Run(Progress, Sources, Reading, Checks, Code, Skip, Holds, Steps, Waits, S
         return {"drift": self.drift_check, "upgrade": self.step, "migrate": self.step, "step": self.step}
 
     def walk_entries(self) -> None:
-        """Walk the entries not yet walked in this command, in order, each part ending with a
-        line of its time."""
+        """Walk the entries not yet walked in this command, in order. A part ends, with a line
+        of its time, when the walk moves to another part or the run ends, never between two walks
+        of the same part, such as a prepare's code then its renders."""
         handlers = self.handlers()
         for index, entry in enumerate(self.record.entries, 1):
-            if entry.kind == "preflight":
-                # Only a run an earlier dp-instance started has one: a run passes over it, as
-                # `dp-instance preflight` runs them.
-                continue
             if part_of(entry) != self._part:
                 self.close_part()
                 self._part = part_of(entry)
@@ -71,7 +69,6 @@ class Run(Progress, Sources, Reading, Checks, Code, Skip, Holds, Steps, Waits, S
             handlers[entry.kind](entry, block)
             self._entry = self._block = None
             self.entry_done(entry)
-        self.close_part()
 
     def preview_group(self, entry: Entry) -> None:
         """A prepare plans its preview's phases at once, then judges each step in order."""

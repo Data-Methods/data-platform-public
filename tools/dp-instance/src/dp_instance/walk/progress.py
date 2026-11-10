@@ -12,7 +12,7 @@ from .. import gitops
 from ..screen import Block, duration
 from ..sequence import Entry
 from .base import Base
-from .common import CHECKS, LEVELS, PARTS, STANDING_BY, level_key, part_of
+from .common import CHECKS, LEVELS, PARTS, STANDING_BY, labels, level_key, part_of
 
 # What a prepare, a plan and an apply show of a step that changed nothing: a count, as its part
 # ends. The pull request and the run record keep each one.
@@ -289,24 +289,7 @@ class Progress(Base):
             self.screen.print(line.text if line.label == "Pull Request:" else line)
 
     def block(self, entry: Entry) -> Block:
-        if entry.kind == "preflight":
-            return Block(
-                "preflight", entry.preflight_counter, entry.component, entry.description, self.footer
-            )
-        if entry.kind == "drift":
-            return Block("drift check", "", "", entry.description, self.footer)
-        if entry.kind == "render":
-            return Block("render step", "", "render", entry.description, self.footer)
-        if entry.kind == "migrate":
-            return Block("migrate step", "", "migrate", entry.description, self.footer)
-        if entry.kind == "upgrade":
-            return Block("upgrade step", "", "upgrade", entry.description, self.footer)
-        if entry.kind == "pull-request":
-            return Block("pull request", "", self.change_branch, entry.description, self.footer)
-        if entry.kind == "mark":
-            return Block("applied commit", "", entry.component, entry.description, self.footer)
-        level = "step preview" if entry.kind == "preview" else "step"
-        return Block(level, entry.step_counter, entry.step, entry.description, self.footer)
+        return Block(*labels(entry, self.change_branch), entry.description, self.footer)
 
     @property
     def change_branch(self) -> str:

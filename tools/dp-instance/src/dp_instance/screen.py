@@ -2,9 +2,10 @@
 
 Every command opens with `dp-instance`, then a line each for its command, its instance and
 what else it knows, each as it becomes known; ends each of its parts with a line of its time,
-and ends with its total, as its JSON events and result give them too. At a terminal a spinner
-shows while it reads before its first part, from each answer to a question until a step or the
-next part shows, and while a part sets up before its first step shows. A prepare's parts are
+and ends with its total, as its JSON events and result give them too. At a terminal one spinner
+shows from the moment the command starts: each section takes it over and says what it does, a
+live block replaces it while it shows and it returns once the block ends, and a question or a
+stop ends it until it's answered or for good. A prepare's parts are
 Repository Changes, Platform Preview and Pull Requests, an apply's Drift Check and Platform
 Changes, and `preflight`'s Preflight, each named as it starts; a level's lines wait for a step to
 show under them, so a level with nothing to show takes no line. Each level is named as it's
@@ -519,12 +520,16 @@ class Screen:
     # Blocks -----------------------------------------------------------------------------
 
     def run_live(self, block: Block, work, *arguments, **keywords):
-        """Run ``work(*arguments, **keywords)`` while the block shows live; at a terminal only."""
+        """Run ``work(*arguments, **keywords)`` while the block shows live, at a terminal, in the
+        spinner's place; the spinner shows again once the block ends."""
         self.read()
         if not self.interactive:
             return work(*arguments, **keywords)
-        with Redrawn(block, console=self.console, refresh_per_second=8, transient=True):
-            return work(*arguments, **keywords)
+        try:
+            with Redrawn(block, console=self.console, refresh_per_second=8, transient=True):
+                return work(*arguments, **keywords)
+        finally:
+            self.working()
 
     def ask(self, block: Block, choices: list[tuple[str, str]], prompt: str = "") -> str:
         """Wait for a key with the block drawn once and nothing redrawing, so the key

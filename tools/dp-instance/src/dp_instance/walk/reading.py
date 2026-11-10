@@ -6,11 +6,10 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from .. import installed
 from ..components import Cli, built
-from ..outcome import Stop, failed
+from ..outcome import failed
 from ..screen import Block
-from ..sequence import UPGRADE_STEPS, Declaration, Plan, declaration
+from ..sequence import Declaration, Plan, declaration
 from .base import Base
 
 
@@ -63,24 +62,3 @@ class Reading(Base):
 
     def plan(self, declarations) -> Plan:
         return Plan(self.manifest, self.repositories, declarations)
-
-
-def walks(declarations: dict[tuple[str, str], Declaration]) -> bool:
-    """Whether every template declares the walk of prepare then apply: the `code` phase's
-    `upgrade` and `migrate` as ordinary steps."""
-    return bool(declarations) and all(item.declares(UPGRADE_STEPS) for item in declarations.values())
-
-
-def refuse_earlier_release(what: str) -> Stop:
-    """A release whose templates walk only as dp-instance 3.0.0 does: only that dp-instance walks
-    it, except the jump to the next, which a prepared upgrade takes."""
-    from ..targets import BELOW_FLOOR, below_floor
-
-    return Stop(
-        "failed",
-        f"{what} declare no `code` phase, so {installed.shown(installed.version())} only prepares the "
-        f"upgrade to the next Platform Version from them; dp-instance {BELOW_FLOOR} walks the rest. "
-        "Nothing has changed." + installed.before_self_update(BELOW_FLOOR),
-        reason="earlier-release",
-        next=(below_floor(""),),
-    )

@@ -21,7 +21,7 @@ MAP_FILE = Path(STATE_FOLDER, "repositories.json")
 SOURCE_RECORD = Path(".dp-template/template-source.json")
 # The `template-source.json` and `outputs aggregate` schemas this dp-instance reads.
 SOURCE_SCHEMAS = (1,)
-AGGREGATE_SCHEMAS = (2, 3)
+AGGREGATE_SCHEMAS = (3,)
 # The Client Infrastructure Repository's template, and its owner's CLI, which reads the
 # instance's published Component Outputs.
 INFRASTRUCTURE = "data-platform-infrastructure"
@@ -32,8 +32,8 @@ SETUP = Next("dp-instance setup", "maps this instance's repositories again")
 @dataclass(frozen=True)
 class SourceRecord:
     """A Component Repository's `.dp-template/template-source.json`: the template commit it
-    holds and, from the engine that records it, the Platform Version the `upgrade` or `repo
-    init` that wrote it named; None in an older engine's record."""
+    holds and the Platform Version the `upgrade` or `repo init` that wrote it named; None when it
+    named none, as `repo init` without `--platform-version` leaves it."""
 
     template: str
     repository: str
@@ -148,23 +148,6 @@ def registrations(aggregate: dict) -> list[tuple[str, str]]:
         repository = registration.get("repository")
         if isinstance(key, str) and isinstance(repository, str) and repository:
             found.append((key, repository))
-    return found
-
-
-def managed_registrations(aggregate: dict) -> list[tuple[str, str]]:
-    """Each Managed Repository a registered component lists in its registration, as
-    `outputs aggregate` prints them: the component's key and the repository's URL. A
-    registration at 2026.3's schema 1 lists none."""
-    found = []
-    for item in aggregate.get("components", []):
-        registration = item.get("registration") if isinstance(item, dict) else None
-        if not isinstance(registration, dict):
-            continue
-        key = (registration.get("component") or {}).get("key")
-        for managed in registration.get("managed_repositories") or []:
-            url = managed.get("url") if isinstance(managed, dict) else None
-            if isinstance(key, str) and isinstance(url, str) and url:
-                found.append((key, url))
     return found
 
 

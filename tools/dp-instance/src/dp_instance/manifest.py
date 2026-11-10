@@ -334,6 +334,14 @@ class Releases:
             self._documents = found
         return self._documents
 
+    def released(self, template: str, commit: str) -> bool:
+        """Whether a published manifest names ``commit`` as ``template``'s: a Template Release's
+        commit, in its Release Repository."""
+        return any(
+            isinstance(document.get("sources"), dict) and document["sources"].get(template) == commit
+            for _, document in self.documents()
+        )
+
     def manifest(self, version: str) -> Manifest:
         manifest = parse(self.text(version), f"platform-release/{version}")
         if manifest.platform_version != version:
